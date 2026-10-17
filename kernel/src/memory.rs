@@ -68,6 +68,25 @@ pub fn alloc_frame() -> Result<PhysFrame, &'static str> {
         .ok_or("frame allocator exhausted")
 }
 
+/// Allocate a naturally aligned power-of-two run of contiguous frames
+/// (page tables, heap regions, back buffers).
+pub fn alloc_pages(count: usize) -> Result<PhysFrame, &'static str> {
+    let mut slot = ALLOCATOR.lock();
+    slot.as_mut()
+        .ok_or("frame allocator is not initialised")?
+        .alloc_pages(count)
+        .ok_or("frame allocator exhausted")
+}
+
+/// Return a run from [`alloc_pages`] to the frame allocator.
+pub fn free_pages(frame: PhysFrame, count: usize) -> Result<(), &'static str> {
+    let mut slot = ALLOCATOR.lock();
+    slot.as_mut()
+        .ok_or("frame allocator is not initialised")?
+        .free_pages(frame, count)
+        .map_err(|_| "frame allocator rejected the run")
+}
+
 /// Run allocation, free, alignment, exhaustion and accounting checks against
 /// the live kernel allocator. Writes a pattern through the HHDM to prove that
 /// returned frames are actually mapped and writable.

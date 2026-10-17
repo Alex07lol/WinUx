@@ -90,6 +90,7 @@ ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
 ISR_NOERR 32
+ISR_NOERR 128
 
 isr_common:
     push rax
@@ -169,6 +170,7 @@ unsafe extern "C" {
     fn isr_30();
     fn isr_31();
     fn isr_32();
+    fn isr_128();
 }
 
 #[repr(C)]
@@ -196,12 +198,13 @@ impl IdtEntry {
         }
     }
 
-    fn for_handler(handler: u64, ist: u8) -> Self {
+    fn for_handler(handler: u64, ist: u8, user_callable: bool) -> Self {
         Self {
             offset_low: handler as u16,
             selector: 0x08,
             ist,
-            type_attr: 0x8e, // present, DPL0, 64-bit interrupt gate
+            // present, DPL0 (or DPL3 for `int 0x80`), 64-bit interrupt gate
+            type_attr: if user_callable { 0xee } else { 0x8e },
             offset_mid: (handler >> 16) as u16,
             offset_high: (handler >> 32) as u32,
             reserved: 0,
@@ -238,8 +241,10 @@ pub fn init() {
     for (vector, handler) in handlers.iter().enumerate() {
         // Vector 8 uses IST1; all other gates use the current stack.
         let ist = if vector == 8 { 1 } else { 0 };
-        idt.0[vector] = IdtEntry::for_handler(*handler as usize as u64, ist);
+        idt.0[vector] = IdtEntry::for_handler(*handler as usize as u64, ist, false);
     }
+    // Syscall gate: user-callable interrupt gate (DPL3) at vector 0x80.
+    idt.0[128] = IdtEntry::for_handler(isr_128 as *const () as usize as u64, 0, true);
 
     let pointer = IdtPointer {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
@@ -292,6 +297,11 @@ pub extern "C" fn exception_dispatch(frame: *mut InterruptFrame) {
         32 => {
             pit::handle_interrupt();
             pic::eoi_master();
+            crate::sched::on_timer_tick();
+            // Perform a pending reschedule here, at the tail of the
+            // dispatcher: the interrupted thread's frame stays on its stack
+            // and is resumed by the normal iretq path when it is picked again.
+            crate::sched::preempt_if_needed();
         }
         3 => {
             // Deliberate self-test: proves descriptor loading, gate dispatch,
@@ -299,7 +309,14 @@ pub extern "C" fn exception_dispatch(frame: *mut InterruptFrame) {
             BREAKPOINT_HANDLED.store(true, Ordering::SeqCst);
             kprintln!("selftest: int3 exception handled (rip={:#x})", frame.rip);
         }
+        128 => crate::syscall::dispatch(frame),
         vector => {
+            // A fault taken from CPL3 is a user-process fault, not a kernel
+            // bug: report it, kill the offending thread and keep the kernel
+            // running. Kernel-mode faults stay fatal.
+            if frame.cs & 3 == 3 {
+                crate::syscall::user_fault(frame);
+            }
             serial::force_print(format_args!(
                 "\r\nPROJECT_OS_FATAL: exception {} ({}) error={:#x} rip={:#x} cs={:#x} rflags={:#x}\r\n",
                 vector,

@@ -225,3 +225,130 @@ MMIO leaves, never splits huge pages, never unmaps and requires 4-level paging.
 It is not a general VM manager; that remains Phase 3/4 work. LINT0 is now owned
 by the 8259 path, so the later IOAPIC/APIC-timer milestone must take it over
 deliberately.
+
+## ADR-0012 – Kernel-owned page tables, fixed heap region, IRQ-safe locks
+
+**Context.** Phase 3/4 require the kernel to stop depending on bootloader page
+tables and to provide a global allocator before user mode can exist. The
+bootloader (Limine) maps kernel image, HHDM and (only some) MMIO through its own
+PML4. Device MMIO is not fully covered, and the timer ISR now coexists with
+potentially allocating threads.
+
+**Decision.** (`kernel/src/vm.rs`, `kernel/src/heap.rs`, `kernel/src/sync.rs`)
+
+1. Build a kernel PML4 by copying PML4 entries 256..512 from the live tables
+   (kernel image + HHDM share lower kernel tables), zero the user half, and
+   switch CR3 onto it. User spaces later copy the kernel half from this
+   template. Bootloader tables/frames are intentionally leaked (reclaiming them
+   needs reclaimer policy).
+2. Lease a fixed 8 MiB contiguous frame run through the HHDM as the kernel heap
+   (`FreeListHeap`, first-fit, address-ordered coalescing free list). No growth
+   yet; growth needs kernel-space per-page mapping.
+3. W^X is enforced in `vm::map_page`: any writable mapping must set NX.
+   Intermediate tables are never split (huge-entry hits are errors).
+4. `IrqSpinLock` (save/disable IF, spin, restore) protects heap and scheduler;
+   the serial sink lock also disables interrupts for the write. Plain
+   `SpinLock` remains for pre-interrupt-only paths.
+
+**Alternatives considered.** Identity-mapping the kernel by hand with its own
+new PML4 entries (rejected: duplicating Limine's layout risks missing regions);
+moving the heap into kernel-image space (rejected for now: HHDM lease is
+simplest and testable); wiring `PageTables::map_mmio_2m` to mutate the *kernel*
+space after activation (kept: it walks live CR3, so it now edits the kernel
+half — this is acceptable for one live CPU).
+
+**Evidence.** QEMU BIOS 256 MiB/512 MiB/1 GiB and VirtualBox BIOS all reach
+`PROJECT_OS_BOOT_SUCCESS:...checks=...,heap,vm,sched`; `vm selftest: passed
+(map/unmap, translate, W^X, guard refusals, CR3 swap)`; `kernel heap selftest:
+passed`; host `cargo test -p os_core`: 53 passed.
+
+**Consequences.** The heap’s fixed 8 MiB is a hard ceiling until kernel-space
+mapping and reclaim exist. Huge-page splitting and 5-level paging are not
+supported. Freeing bootloader tables will be a later, separate decision with its
+own safety analysis.
+
+## ADR-0013 – Cooperative + timer-preempted kernel threads (Phase 5a)
+
+**Context.** With IRQ0 working and an IRQ-safe lock available, the next
+milestone is kernel threads and a scheduler strong enough to prove isolation of
+stacks and preemption.
+
+**Decision.** Thread 0 is the boot context; up to 15 more threads get 16 KiB
+kernel stacks. Context switch (`arch/x86_64/context.rs`) saves only
+callee-saved registers and swaps RSP; the trampoline fabricates the initial
+frame so a new thread starts with the SysV stack alignment. Preemption: the
+timer ISR sets `need_resched` when another thread is runnable; the switch is
+performed at the tail of `exception_dispatch` so the interrupted thread keeps
+its IRQ frame on its own stack and unwinds later through the original `iretq`.
+Interrupts stay disabled across the switch; trampolines re-enable. Stacks of
+exited threads are freed at the next scheduling point on another thread's
+context.
+
+**Alternatives considered.** Switching from inside `context_switch` while
+holding the scheduler lock (rejected: lock alive across switch / possible
+double-switch); full `iretq` frame surgery in the switch (rejected: complexity,
+easier to leave frames on per-thread stacks); separate per-thread TSS (not
+needed for ring-0 threads; needed later for ring 3).
+
+**Evidence.** QEMU BIOS 256 MiB/512 MiB/1 GiB (512 MiB: 24 switches, 11
+preemptions) and VirtualBox (21 switches, 8 preemptions): five A/B yields,
+spinner completed under preemption, `sched selftest: passed`.
+
+**Consequences.** Cooperative + preemptive kernel threads exist, but there is
+no priority, sleep/wake or SMP; idle is `hlt` in thread 0; a thread cannot yet
+own user-mode state (Phase 5b).
+
+## ADR-0014 – Ring 3 via `int 0x80`, embedded test programs, one user thread (Phase 5b)
+
+**Context.** The VM manager (ADR-0012) can build user address spaces and the
+scheduler (ADR-0013) can run threads, but no code has executed below CPL0. The
+first ring-3 milestone must prove: a user program runs at CPL3 in its own
+address space, syscalls reach the kernel through a validated boundary, and a
+user fault kills only that thread.
+
+**Decision.**
+
+- **Gate:** a DPL3 interrupt gate at vector `0x80` (not `syscall`/`sysret`):
+  the existing 15-register exception frame already carries every argument
+  register and is reachable from ring 3 by installing the gate with DPL3, so
+  no additional entry path is needed. Argument registers are Windows-style
+  (`rax` service, `rcx`/`rdx`/`r8`/`r9` arguments) so the PE compatibility
+  layer can reuse the gate.
+- **Services (minimal):** `1 write(fd=1, buf, len)` with `len <= 4096`, and
+  `2 exit(code)`. Every pointer is validated against the live CR3: canonical
+  user half, whole span below the user/kernel boundary, and every touched page
+  mapped with the USER bit before the kernel reads a byte.
+- **Test programs:** assembled with `global_asm!`, copied from kernel text
+  into fresh user frames of a `new_like_kernel` address space (kernel half
+  shared with the boot template). Program A writes and exits 0; program B
+  dereferences an unmapped user address. No ELF loader yet — this keeps the
+  ring-3 boundary the only new variable.
+- **Fault isolation:** any exception taken with `cs & 3 == 3` is reported,
+  counted and turned into `sched::exit()` (thread killed, kernel continues);
+  kernel-mode exceptions stay fatal.
+- **One user thread at a time:** the TSS `rsp0` is a single global, so the
+  demo runs programs sequentially (`spawn A → join → spawn B → join`), each
+  with `set_tss_rsp0` pointed at that thread's kernel stack before `iretq`.
+  Concurrent user threads need per-thread TSS support and are explicitly out
+  of scope for this milestone.
+- **Teardown:** after both joins the kernel reactivates its PML4, unmaps and
+  frees the user frames, and destroys the page tables. The stale TSS `rsp0`
+  is harmless because no ring-3 entry happens after teardown.
+
+**Alternatives considered.** `syscall`/`sysret` (rejected for now: needs
+MSR programming, a swapgs/stack-switch stub and its own frame layout);
+per-thread TSS (deferred until concurrent user threads); loading a Limine
+module as the user program (deferred to Phase 6/7, when a real ELF/PE loader
+exists).
+
+**Evidence.** QEMU BIOS 256 MiB/512 MiB/1 GiB and VirtualBox all print
+`user: hello from ring 3 via int 0x80`, `syscall: thread exits with code 0`,
+`user fault isolated: vector=14 ... cr2=0x500000000 (thread killed, kernel
+continues)`, `user: ring-3 program exited (code 0), 1 write(s), 37 bytes,
+1 isolated fault(s), 0 rejected syscall(s)` and reach
+`checks=...,heap,vm,sched,user`. Host unit suite: 54 passed, 0 failed.
+
+**Consequences.** The first ring-3 boundary is real and tested end to end,
+but user programs are embedded test fixtures, one runs at a time, and there is
+no process model (no fork/exec, handles or per-process resources). Those arrive
+with the VFS/process work (Phase 6).

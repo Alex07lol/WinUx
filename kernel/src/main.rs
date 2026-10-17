@@ -1,23 +1,30 @@
 #![no_std]
 #![no_main]
 
-//! PROJECT_OS kernel — first bootable milestone.
+//! PROJECT_OS kernel — boot bring-up through heaps and memory management.
 //!
 //! Boot chain: Limine (bootloader) -> `_start` in `entry.S` -> `kmain`.
 //! The kernel is a modular monolithic x86-64 kernel written in freestanding
 //! Rust. This milestone validates the handoff, records the firmware memory map,
-//! initialises descriptor tables, a physical frame allocator and a legacy
-//! timer, then reports a unique success marker on serial before entering a
-//! controlled idle loop.
+//! initialises descriptor tables, a physical frame allocator, a kernel heap
+//! with the global allocator and a legacy timer, then reports a unique success
+//! marker on serial before entering a controlled idle loop.
+
+extern crate alloc;
 
 mod arch;
 mod display;
 mod font;
+mod heap;
 mod limine;
 mod memory;
 mod panic;
+mod sched;
 mod serial;
 mod sync;
+mod syscall;
+mod user;
+mod vm;
 
 use core::arch::{asm, global_asm};
 use core::sync::atomic::Ordering;
@@ -400,6 +407,33 @@ pub extern "C" fn kmain() -> ! {
             format_args!("frame allocator selftest failed: {}", error),
         ),
     }
+    let heap_stats = match heap::init(hhdm_offset) {
+        Ok(stats) => stats,
+        Err(error) => fatal(Some(&mut display), format_args!("{}", error)),
+    };
+    kprintln!(
+        "kernel heap: {} KiB region, {} KiB free, {} blocks, largest {} B",
+        heap::HEAP_BYTES / 1024,
+        heap_stats.free_bytes / 1024,
+        heap_stats.block_count,
+        heap_stats.largest_free_block
+    );
+    match heap::self_test() {
+        Ok(_) => kprintln!("kernel heap selftest: passed (box, vec growth, 1 MiB block)"),
+        Err(error) => fatal(
+            Some(&mut display),
+            format_args!("kernel heap selftest failed: {}", error),
+        ),
+    }
+
+    if let Err(error) = vm::init(hhdm_offset) {
+        fatal(Some(&mut display), format_args!("{}", error));
+    }
+    kprintln!(
+        "vm: kernel-owned 4-level tables active (CR3 {:#x}), W^X enforced",
+        vm::kernel_pml4().unwrap_or(0)
+    );
+    kprintln!("vm selftest: passed (map/unmap, translate, W^X, guard refusals, CR3 swap)");
     display.set_frames(FramesInfo {
         free_frames: allocator_stats.free_frames as u64,
         total_frames: allocator_stats.total_frames as u64,
@@ -408,8 +442,10 @@ pub extern "C" fn kmain() -> ! {
     display.set_row(
         5,
         format_args!(
-            "{} / {} frames free",
-            allocator_stats.free_frames, allocator_stats.total_frames
+            "{} / {} frames | heap {} KiB",
+            allocator_stats.free_frames,
+            allocator_stats.total_frames,
+            heap_stats.free_bytes / 1024
         ),
         Status::Ok,
     );
@@ -417,7 +453,7 @@ pub extern "C" fn kmain() -> ! {
     arch::x86_64::gdt::init();
     kprintln!("gdt: loaded (kernel code/data, TSS, IST1 double-fault stack)");
     idt::init();
-    kprintln!("idt: loaded (32 exception gates + IRQ0)");
+    kprintln!("idt: loaded (32 exception gates + IRQ0 + int 0x80 syscall gate)");
 
     // Deliberate breakpoint: exercises the gate, stub, Rust dispatcher and
     // iretq before interrupts are enabled.
@@ -462,9 +498,51 @@ pub extern "C" fn kmain() -> ! {
         Status::Ok,
     );
 
+    let tsc_frequency = limine::get()
+        .tsc_frequency
+        .get()
+        .map(|response| response.frequency)
+        .filter(|frequency| *frequency > 0);
+    if let Err(error) = sched::init(hhdm_offset) {
+        fatal(Some(&mut display), format_args!("{}", error));
+    }
+    match sched::demo(tsc_frequency) {
+        Ok(report) => kprintln!(
+            "sched: {} workers finished (a={}, b={}, spinner={}), {} switches, {} preemptions, {} live",
+            report.worker_a_steps.min(report.worker_b_steps),
+            report.worker_a_steps,
+            report.worker_b_steps,
+            report.spinner_done,
+            report.stats.switches,
+            report.stats.preemptions,
+            report.stats.live
+        ),
+        Err(error) => fatal(
+            Some(&mut display),
+            format_args!("scheduler selftest failed: {}", error),
+        ),
+    }
+    kprintln!("sched selftest: passed (round-robin yield + timer preemption)");
+
+    match user::demo(tsc_frequency) {
+        Ok(report) => kprintln!(
+            "user: ring-3 program exited (code {}), {} write(s), {} bytes, {} isolated fault(s), {} rejected syscall(s)",
+            report.exit_code,
+            report.write_calls,
+            report.bytes_written,
+            report.user_faults,
+            report.rejected_syscalls
+        ),
+        Err(error) => fatal(
+            Some(&mut display),
+            format_args!("user-mode selftest failed: {}", error),
+        ),
+    }
+    kprintln!("user selftest: passed (int 0x80 write/exit from CPL3, user fault isolated)");
+
     display.success();
     kprintln!(
-        "PROJECT_OS_BOOT_SUCCESS:{} checks=handoff,memmap,gdt,idt,exceptions,timer,allocator",
+        "PROJECT_OS_BOOT_SUCCESS:{} checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user",
         BUILD_ID
     );
 

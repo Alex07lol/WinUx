@@ -54,6 +54,17 @@ pub fn force_write_str(text: &str) {
     }
 }
 
+/// Lock-free raw-byte write used by the syscall boundary (the kernel validates
+/// the user buffer before calling this).
+pub fn force_write_bytes(bytes: &[u8]) {
+    for &byte in bytes {
+        if byte == b'\n' {
+            write_byte(b'\r');
+        }
+        write_byte(byte);
+    }
+}
+
 pub fn force_print(args: fmt::Arguments<'_>) {
     struct ForceWriter;
     impl Write for ForceWriter {
@@ -80,6 +91,10 @@ impl Write for SerialWriter {
 }
 
 pub fn _print(args: fmt::Arguments<'_>) {
+    // Interrupts are disabled while the lock is held so a thread preempted
+    // mid-write cannot leave another thread spinning on a lock that only the
+    // preempted thread can release. `force_*` callers stay lock-free.
+    let flags = crate::arch::x86_64::interrupts_save_disable();
     while LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -88,6 +103,7 @@ pub fn _print(args: fmt::Arguments<'_>) {
     }
     let _ = SerialWriter.write_fmt(args);
     LOCK.store(false, Ordering::Release);
+    crate::arch::x86_64::interrupts_restore(flags);
 }
 
 #[macro_export]

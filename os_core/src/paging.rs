@@ -12,14 +12,30 @@ pub const ENTRY_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
+pub const USER: u64 = 1 << 2;
 pub const WRITE_THROUGH: u64 = 1 << 3;
 pub const CACHE_DISABLE: u64 = 1 << 4;
 pub const HUGE_PAGE: u64 = 1 << 7;
+pub const NO_EXECUTE: u64 = 1 << 63;
 
 /// Flags for an uncached MMIO mapping.
 pub const MMIO_FLAGS: u64 = PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE;
 /// Flags for a 2 MiB uncached MMIO mapping.
 pub const MMIO_FLAGS_2M: u64 = MMIO_FLAGS | HUGE_PAGE;
+/// Flags for writable kernel data (never executable: W^X).
+pub const KERNEL_DATA: u64 = PRESENT | WRITABLE | NO_EXECUTE;
+/// Flags for read-only kernel code (executable).
+pub const KERNEL_CODE: u64 = PRESENT;
+/// Flags for writable user data (never executable: W^X).
+pub const USER_DATA: u64 = PRESENT | WRITABLE | USER | NO_EXECUTE;
+/// Flags for read-only user code (executable).
+pub const USER_CODE: u64 = PRESENT | USER;
+
+/// The kernel's W^X policy, applied to every mapping request: a writable page
+/// must also be non-executable. Read-only pages may be executable.
+pub fn is_wx_safe(flags: u64) -> bool {
+    !(flags & WRITABLE != 0 && flags & NO_EXECUTE == 0)
+}
 
 /// Indices into PML4, PDPT, PD and PT for a 4-level virtual address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,5 +137,19 @@ mod tests {
         assert_eq!(MMIO_FLAGS_2M & CACHE_DISABLE, CACHE_DISABLE);
         assert_eq!(MMIO_FLAGS_2M & WRITE_THROUGH, WRITE_THROUGH);
         assert_eq!(MMIO_FLAGS & HUGE_PAGE, 0);
+    }
+
+    #[test]
+    fn wx_policy_rejects_writable_executable_pages() {
+        assert!(is_wx_safe(USER_CODE));
+        assert!(is_wx_safe(USER_DATA));
+        assert!(is_wx_safe(KERNEL_CODE));
+        assert!(is_wx_safe(KERNEL_DATA));
+        // Writable without NX is the violation the policy exists for.
+        assert!(!is_wx_safe(PRESENT | WRITABLE));
+        assert!(!is_wx_safe(USER_CODE | WRITABLE));
+        // Read-only and executable is allowed; read-only and NX is allowed.
+        assert!(is_wx_safe(PRESENT));
+        assert!(is_wx_safe(PRESENT | NO_EXECUTE));
     }
 }

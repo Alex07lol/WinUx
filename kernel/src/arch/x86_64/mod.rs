@@ -1,4 +1,5 @@
 pub mod apic;
+pub mod context;
 pub mod gdt;
 pub mod idt;
 pub mod io;
@@ -16,6 +17,26 @@ pub fn interrupts_disable() {
 pub fn interrupts_enable() {
     // SAFETY: the IDT is installed before this is called.
     unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
+}
+
+/// Disable interrupts and return the previous RFLAGS value for
+/// [`interrupts_restore`]. Used by IRQ-safe locks so a lock taken with
+/// interrupts enabled cannot be interrupted while held (which could otherwise
+/// deadlock on a single CPU, since interrupt handlers never block).
+pub fn interrupts_save_disable() -> u64 {
+    let flags: u64;
+    // SAFETY: `pushfq`/`pop`/`cli` are valid in ring 0. The stack is balanced
+    // by the end of the block.
+    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    flags
+}
+
+/// Restore RFLAGS saved by [`interrupts_save_disable`]. Only the interrupted
+/// context's flags should be passed back.
+pub fn interrupts_restore(flags: u64) {
+    // SAFETY: restoring previously saved RFLAGS in ring 0 is valid; the caller
+    // passes flags saved by `interrupts_save_disable` on this CPU.
+    unsafe { asm!("push {}", "popfq", in(reg) flags) };
 }
 
 pub fn halt() {

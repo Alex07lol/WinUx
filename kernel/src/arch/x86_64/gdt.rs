@@ -2,7 +2,8 @@
 //!
 //! Limine supplies a usable GDT, but the kernel must own its descriptor tables
 //! before installing an IDT with an IST-backed double-fault handler. Selectors:
-//! 0x08 kernel code, 0x10 kernel data, 0x18 TSS.
+//! 0x08 kernel code, 0x10 kernel data, 0x18 TSS (two slots), 0x28 user data
+//! (DPL3 → 0x2b), 0x30 user code (DPL3 → 0x33).
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -48,7 +49,12 @@ struct SyncCell<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for SyncCell<T> {}
 
 static TSS: SyncCell<Tss> = SyncCell(UnsafeCell::new(Tss::zeroed()));
-static GDT: SyncCell<[u64; 5]> = SyncCell(UnsafeCell::new([0; 5]));
+static GDT: SyncCell<[u64; 7]> = SyncCell(UnsafeCell::new([0; 7]));
+
+/// User data selector (DPL3).
+pub const USER_DATA_SELECTOR: u16 = 0x28 | 3;
+/// User code selector (DPL3).
+pub const USER_CODE_SELECTOR: u16 = 0x30 | 3;
 
 #[repr(C, packed)]
 struct DescriptorTablePointer {
@@ -62,9 +68,16 @@ fn tss() -> &'static mut Tss {
     unsafe { &mut *TSS.0.get() }
 }
 
-fn gdt() -> &'static mut [u64; 5] {
+fn gdt() -> &'static mut [u64; 7] {
     // SAFETY: as above.
     unsafe { &mut *GDT.0.get() }
+}
+
+/// Point the TSS `rsp0` at the kernel stack that ring-3 entries (interrupts,
+/// exceptions and `int 0x80` coming from CPL3) must use. Called before every
+/// switch into user mode with the current thread's kernel stack top.
+pub fn set_tss_rsp0(value: u64) {
+    tss().rsp0 = value & !0xf;
 }
 
 fn make_tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
@@ -104,9 +117,13 @@ pub fn init() {
     let [low, high] = make_tss_descriptor(tss_base, (core::mem::size_of::<Tss>() - 1) as u32);
     entries[3] = low;
     entries[4] = high;
+    // 64-bit user data (0x28|3 = 0x2b): present, writable, DPL3.
+    entries[5] = 0x00af_f200_0000_ffff;
+    // 64-bit user code (0x30|3 = 0x33): present, readable, DPL3.
+    entries[6] = 0x00af_fa00_0000_ffff;
 
     let pointer = DescriptorTablePointer {
-        limit: (core::mem::size_of::<[u64; 5]>() - 1) as u16,
+        limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
         base: entries.as_ptr() as u64,
     };
 

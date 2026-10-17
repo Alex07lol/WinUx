@@ -1,0 +1,15 @@
+[package]
+name = "project_os_kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PROJECT_OS x86-64 kernel"
+
+[dependencies]
+os_core = { workspace = true }
+
+[[bin]]
+name = "project_os_kernel"
+path = "src/main.rs"
+

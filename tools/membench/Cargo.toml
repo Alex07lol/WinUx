@@ -1,0 +1,10 @@
+[package]
+name = "membench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Reproducible host benchmark for the PROJECT_OS physical frame allocator"
+
+[dependencies]
+os_core = { workspace = true }

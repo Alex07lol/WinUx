@@ -1,0 +1,10 @@
+/target/
+/artifacts/*
+!/artifacts/.gitkeep
+/boot/limine/*
+!/boot/limine/.gitkeep
+/third_party/
+*.iso
+*.img
+*.log
+/tmp/

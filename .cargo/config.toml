@@ -1,0 +1,10 @@
+[target.x86_64-unknown-none]
+# The built-in target already selects rust-lld, kernel code model, no red zone
+# and panic=abort. Static relocation is required because Limine loads a fixed
+# address image and performs no runtime relocation processing.
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+    "-C", "link-arg=-Tkernel/linker.ld",
+    "-C", "link-arg=--build-id=none",
+]

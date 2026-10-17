@@ -1,0 +1,18 @@
+# Pinned bootloader input for reproducible ISO builds.
+version = "12.9.3"
+release_url = "https://github.com/Limine-Bootloader/Limine/releases/download/v12.9.3/limine-binary.tar.xz"
+sha256 = "e02a473c6dc6df25159697f94930272397f21fd86e5d4eeee61bba72c95ec8d2"
+protocol_revision = 6
+
+assets = [
+  "limine-bios.sys",
+  "limine-bios-cd.bin",
+  "limine-uefi-cd.bin",
+  "BOOTX64.EFI",
+  "limine-tool-windows-x86/limine.exe",
+  "LICENSE",
+  "3RDPARTY.md",
+]
+
+license = "BSD-2-Clause (Limine); bundled third-party notices in 3RDPARTY.md"
+notes = "Downloaded by scripts/fetch_limine.sh, checksum-verified on every use, and ignored by Git."

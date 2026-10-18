@@ -48,11 +48,28 @@ check_optional python
 check_optional readelf
 
 if have rustup; then
-    if rustup target list --installed 2>/dev/null | grep -qx "$KERNEL_TARGET"; then
-        log "rust target installed: $KERNEL_TARGET"
+    for target in "$KERNEL_TARGET" x86_64-pc-windows-msvc; do
+        if rustup target list --installed 2>/dev/null | grep -qx "$target"; then
+            log "rust target installed: $target"
+        else
+            log "rust target missing: $target"
+            log "  fix: rustup target add $target"
+            missing_required=1
+        fi
+    done
+fi
+
+# The PE fixture build drives rust-lld directly (no MSVC/MinGW/Windows SDK).
+if have rustc; then
+    SYSROOT=$(rustc --print sysroot | sed 's|\\|/|g')
+    HOST=$(rustc -vV | sed -n 's/^host: //p')
+    RUST_LLD="$SYSROOT/lib/rustlib/$HOST/bin/rust-lld"
+    [ -x "$RUST_LLD" ] || RUST_LLD="$RUST_LLD.exe"
+    if [ -x "$RUST_LLD" ]; then
+        log "rust-lld present: $RUST_LLD"
     else
-        log "rust target missing: $KERNEL_TARGET"
-        log "  fix: rustup target add $KERNEL_TARGET"
+        log "rust-lld missing under $SYSROOT/lib/rustlib/$HOST/bin"
+        log "  fix: rustup component add rust-lld (or reinstall the toolchain)"
         missing_required=1
     fi
 fi

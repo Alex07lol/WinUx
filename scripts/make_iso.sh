@@ -45,6 +45,23 @@ for name in hello fault bad; do
     USER_ELFS="$USER_ELFS $artifact"
 done
 
+# PE32+ fixtures (Phase 7, stage 1) are modules too; build on demand and never
+# produce an ISO that references a missing .exe module.
+USER_PES=""
+for name in pehello pebad; do
+    artifact="$ROOT_DIR/artifacts/$name.exe"
+    if [ ! -f "$artifact" ]; then
+        log "PE fixture missing ($artifact); building"
+        "$ROOT_DIR/scripts/build_user_pe.sh"
+        break
+    fi
+done
+for name in pehello pebad; do
+    artifact="$ROOT_DIR/artifacts/$name.exe"
+    [ -f "$artifact" ] || die "PE fixture missing: $artifact"
+    USER_PES="$USER_PES $artifact"
+done
+
 if [ ! -f "$ROOT_DIR/boot/limine/limine-bios.sys" ]; then
     "$ROOT_DIR/scripts/fetch_limine.sh"
 fi
@@ -57,6 +74,9 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/boot" "$STAGE/EFI/BOOT" "$STAGE/licenses/rust"
 cp "$KERNEL_ARTIFACT" "$STAGE/boot/kernel.elf"
 for artifact in $USER_ELFS; do
+    cp "$artifact" "$STAGE/boot/$(basename "$artifact")"
+done
+for artifact in $USER_PES; do
     cp "$artifact" "$STAGE/boot/$(basename "$artifact")"
 done
 cp "$ROOT_DIR/boot/limine.conf" "$STAGE/limine.conf"

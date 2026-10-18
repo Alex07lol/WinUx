@@ -22,6 +22,7 @@ pub mod net;
 pub mod paging;
 pub mod path;
 pub mod pci;
+pub mod pe;
 pub mod pofs;
 pub mod rng;
 pub mod textcon;

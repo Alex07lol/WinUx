@@ -438,6 +438,80 @@ step in `test_all.sh`. Recorded as ADR-0018; the corrected loopback finding is
 also noted in `docs/NETWORK.md` §2 and §11. Limits (polled, static addressing,
 one NIC, no TCP/DHCP/IRQ) stay as stated in `docs/NETWORK.md` §10.
 
+## R-013 — PE32+ image layout, base relocations and a no-SDK fixture pipeline
+
+**Question.** What does the PE32+ (AMD64) on-disk layout require of a loader:
+which header fields are load-bearing, how are sections placed and mapped, how
+does the `.reloc` base-relocation table encode DIR64 fixups, and can genuine
+PE fixture binaries be produced with the pinned Rust toolchain alone — no
+MSVC, no MinGW, no Windows SDK, no Wine?
+
+**Sources.**
+- Microsoft *PE Format* specification (Win32 docs, document revision dated
+  2026-09-10; fetched 2026-10-18): MS-DOS stub with `e_lfanew` at `0x3C`;
+  `PE\0\0` signature; COFF file header (`Machine`, `NumberOfSections`,
+  `SizeOfOptionalHeader`, `Characteristics`: `EXECUTABLE_IMAGE` `0x0002`,
+  `RELOCS_STRIPPED` `0x0001`, `DLL` `0x2000`); PE32+ optional header (magic
+  `0x20B`, `AddressOfEntryPoint`, `ImageBase` 64 KiB-aligned,
+  `SectionAlignment` ≥ `FileAlignment`, `FileAlignment` power of two
+  512..64K, `SizeOfImage` multiple of `SectionAlignment`, `Subsystem` CUI = 3,
+  `NumberOfRvaAndSizes`); section table (40-byte entries: `VirtualSize`,
+  `VirtualAddress` aligned/ascending, `SizeOfRawData` multiple of
+  `FileAlignment`, `PointerToRawData`, characteristics
+  `MEM_EXECUTE/WRITE/READ`); data directories (base relocation = index 5);
+  base-relocation blocks (`Page RVA`, `Block Size`, 2-byte entries with
+  4-bit type — `0` ABSOLUTE skipped padding, `3` HIGHLOW (32-bit), `10`
+  DIR64 (64-bit) — and 12-bit in-page offset); delta rule (fixups applied
+  only when the load base differs from the preferred base); Windows loader
+  limit of 96 sections.
+- Toolchain probe (this checkout, 2026-10-18): `rustc 1.99.1` with the
+  `x86_64-pc-windows-msvc` target links a `no_std` binary with
+  `rust-lld -flavor link /nodefaultlib /entry:_start /subsystem:console`;
+  rust-lld ships inside the sysroot
+  (`lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe`). Probe output:
+  valid PE32+, 3584 bytes, 5 sections (`.text` RX, `.rdata` R, `.data` RW,
+  `.pdata` R, `.reloc` R), entry RVA `0x1000`, image base `0x140000000`,
+  subsystem 3, relocation directory RVA `0x5000` size 12 (one block, one
+  DIR64 entry from a `global_asm!` `.quad marker` slot). A Rust `static`
+  with an absolute function-pointer initializer is impossible (pointer→int
+  const-eval is rejected), which is why the slot is emitted via
+  `global_asm!`.
+
+**Claim.** A PE32+ loader needs the header/section/relocation validation as
+specified, can map sections per their alignment and flags with W^X derived
+from `MEM_EXECUTE`/`MEM_WRITE`, and can implement the delta rule by walking
+4 KiB relocation blocks and adding `loaded_base - image_base` to each DIR64
+target. Genuine fixture binaries are buildable from Rust source with the
+pinned toolchain (rustc COFF codegen + rust-lld PE linking, no CRT, our own
+entry); `e_lfanew`-targeted corruption (zeroed signature) yields a
+deterministic reject vector for the parser probe. Confidence high for the
+layout and delta rule (spec text); the fixture pipeline is verified by the
+probe above and end-to-end execution under the kernel loader (see the stage
+evidence in `docs/PE_LOADER.md`).
+
+**Experiment.** PASSED (2026-10-18). Commands: `scripts/build_user_pe.sh`,
+`scripts/test_pe_qemu.sh`, `scripts/test_all.sh` (PASS=22 FAIL=0 SKIP=4; the
+skip set is unchanged and unrelated). The final rust-lld fixture is 3072 bytes
+with **4** sections (`.text` RX, `.rdata` R, `.data` RW, `.reloc` R — no
+`.pdata`: the fixture has no unwind info, unlike the larger 5-section probe),
+entry RVA `0x1000`, image base `0x140000000`, one DIR64 entry. Observed serial
+lines (`artifacts/qemu-serial-pe.log`): `pe: 2 modules present`;
+`pe: pehello.exe loaded at 0x400000 (entry 0x401000, 4 sections, 1 relocation
+applied)`; `pe: hello from a PE32+ image via int 0x80`;
+`pe: base relocation verified`; `user: /boot/pebad.exe rejected (bad
+signature)`; `pe selftest: passed (PE32+ module loaded, base relocation
+applied, int 0x80 write from CPL3, corrupt module rejected)`; marker
+`checks=...,sched,user,elf,pe,vfs`. The ELF stage-3 lines and the full suite
+stayed green in the same run.
+
+**Conclusion.** Implemented: `os_core::pe` (host-tested parser, stable
+rejection labels), `kernel/src/pe_loader.rs` (window/W^X/relocation policy),
+`userland/pe/pehello` fixture workspace, `scripts/build_user_pe.sh`,
+`scripts/check_user_pe.py`, `scripts/test_pe_qemu.sh` and the `test_all.sh`
+`pe` step; recorded as ADR-0019. Limits (no imports/DLL/TLS/CLR/SEH, fixed
+load base, no third-party binaries) stay as stated in `docs/PE_LOADER.md`
+§1 and §9.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

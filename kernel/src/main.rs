@@ -24,6 +24,7 @@ mod memory;
 mod net;
 mod panic;
 mod pci;
+mod pe_loader;
 mod persist;
 mod sched;
 mod serial;
@@ -471,6 +472,13 @@ pub extern "C" fn kmain() -> ! {
             } else {
                 kprintln!("user selftest: skipped (no ELF modules present)");
             }
+            if report.pe {
+                kprintln!(
+                    "pe selftest: passed (PE32+ module loaded, base relocation applied, int 0x80 write from CPL3, corrupt module rejected)"
+                );
+            } else {
+                kprintln!("pe selftest: skipped (no PE modules present)");
+            }
             report
         }
         Err(error) => fatal(format_args!("user-mode selftest failed: {}", error)),
@@ -500,6 +508,9 @@ pub extern "C" fn kmain() -> ! {
         String::from("handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user");
     if user_report.elf {
         checks.push_str(",elf");
+    }
+    if user_report.pe {
+        checks.push_str(",pe");
     }
     checks.push_str(",vfs");
     if blk::info().is_some() {

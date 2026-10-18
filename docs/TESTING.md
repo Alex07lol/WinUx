@@ -30,17 +30,19 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 
 | Command | Proves | Recorded result |
 |---|---|---|
-| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 20 PASS, 0 FAIL, 4 SKIP |
-| `scripts/bootstrap.sh` | required tools and Rust target exist | PASS |
-| `scripts/format.sh` | `rustfmt --check` clean (kernel workspace and userland) | PASS |
-| `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland | PASS |
-| `scripts/test_unit.sh` | 179 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors, PCI config/BAR math, Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (179/179) |
+| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 22 PASS, 0 FAIL, 4 SKIP |
+| `scripts/bootstrap.sh` | required tools and Rust targets (incl. `x86_64-pc-windows-msvc` and `rust-lld`) exist | PASS |
+| `scripts/format.sh` | `rustfmt --check` clean (kernel workspace, userland, `userland/pe`) | PASS |
+| `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland, `userland/pe` | PASS |
+| `scripts/test_unit.sh` | 235 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors, PE32+ parser incl. all rejection vectors and relocation walk, PCI config/BAR math, Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (235/235) |
 | `scripts/build.sh` | kernel builds; ELF entry and Limine requests verified | PASS |
 | `scripts/build_user.sh` | userland workspace builds; `hello`/`fault` pass the header checker; `bad.elf` fails with `bad magic` | PASS |
-| `scripts/make_iso.sh` | ISO built (kernel + three modules); both El Torito entries verified | PASS |
+| `scripts/build_user_pe.sh` | `userland/pe` builds via rust-lld; `pehello.exe` passes `check_user_pe.py`; `pebad.exe` fails with `bad signature` | PASS |
+| `scripts/make_iso.sh` | ISO built (kernel + three ELF modules + two PE modules); both El Torito entries verified | PASS |
 | `scripts/test_boot_qemu.sh` | BIOS boot at 256 MiB, 512 MiB and 1 GiB; marker; no panic; debug-exit 33 | PASS (all three) |
 | `scripts/test_boot_qemu.sh --firmware uefi` | UEFI boot | SKIP (no `OVMF_FD`) |
 | `scripts/test_elf_qemu.sh` | ELF64 module self-test: 3 modules present, ring-3 greeting from the ELF, exit 0, one isolated fault, `bad.elf` rejected, `,elf` marker | PASS |
+| `scripts/test_pe_qemu.sh` | PE32+ module self-test: 2 modules present, load line with 4 sections and 1 relocation, ring-3 greeting from the PE, base relocation verified, `pebad.exe` rejected with `bad signature`, `pe selftest: passed`, `,pe` marker | PASS |
 | `scripts/test_memory.sh` | allocator host tests + in-VM allocator self-test | PASS (both) |
 | `scripts/test_vfs.sh` | host path tests + in-VM VFS self-test | PASS (both) |
 | `scripts/test_shell_qemu.sh` | scripted interactive shell session over a paced TCP serial chardev | PASS (17 commands) |
@@ -72,14 +74,16 @@ qemu-system-x86_64 \
 The kernel prints a unique marker only after all checks:
 
 ```text
-PROJECT_OS_BOOT_SUCCESS:<build-id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,vfs
+PROJECT_OS_BOOT_SUCCESS:<build-id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,vfs
 ```
 
 The `,elf` component is inserted between `user` and `vfs` only when the ELF64
-module self-test ran (ADR-0017). Correction note: stage 2 described the no-disk
+module self-test ran (ADR-0017), and `,pe` after `,elf` only when the PE32+
+self-test ran (ADR-0019). Correction note: stage 2 described the no-disk
 marker as byte-identical to stage 1; the segment between `user` and `vfs` now
-carries `elf`, so the byte-identical wording applies to the `vfs`-onward suffix
-(`vfs,blk,persist`) that the persistence test pins, not to the full line.
+carries `elf` (and, with PE modules present, `pe`), so the byte-identical
+wording applies to the `vfs`-onward suffix (`vfs,blk,persist`) that the
+persistence test pins, not to the full line.
 
 Failure conditions:
 
@@ -124,8 +128,13 @@ and the kernel idles, so the same ISO can be booted manually.
     before any allocation; `hello.elf` performs an `int 0x80` write and exits 0
     from CPL3; `fault.elf` produces one isolated user page fault that kills
     only the user thread.
-14. VFS self-test: create/read/append/overwrite/remove/list and the error paths.
-15. Framebuffer console self-test: the whole grid plus cursor is re-rendered in
+14. PE self-test (when `.exe` modules are present): `pebad.exe` rejected before
+    any allocation (`bad signature`); `pehello.exe` parsed, mapped with W^X
+    section flags, base-relocated with a nonzero DIR64 delta, executed at CPL3
+    performing exactly two `int 0x80` writes and exiting 0 — including the
+    fixture's own relocated-pointer comparison; no new user faults.
+15. VFS self-test: create/read/append/overwrite/remove/list and the error paths.
+16. Framebuffer console self-test: the whole grid plus cursor is re-rendered in
     host-testable code, `sfence` is executed, and the framebuffer bytes are read
     back and compared scanline by scanline; any mismatch is a `PROJECT_OS_FATAL`.
     The console also logs its activation line (`fbcon: enabled ...` or the
@@ -135,7 +144,7 @@ After the timer is verified, the kernel probes the PIIX primary master
 (`blk`), then loads the best checkpoint slot or formats a fresh disk
 (`persist`). Both steps are conditional: without a disk the kernel logs
 `blk: no ATA device on primary channel` / `persist: inactive (no ATA disk)`
-and the marker is `checks=...,user,elf,vfs`. With a usable disk the marker
+and the marker is `checks=...,user,elf,pe,vfs`. With a usable disk the marker
 gains `,blk,persist`.
 
 ## Interactive shell test details

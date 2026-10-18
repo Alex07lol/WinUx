@@ -70,7 +70,7 @@ impl Inspection {
 /// The module content as a byte slice. Module addresses are HHDM-virtual and
 /// valid for the kernel lifetime; a null address or zero size yields an empty
 /// slice, which the parser rejects as truncated.
-fn module_bytes(module: &limine::File) -> &'static [u8] {
+pub(crate) fn module_bytes(module: &limine::File) -> &'static [u8] {
     if module.address.is_null() || module.size == 0 {
         return &[];
     }

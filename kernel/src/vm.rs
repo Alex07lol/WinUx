@@ -71,7 +71,7 @@ fn write_cr3(value: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) value, options(nostack, preserves_flags)) };
 }
 
-fn flush(virtual_address: u64) {
+pub(crate) fn flush(virtual_address: u64) {
     // SAFETY: `invlpg` is valid in ring 0 for any address; it only drops a
     // TLB entry.
     unsafe {

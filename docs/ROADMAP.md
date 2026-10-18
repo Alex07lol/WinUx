@@ -178,6 +178,17 @@ QEMU/VirtualBox BIOS scope; the limits recorded in each stage's spec still
 apply (no filesystem beyond the checkpoint image, serial-only console, polled
 e1000 with static addressing).
 
+## Phase 7 stage 1 (2026-10-18): PE32+ loader
+
+Implemented and verified: a host-tested PE32+ parser (`os_core::pe`), a kernel
+loader (`kernel/src/pe_loader.rs`) that maps W^X sections into a fresh user
+address space and applies DIR64 base relocations under a fixed 1 MiB window at
+`0x400000`, and a genuine rust-lld PE fixture executed at CPL3 via `int 0x80`
+(see R-013, ADR-0019, `docs/PE_LOADER.md`). A corrupt PE module is rejected
+without harming boot; `test_all.sh` reports PASS=22 FAIL=0 SKIP=4. Remaining
+Phase 7 items (Win32/NT console API surface, imports, DLLs, SEH, TLS, PE32)
+are explicitly deferred; no compatibility claim is made.
+
 ## Phase 7 acceptance (planned)
 
 PE parser/loader handles malformed inputs safely; a named set of controlled

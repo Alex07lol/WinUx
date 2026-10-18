@@ -9,6 +9,7 @@ ReactOS or NVIDIA implementation source is copied into this repository.
 | Component | License | Notes |
 |---|---|---|
 | PROJECT_OS kernel, `os_core`, scripts, docs, 5x7 font, dashboard design | MIT (`LICENSE`) | Original work created for this project |
+| `userland/` ELF programs and the `userland/pe` PE32+ fixture | MIT (`LICENSE`) | Original work; no new third-party code — the fixtures are compiled and linked by the already-documented Rust toolchain (rust-lld ships inside it; no MSVC/MinGW/Windows SDK) and the linked `core`/`compiler_builtins` crates are the same Rust runtime already documented below |
 
 There are **no Rust crate dependencies**; the workspace uses only `core`/`std`
 from the pinned toolchain. The 5x7 font was authored for this project, so no font
@@ -42,8 +43,10 @@ The build tools themselves are not included in the ISO. The kernel does link
 Rust's `core` and `compiler_builtins`; Rust is MIT OR Apache-2.0. The ISO
 includes `licenses/rust/COPYRIGHT-library.html` and the accompanying license
 texts under `/licenses/rust` to satisfy the notice requirements for that linked
-code. Package-manager metadata was used for the cdrtools/QEMU license
-identification; verify exact upstream files before redistributing those tools.
+code; the PE32+ fixture modules shipped on the ISO link the same Rust runtime
+built for `x86_64-pc-windows-msvc`, covered by the same notices. Package-manager
+metadata was used for the cdrtools/QEMU license identification; verify exact
+upstream files before redistributing those tools.
 
 ## Specifications and documentation consulted (no code copied)
 

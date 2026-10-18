@@ -605,3 +605,71 @@ to the local subnet only, one NIC on bus 0, no TCP/DHCP/DNS, fragmented IPv4
 rejected, no RX offload. Reconsider when interrupt-driven devices (Phase 9) or
 a socket/NIC-abstraction layer exist.
 
+## ADR-0019 – PE32+ loading of Windows-target fixtures, real-linker only (Phase 7, stage 1)
+
+**Context.** Phase 7's goal is a PE loader followed by minimal native Windows
+console compatibility. Before any Win32 API work, the loader itself must be
+proven with genuine PE images: the format as produced by a real toolchain,
+parsed by host-tested code, mapped with W^X policy and **base-relocated**,
+without ever involving Wine, MinGW, the Windows SDK or a Windows VM. The full
+contract (pinned serial lines, test plan, limits) lives in
+`docs/PE_LOADER.md`; the research record is R-013.
+
+**Decision.**
+
+- **Fixtures are genuine rustc + rust-lld output, built from our own Rust
+  source.** `userland/pe/pehello` (separate workspace, `#![no_std]`,
+  `#![no_main]`) is compiled for `x86_64-pc-windows-msvc` and linked by the
+  `rust-lld` that ships inside the pinned Rust toolchain, with
+  `/nodefaultlib /entry:_start /subsystem:console` — no CRT, no MSVC, no
+  MinGW, no Windows SDK. A hand-written PE emitter was rejected: it would
+  test our own simplification instead of real linker output.
+- **Load at the fixed 1 MiB code window (`0x400000`), always apply
+  relocations.** The fixture links at the lld default base (`0x140000000`),
+  so the delta is nonzero and the DIR64 path runs in every boot. The fixture
+  verifies the fixup itself: a `global_asm!` `.quad marker` slot in `.data`
+  (Rust const-eval forbids a pointer-initialized static) must match the
+  runtime `lea` address of `marker`; a mismatch prints
+  `pe: base relocation mismatch` and exits 1, failing the selftest loudly.
+- **Reject-by-directory policy.** Images with non-empty import, delay-import,
+  TLS or CLR directories are rejected with named labels; export, resource,
+  exception (`.pdata`), debug, load-config and certificate directories are
+  ignored (they have no runtime effect until SEH/Win32 services exist). This
+  keeps "runs" from silently meaning "runs with missing semantics".
+- **Two-phase loader** (`inspect` then `map`) mirroring `kernel/src/loader.rs`:
+  the corrupt-module probe (`pebad.exe`, signature zeroed) fails before any
+  page is allocated.
+- **W^X is kernel policy, not parser policy**: `MEM_EXECUTE|MEM_WRITE`
+  sections are rejected (`WriteExecuteSection`); mapping uses
+  `USER_CODE`/`USER_DATA`/`NO_EXECUTE` exactly as the ELF loader does.
+- **DIR64 relocation targets must lie in a writable section and not cross a
+  page** (`RelocationTarget` otherwise) — both fixtures and real console
+  images satisfy this; it keeps the fixup a single translated 8-byte write.
+- **Marker token `,pe` after `,elf`**, gated on the PE selftest verdict, so
+  every existing marker test keeps its suffix semantics.
+
+**Alternatives considered.** Hand-emitted PE fixtures via a `tools/pegen`
+(less fidelity, more code to maintain); loading at the preferred base
+(destroys the relocation evidence); PE32 (32-bit) support (no consumer, the
+target is x86-64); accepting import/TLS directories and ignoring them
+(silently wrong semantics later); mapping relocation targets through a second
+mapping of the target page (needs page-table walking that `AddressSpace`
+does not expose; rejected as stage-1 scope creep).
+
+**Evidence.** Observed (to be recorded with logs in `progress.md`):
+`scripts/test_pe_qemu.sh` PASS with `pe: pehello.exe loaded at 0x400000
+(entry 0x401000, 5 sections, 1 relocation applied)`, fixture lines
+`pe: hello from a PE32+ image via int 0x80` / `pe: base relocation verified`,
+`user: /boot/pebad.exe rejected (bad signature)`, `pe selftest: passed (...)`,
+marker `...,user,elf,pe,vfs`; unit tests for the parser and builder; full
+`test_all.sh` run including VirtualBox.
+
+**Consequences.** The OS now executes its second real executable format with
+its own parser and loader, and the relocation engine required by ASLR-style
+loading exists (though no ASLR is implemented). Limits stay as stated in
+`docs/PE_LOADER.md` §1/§9: no imports/DLLs/exports, no Win32 API yet (stage 2
+of Phase 7), no SEH/TLS/CLR, no PE32, fixed window, one thread at a time,
+bootloader-provided modules only. No compatibility claim of any kind is made
+from this stage; the word "Windows" in the roadmap refers to this format and
+these fixtures, not to application support.
+

@@ -30,6 +30,7 @@ run lint "$ROOT_DIR/scripts/lint.sh"
 run unit "$ROOT_DIR/scripts/test_unit.sh"
 run build "$ROOT_DIR/scripts/build.sh"
 run userland "$ROOT_DIR/scripts/build_user.sh"
+run userland-pe "$ROOT_DIR/scripts/build_user_pe.sh"
 run iso "$ROOT_DIR/scripts/make_iso.sh" --no-build
 run verify-iso "$ROOT_DIR/scripts/test_iso.sh"
 run boot-qemu-bios "$ROOT_DIR/scripts/test_boot_qemu.sh" "$ISO_PATH" --firmware bios --memory 512M \
@@ -40,6 +41,7 @@ run boot-qemu-bios-1g "$ROOT_DIR/scripts/test_boot_qemu.sh" "$ISO_PATH" --firmwa
     --serial-log "$ROOT_DIR/artifacts/qemu-serial-1g.log" --timeout 90
 run boot-qemu-uefi "$ROOT_DIR/scripts/test_boot_qemu.sh" "$ISO_PATH" --firmware uefi --timeout 90
 run elf "$ROOT_DIR/scripts/test_elf_qemu.sh"
+run pe "$ROOT_DIR/scripts/test_pe_qemu.sh"
 run memory "$ROOT_DIR/scripts/test_memory.sh"
 run vfs "$ROOT_DIR/scripts/test_vfs.sh"
 run graphics-host "$ROOT_DIR/scripts/test_graphics_host.sh"

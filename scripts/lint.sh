@@ -16,4 +16,6 @@ log "clippy: kernel ($KERNEL_TARGET)"
 cargo clippy -p "$KERNEL_BIN" --target "$KERNEL_TARGET" --release -- -D warnings
 log "clippy: userland ($KERNEL_TARGET)"
 (cd "$ROOT_DIR/userland" && cargo clippy -- -D warnings)
+log "clippy: userland/pe (x86_64-pc-windows-msvc, release)"
+(cd "$ROOT_DIR/userland/pe" && cargo clippy --release --target x86_64-pc-windows-msvc -- -D warnings)
 log "PASS: lint"

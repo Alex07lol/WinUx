@@ -83,8 +83,9 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/vm.rs` | own 4-level PML4, map/unmap/translate, W^X, user-half teardown | working |
 | `kernel/src/sched.rs` | 16 kernel threads, round-robin yield + timer preemption | working |
 | `kernel/src/syscall.rs` | `int 0x80` dispatch, pointer validation, user-fault kill path | working |
-| `kernel/src/user.rs` | ring-3 ELF module life cycle, iretq trampoline, teardown | working (ELF modules) |
+| `kernel/src/user.rs` | ring-3 module life cycle (ELF and PE), iretq trampoline, teardown | working (ELF + PE32+ modules) |
 | `kernel/src/loader.rs` | two-phase ELF64 module loader (`inspect`/`map`), code window, rollback | working (ADR-0017) |
+| `kernel/src/pe_loader.rs` | two-phase PE32+ loader: window/W^X policy and DIR64 base relocations | working (stage 1, ADR-0019) |
 | `kernel/src/console.rs` | IRQ4 receive ring, echo and line editing | working (serial only) |
 | `kernel/src/vfs.rs` | in-memory arena VFS, boot self-test, dirty tracking, export/replace for checkpoints | working |
 | `kernel/src/blk.rs` | ATA PIO block device (PIIX primary master, LBA28, polled) | working (QEMU `-machine pc`) |
@@ -103,6 +104,7 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/sync.rs` | `SpinLock` and RFLAGS-saving `IrqSpinLock` | working |
 | `kernel/src/panic.rs` | panic report and halt | working |
 | `userland/` | independent no_std cargo workspace: syscall runtime plus the `hello`/`fault` ELF programs | working (ADR-0017) |
+| `userland/pe/` | separate workspace: the `pehello` PE32+ fixture, linked by rust-lld without an SDK | working (ADR-0019) |
 | `os_core::memmap` | classification/accounting/validation | host-tested |
 | `os_core::fb` | geometry, pixel format, bounds, colour packing | host-tested |
 | `os_core::frame` | bitmap frame allocator | host- and in-VM-tested |
@@ -110,6 +112,7 @@ writable, which the segment permissions above guarantee.
 | `os_core::path` | VFS path validation and component splitting | host-tested |
 | `os_core::pofs` | checkpoint header/payload encode, decode, CRC32 | host-tested |
 | `os_core::elf` | ELF64 `ET_EXEC` parser: headers, segments, W^X and overlap policy | host-tested |
+| `os_core::pe` | PE32+ parser: headers, sections, data-directory policy, DIR64 relocations | host-tested |
 | `os_core::pci` | config-address construction, BAR decode and sizing | host-tested |
 | `os_core::net` | Ethernet/ARP/IPv4/ICMP/UDP codecs, RFC 1071 checksums, ARP cache with expiry | host-tested |
 | `os_core::font` | original 5x7 bitmap font (moved from the kernel for host tests) | host-tested |
@@ -128,11 +131,14 @@ refusals; `unmap` issues `invlpg` and releases frames. The bootloader tables are
 intentionally left allocated and unused for now; reclaiming bootloader-
 reclaimable memory is future work.
 
-Each ring-3 program is an ELF64 executable (`userland/` workspace, Rust
-`no_std`) shipped as a Limine module. `loader::inspect` parses and policy-checks
-it without allocating (segments inside `0x400000..0x500000`, entry executable);
-`loader::map` then allocates, zero-fills and maps each segment page with W^X
-flags and rolls every page back on failure. The program runs in a fresh address
+Each ring-3 program is an ELF64 executable or a PE32+ image (`userland/`
+workspace for ELF, `userland/pe/` for the PE fixture) shipped as a Limine
+module. `loader::inspect` / `pe_loader::inspect` parse and policy-check the
+module without allocating (sections inside `0x400000..0x500000`, entry
+executable, PE W^X and DIR64 relocation policy); `map` then allocates,
+zero-fills and maps each section/segment page with W^X flags, applies PE base
+relocations when the load base differs from the image's preferred base, and
+rolls every page back on failure. The program runs in a fresh address
 space cloned from the kernel-half template, with its segments and a zeroed
 one-page stack mapped in the lower half with the USER bit. Every syscall
 argument is validated against the live CR3 (`vm::translate_live`): canonical
@@ -191,8 +197,11 @@ as well (ADR-0014).
   timer, IOAPIC, MSI or HPET.
 - The kernel heap is a fixed 8 MiB region that does not grow on demand.
 - One user thread at a time (single TSS `rsp0`); program images are our own
-  ELF64 `ET_EXEC` modules loaded from Limine, with no PIE/dynamic linking,
-  no ASLR, no filesystem-backed exec and no process model (ADR-0017).
+  ELF64 `ET_EXEC` modules and PE32+ images loaded from Limine, with no
+  PIE/dynamic linking, no ASLR, no filesystem-backed exec and no process model
+  (ADR-0017, ADR-0019). The PE path is a loader only: no imports/IAT, DLLs,
+  exports, SEH/unwind, TLS, CLR, resources, PE32 or Win32 API surface exists,
+  so it is not Windows application compatibility (stage 1 of Phase 7).
 - The filesystem is a whole-tree checkpoint image: two 1 MiB slots on a
   PIIX-legacy ATA disk, flushed write-through at shell-command boundaries
   (ADR-0016). No journal, no AHCI/virtio, no DMA or IRQ14, and the disk path

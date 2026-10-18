@@ -11,4 +11,6 @@ log "checking formatting"
 cargo fmt --all -- --check
 log "checking formatting (userland)"
 (cd "$ROOT_DIR/userland" && cargo fmt --all -- --check)
+log "checking formatting (userland/pe)"
+(cd "$ROOT_DIR/userland/pe" && cargo fmt --all -- --check)
 log "PASS: formatting"

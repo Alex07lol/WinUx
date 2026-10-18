@@ -23,10 +23,12 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
 ## Repository state
 
 - Workspace root: this thread's local checkout.
-- Git: branch `main`, two commits (`77bb56e phase1`,
-  `0cc9372 heap, kernel-owned page tables, threads, ring 3`). The Phase 6
-  stage-1 through stage-3 work since then is uncommitted; nothing was reset
-  or discarded.
+- Git: branch `main`, three commits (`77bb56e phase1`, `0cc9372 heap, kernel-owned
+  page tables, threads, ring 3`, `43fdd7b phase6: serial console, vfs, shell,
+  ata checkpoint persistence, ring-3 elf64 module loader`). All Phase 6 work is
+  committed and pushed to `orgin/main`
+  (github.com/Alex07lol/WinUx); the working tree is clean. Nothing was reset or
+  discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
 - Case-insensitive host: `agents.md`, `STOP.md` and `PROGRESS.md` resolve to
@@ -480,9 +482,9 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 6 stage 3 is complete and verified; the next step is user review and (on
-request) a commit of the uncommitted Phase 6 work. After that, the remaining
-Phase 6 acceptance items are logging beyond COM1 and networking (QEMU user-mode
-NIC), in whichever order the user directs. The persistence path beyond stage 2
-— AHCI (needs PCI, Phase 9), a general on-disk filesystem, or a VirtualBox disk
-smoke test — remains available afterwards.
+Phase 6 stages 1–3 are complete, verified, committed (`43fdd7b`) and pushed.
+The remaining Phase 6 acceptance items are logging beyond COM1 (roadmap order:
+first) and networking (staged later in the phase); the user selects the scope
+for the next stage. The persistence path beyond stage 2 — AHCI (needs PCI,
+Phase 9), a general on-disk filesystem, or a VirtualBox disk smoke test —
+remains available afterwards.

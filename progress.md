@@ -11,29 +11,36 @@ allocator, narrow MMIO page-table mapping). Phase 3's central deliverable — th
 kernel's **own page-table manager** — Phase 4's **kernel heap with global
 allocator**, Phase 5a's **kernel threads with a timer-preempted round-robin
 scheduler**, Phase 5b's **ring-3 user mode with an `int 0x80` syscall
-boundary and user-fault isolation**, and Phase 6 stages 1–4 — the **serial
-console, in-memory VFS, kernel shell**, **durable checkpoint persistence over
-ATA PIO**, the **native ELF64 program loader** (three Limine modules built
-from our own `userland/` workspace, parsed by a host-tested `os_core::elf`
-parser and executed at CPL3) and the **framebuffer log console** (the serial
-log mirrored to the Limine framebuffer through host-tested grid/renderer
-modules, with a boot-time readback self-test and a validated screendump) —
-are implemented and verified in QEMU/VirtualBox BIOS boots. PE loading and
-Windows compatibility remain unstarted.
+boundary and user-fault isolation**, and **all five Phase 6 stages** — the
+**serial console, in-memory VFS, kernel shell**, **durable checkpoint
+persistence over ATA PIO**, the **native ELF64 program loader** (three Limine
+modules built from our own `userland/` workspace, parsed by a host-tested
+`os_core::elf` parser and executed at CPL3), the **framebuffer log console**
+(the serial log mirrored to the Limine framebuffer through host-tested
+grid/renderer modules, with a boot-time readback self-test and a validated
+screendump) and the **e1000 network stack** (a polled 82540EM driver over a
+minimal PCI scan, host-tested ARP/IPv4/ICMP/UDP codecs, static `10.0.2.15/24`,
+and a scripted QEMU slirp round trip proving ARP, three ICMP replies and a
+UDP echo) — are implemented and verified in QEMU/VirtualBox BIOS boots.
+Phase 6 scope is complete for that environment. PE loading and Windows
+compatibility remain unstarted.
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
 ## Repository state
 
 - Workspace root: this thread's local checkout.
-- Git: branch `main`, five commits (`77bb56e phase1`, `0cc9372 heap,
-  kernel-owned page tables, threads, ring 3`, `43fdd7b phase6: serial console,
-  vfs, shell, ata checkpoint persistence, ring-3 elf64 module loader`,
-  `f3b17a3 progress: record phase6 commit and push`, `fb2da14 phase6:
-  framebuffer log console with readback selftest and screendump test`). The
-  stage-4 commit was pushed to `orgin/main` (github.com/Alex07lol/WinUx,
-  `f3b17a3..fb2da14`); this progress edit is the follow-up commit, same
-  pattern as `f3b17a3`. Nothing was reset or discarded.
+- Git: branch `main`; seven commits before this progress edit (`77bb56e
+  phase1`, `0cc9372 heap, kernel-owned page tables, threads, ring 3`,
+  `43fdd7b phase6: serial console, vfs, shell, ata checkpoint persistence,
+  ring-3 elf64 module loader`, `f3b17a3 progress: record phase6 commit and
+  push`, `fb2da14 phase6: framebuffer log console with readback selftest and
+  screendump test`, `5467bde progress: record phase6 stage 4 commit and push`,
+  `b257a1e phase6: e1000 networking with arp/icmp/udp and qemu slirp
+  round-trip test`). The stage-5 commit was pushed to `orgin/main`
+  (github.com/Alex07lol/WinUx, `5467bde..b257a1e`); this progress edit is the
+  eighth commit, the follow-up recording it, same pattern as `f3b17a3` and
+  `5467bde`. Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
 - Case-insensitive host: `agents.md`, `STOP.md` and `PROGRESS.md` resolve to
@@ -258,15 +265,66 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   `scripts/test_console_qemu.sh`; `test_all.sh` gained the `fbcon` step
   (18 → 19 PASS). Evidence: 106×50 grid, 119,512 foreground pixels,
   `fbcon selftest: passed (4070400 bytes match after 1059 redraws)`.
-  VirtualBox BIOS logs `fbcon: enabled 85x48 cells at scale 2` and
-  `3133440 bytes match after 1088 redraws`.
+   VirtualBox BIOS logs `fbcon: enabled 85x48 cells at scale 2` and
+   `3133440 bytes match after 1088 redraws`.
+- Phase 6 stage 5 — host-tested core (`os_core/src/pci.rs`,
+  `os_core/src/net/{mod,eth,arp,ipv4,icmp,udp}.rs`): PCI config-address
+  construction, BAR decode/sizing (32-bit wrap, 64-bit pair, I/O BARs);
+  Ethernet MAC/type/header; ARP request/reply plus an 8-entry cache with a
+  30 s lifetime (refresh, oldest-eviction); IPv4 header parse/build with
+  RFC 1071 checksum, IHL-5-only, fragment and bad-checksum rejection; ICMP
+  echo request/reply; UDP header with pseudo-header checksum, zero-checksum
+  rules (never transmit 0x0000, accept received 0). Golden byte vectors,
+  known-answer checksums and rejection vectors for each. Host tests
+  128 → 179 (51 new).
+- Phase 6 stage 5 — PCI scan and driver (`kernel/src/pci.rs`,
+  `kernel/src/e1000.rs`, new `inl` in `arch::x86_64::io`): mechanism #1 on
+  `0xCF8`/`0xCFC`, bus-0 scan for `8086:100E`, BAR0 all-ones write-back with
+  immediate restore, memory-space + bus-master enable. Driver: BAR0 aligned
+  to 2 MiB and mapped uncached, `CTRL.RST` reset with a 5 s-pump deadline,
+  MAC from RAL/RAH then bounded EEPROM reads (VirtualBox fallback), legacy
+  rings (RX 32 × 2048 B with tail/head protocol; TX 8 descriptors over one
+  shared buffer, synchronous `STA.DD` poll), `RCTL = EN|BAM|SECRC`,
+  `TCTL = EN|PSP|CT|COLD|RTLC`, `TIPG`; counters; non-fatal MAC loopback
+  check (0x88B5 pattern frame). Note: the loopback selftest frame is a real
+  transmit and is counted in `tx` (documented in `docs/NETWORK.md` §11).
+- Phase 6 stage 5 — stack and shell (`kernel/src/net.rs`, `main.rs`,
+  `shell.rs`): static `10.0.2.15/24` gw `10.0.2.2`; boot probe + ARP/ICMP
+  selftest with the pinned `net:` lines; panic-free inactive/skipped paths;
+  marker gains `,net` (after `,persist`) only when the selftest passed;
+  `ping <ip> [-c n]` and `udpecho <port>` builtins; dispatch for ARP, IPv4
+  (ICMP/UDP), with undocumented cases dropped silently. Poll loops take the
+  IRQ-safe lock per iteration so PIT/serial interrupts keep flowing;
+  transmit (which can run with interrupts disabled) also has a spin bound.
+- Phase 6 stage 5 — end-to-end defect found and fixed by the harness
+  (recorded in `docs/NETWORK.md` §11): `send_echo_request`/`send_echo_reply`
+  wrote the echo payload *after* `icmp::Message::write` had computed the
+  checksum, so every echo request carried a stale checksum and was dropped
+  (`net selftest: no gateway reply (echo timeout)` on the first
+  `test_net_qemu.py` run; ARP was unaffected because it has no checksum).
+  Writing the payload first fixed it; host tests cannot catch this class
+  because it was glue call order, not codec logic. A second correction:
+  the design assumed QEMU loops `RCTL.LBM_MAC` frames; QEMU's `e1000.c`
+  implements only PHY `BMCR` loopback (source read 2026-10-18), so
+  `net: loopback selftest: unsupported` is the expected QEMU/VirtualBox
+  outcome (R-012 updated; `,net` is unaffected because the ARP/ICMP probe
+  is the gate).
+- Phase 6 stage 5 — harness: new `scripts/test_net_qemu.py` (reuses
+  `scripts/qemu_serial.py`; picks a free host UDP port for
+  `hostfwd=udp:127.0.0.1:<port>-:7777`) and `scripts/test_net_qemu.sh`
+  (interactive ISO on q35 with a pinned `model=e1000` slirp NIC — q35's
+  default e1000e is unsupported by design). Asserts the pinned bring-up
+  lines, the `,net` marker, `net` counters, three `ping` replies with `0%
+  loss`, and a 19-byte host→guest UDP echo (`udpecho: echoed 19 bytes`);
+  `test_all.sh` gained the `net` step (19 → 20 PASS); VirtualBox now
+  attaches `--nic1 nat --nictype1 82540EM`.
 
 ## Exact commands and results
 
 | Command | Result |
 |---|---|
 | `cargo build -p project_os_kernel --target x86_64-unknown-none --release` | PASS |
-| `cargo test -p os_core` | PASS: 128 passed, 0 failed (includes 14 heap, 9 path, 14 checkpoint-format, 19 ELF-parser, 5 font, 14 text-grid and 13 renderer tests) |
+| `cargo test -p os_core` | PASS: 179 passed, 0 failed (includes 14 heap, 9 path, 14 checkpoint-format, 19 ELF-parser, 5 font, 14 text-grid, 13 renderer, and 51 new stage-5 PCI/BAR + Ethernet/ARP/IPv4/ICMP/UDP codec tests) |
 | `cargo clippy` (os_core, membench, kernel, userland) with `-D warnings` | PASS |
 | `cargo fmt --all -- --check` (kernel workspace and userland) | PASS |
 | `scripts/build_user.sh` | PASS: hello/fault built and header-checked; bad.elf rejected with `bad magic` |
@@ -278,11 +336,12 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
 | `scripts/test_shell_qemu.sh` | PASS: 17-command scripted shell session, 0 overruns |
 | `scripts/test_persistence_qemu.sh` | PASS: 4 boots on one raw disk — format/save, reboot load, CRC fallback, fresh format (`persistence: 4 boots, all phases passed`) |
 | `scripts/test_elf_qemu.sh` | PASS: 3 modules, ring-3 greeting from the ELF, exit 0, one isolated fault, `bad.elf` rejected, `,elf` marker |
-| `scripts/test_console_qemu.sh` | PASS: `fbcon: enabled 106x50 cells at scale 2`, selftest 4,070,400 bytes after 1059 redraws, shell `version` mirrored, screendump 1280x800 with 119,512 foreground pixels and pure-background margins |
+| `scripts/test_console_qemu.sh` | PASS: `fbcon: enabled 106x50 cells at scale 2`, selftest 4,070,400 bytes after 1059 redraws, shell `version` mirrored, screendump 1280x800 with foreground pixels inside the grid and pure-background margins |
+| `scripts/test_net_qemu.sh` | PASS (reproduced twice): `net: e1000 at 00:02.0`, MAC `52:54:00:12:34:56`, `net: ip 10.0.2.15/24 gw 10.0.2.2`, `net: loopback selftest: unsupported`, `net selftest: passed (arp resolved, icmp echo reply in 0 ms)`, `,net` marker; `net` → `tx 3 frames, rx 2 frames, arp 1/8 entries, errors 0`; `ping 10.0.2.2 -c 3` → 3/3 replies, `0% loss`; host→guest 19-byte UDP echo byte-identical (`udpecho: echoed 19 bytes to 10.0.2.2:57841`) |
 | `scripts/test_graphics_host.sh` | PASS: framebuffer tests |
-| `scripts/test_all.sh` (Phase 6 stage 4, final) | PASS: 19 PASS, 0 FAIL, 4 SKIP (UEFI/pci/driver-model/gpu-vm; skipped is not passed); unit suite 128 passed |
-| QEMU BIOS boot matrix, 256 MiB / 512 MiB / 1 GiB | PASS at each size: marker `checks=...,sched,user,elf,vfs`, exit 33 |
-| VirtualBox BIOS (`scripts/test_virtualbox.sh`) | PASS with ELF-module ring-3 checks and `fbcon: enabled 85x48 cells at scale 2` / `3133440 bytes match after 1088 redraws` (`vbox-serial.log`); isolated VM created and deleted |
+| `scripts/test_all.sh` (Phase 6 stage 5, final) | PASS: 20 PASS, 0 FAIL, 4 SKIP (UEFI/pci/driver-model/gpu-vm; skipped is not passed); unit suite 179 passed |
+| QEMU BIOS boot matrix, 256 MiB / 512 MiB / 1 GiB | PASS at each size: marker `checks=...,sched,user,elf,vfs`, exit 33; q35's default e1000e is deliberately unclaimed, so these boots log `net: inactive (no supported e1000 NIC)` and `net selftest: skipped (no NIC)` |
+| VirtualBox BIOS (`scripts/test_virtualbox.sh`) | PASS with ELF-module ring-3 checks, `fbcon: enabled 85x48 cells at scale 2` / `3133440 bytes match after 1088 redraws`, and the 82540EM NIC observed: `net: e1000 at 00:03.0`, MAC `08:00:27:c4:5d:0a`, loopback `unsupported`, `net selftest: no gateway reply (arp timeout)` — non-fatal, marker without `,net` (`vbox-serial.log`); isolated VM created and deleted |
 | `scripts/test_boot_qemu.sh --firmware uefi` | SKIP: no `OVMF_FD` / OVMF firmware |
 | `scripts/test_virtualbox.sh artifacts/project-os.iso` | PASS (VirtualBox 7.2.20r175154): marker reached, 5 timer ticks, VM deleted |
 | `scripts/test_pci.sh` | SKIP: PCI not implemented |
@@ -362,7 +421,12 @@ Persistence session (`artifacts/qemu-persist-boot1.log`, `-machine pc`,
 ```text
 blk: found QEMU HARDDISK, 16384 sectors
 persist: no valid checkpoint, formatted slot A seq=0
-PROJECT_OS_BOOT_SUCCESS:0.1.0-0cc93723 checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,vfs,blk,persist
+net: e1000 at 00:03.0 bar0 0xfebc0000 size 128 KiB
+net: mac 52:54:00:12:34:56
+net: ip 10.0.2.15/24 gw 10.0.2.2
+net: loopback selftest: unsupported
+net selftest: passed (arp resolved, icmp echo reply in 0 ms)
+PROJECT_OS_BOOT_SUCCESS:0.1.0-5467bde4 checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,vfs,blk,persist,net
 project-os> blk
 blk: QEMU HARDDISK, 16384 sectors (8 MiB), lba28 pio; reads 3 sectors, writes 2 sectors, flushes 1, errors 0
 project-os> persist
@@ -404,39 +468,77 @@ VirtualBox BIOS (`artifacts/vbox-serial.log`) shows the same contract at
 1024×768: `fbcon: enabled 85x48 cells at scale 2` and
 `fbcon selftest: passed (3133440 bytes match after 1088 redraws)`.
 
+Network session (`artifacts/qemu-net-session.log`, interactive ISO on q35 with
+a pinned `model=e1000` slirp NIC; `artifacts/qemu-net.log` is empty — QEMU
+reported no errors; the run was reproduced twice):
+
+```text
+net: e1000 at 00:02.0 bar0 0xfebc0000 size 128 KiB
+net: mac 52:54:00:12:34:56
+net: ip 10.0.2.15/24 gw 10.0.2.2
+net: loopback selftest: unsupported
+net selftest: passed (arp resolved, icmp echo reply in 0 ms)
+PROJECT_OS_BOOT_SUCCESS:0.1.0-5467bde4 checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,vfs,net
+project-os> net
+net: mac 52:54:00:12:34:56, ip 10.0.2.15/24 gw 10.0.2.2; tx 3 frames, rx 2 frames, arp 1/8 entries, errors 0
+project-os> ping 10.0.2.2 -c 3
+reply from 10.0.2.2: seq=1 ttl=255 time=0 ms
+reply from 10.0.2.2: seq=2 ttl=255 time=0 ms
+reply from 10.0.2.2: seq=3 ttl=255 time=0 ms
+ping: 3 sent, 3 received, 0% loss
+project-os> udpecho 7777
+udpecho: listening on 10.0.2.15:7777 for one datagram
+udpecho: echoed 19 bytes to 10.0.2.2:57841
+```
+
+The harness sent `PROJECT_OS-NET-TEST` (19 bytes) to the host-forwarded UDP
+port and received the identical payload back. `net: loopback selftest:
+unsupported` is the expected QEMU outcome (its e1000 model implements only PHY
+`BMCR` loopback — corrected research finding R-012; the ARP/ICMP probe is the
+gate). The `tx 3` counter includes the loopback selftest frame (loopback
+frame + ARP request + echo request); `rx 2` is the ARP reply and the ICMP
+reply. The q35 default `e1000e` stays deliberately unclaimed: the boot matrix
+and console/shell boots log `net: inactive (no supported e1000 NIC)` and
+`net selftest: skipped (no NIC)`, leaving their markers unchanged, while the
+`-machine pc` persistence boots claim the default e1000 and append `,net`
+after `,persist` (boot-1 log above).
+
 `scripts/test_boot_qemu.sh` (BIOS, 512 MiB) reached the marker and exited via
 isa-debug-exit with the expected status 33; the 256 MiB / 1 GiB matrix and the
 VirtualBox run were executed in the same `scripts/test_all.sh` pass.
 
-Build identifier is `0.1.0-f3b17a34`, derived from `VERSION` and the current
-Git commit (`f3b17a3`); rebuilding from changed sources without a commit keeps
-the same ID, which is why the exact kernel/ISO hashes below are recorded.
+Build identifier is `0.1.0-5467bde4`, derived from `VERSION` and the current
+Git commit at build time (`5467bde`); rebuilding from changed sources without
+a commit keeps the same ID, which is why the exact kernel/ISO hashes below are
+recorded. (The stage-5 work was committed afterwards as `b257a1e`, so a fresh
+build from HEAD would carry a new ID.)
 
 ## Artifact
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 1,176,992 bytes (Phase 6 stage 4) |
-| Kernel SHA-256 | `d4ae6a476d799021de82ae25aedc42d5644ea55bca934c055f75a3063eeb0fe7` |
+| Kernel ELF | `artifacts/kernel.elf`, 1,350,832 bytes (Phase 6 stage 5) |
+| Kernel SHA-256 | `8ae5f608209303f4700c7bf8942a294a358aa0e9aabf512d26479a6edb4f00c8` |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
 | ISO | `artifacts/project-os.iso` |
-| ISO size | 7,184,384 bytes |
-| ISO SHA-256 | `b2817f952ae18883e3f9af805693fd58d8132f683397b12dac3d6c4bc073a7ca` |
-| Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline) |
-| Interactive ISO SHA-256 | `2509b803a5eac892efb0b9c9a96294ff81103b7e78ed8b10b868e933f1f195fb` |
-| Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `54b74762bb3e6a386a4c46c93fc434cafc7c5b1b8fd881d0352355ef9a5812a9`; checker PASS |
-| Framebuffer session log | `artifacts/qemu-console-session.log`, SHA-256 `ebfa371abf1fd704b4a1f25ad622b28bc36edc3193e83904fdbcf2cf086f5b41` |
+| ISO size | 7,358,464 bytes |
+| ISO SHA-256 | `e8a21258551197f2e818fd0cad6849e9123fa90216c51ef7fdffc2dbc3eef044` |
+| Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline; rebuilt by each session harness) |
+| Interactive ISO SHA-256 | `9ddb437e3a21f640663b96ee9572dd548d7074699201d4ab7cd8a228e42d20bf` (rebuilt during the final `net` harness run) |
+| Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `002f45ab44049304dbf7f8605b58a597791caba5c6837ec7e4311c4ea73c0c40`; checker PASS (rebuilt in the stage-5 suite run; the boot log now includes the `net:` lines) |
+| Framebuffer session log | `artifacts/qemu-console-session.log`, SHA-256 `501334a8fde73879a109602782a68a7591c8c571c2ca3e09f119ff8ad6c296e3` |
+| Net session log | `artifacts/qemu-net-session.log`, 4,494 bytes, SHA-256 `940b29fbdd4477e325164e2df7615ef690947de1ca4dff7e6a5cda624ed3eb44`; `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
 | Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the 4-boot test: fresh format, slot A seq 0), SHA-256 `cb97111ff33d7e456e5ea82d9352ed3281e93c882fb02a02bd1947fc8f4857de` |
 | ISO boot entries | BIOS platform 0x00 (4 sectors), UEFI platform 0xEF (6144 sectors), both no-emulation, verified by `scripts/verify_iso.py` |
-| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot) |
-| VirtualBox result | `artifacts/vbox-test.log`: VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed |
+| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-net-session.log` (e1000 network session) |
+| VirtualBox result | `artifacts/vbox-test.log`: VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed; with the 82540EM NAT NIC the kernel detected the NIC and reported `net: loopback selftest: unsupported` + `net selftest: no gateway reply (arp timeout)` — non-fatal, no VirtualBox networking claim |
 
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
 The kernel build is deterministic for identical sources, flags and build ID.
-The checksums above are from the final Phase 6 stage 4 `scripts/test_all.sh`
-run (19 PASS / 0 FAIL / 4 SKIP, unit suite 128 passed). The ISO includes
+The checksums above are from the final Phase 6 stage 5 `scripts/test_all.sh`
+run (20 PASS / 0 FAIL / 4 SKIP, unit suite 179 passed). The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
 the kernel (including linked Rust runtime code) and Limine binaries.
@@ -457,9 +559,11 @@ This is a host model, not a kernel or Linux comparison.
   path, gated debug-exit, original font, case-insensitive control-file policy,
   serial console/VFS/shell (ADR-0015), ATA PIO + checkpoint persistence
   (ADR-0016), the native ELF64 module loader incl. the RUSTFLAGS/MAX_PATH
-  deviation (ADR-0017), and the framebuffer log console
+  deviation (ADR-0017), the framebuffer log console
   (`docs/FRAMEBUFFER_CONSOLE.md`, research R-011; no ADR — the spec is the
-  contract). ADR-0006's framing still holds: serial is authoritative for
+  contract), and the e1000 network stack (`docs/NETWORK.md`, ADR-0018,
+  research R-012 including the corrected QEMU loopback finding). ADR-0006's
+  framing still holds: serial is authoritative for
   tests, the framebuffer is a display mirror, not a gate.
 - [docs/RESEARCH.md](docs/RESEARCH.md): primary sources, findings, confidence and
   open questions.
@@ -477,9 +581,25 @@ This is a host model, not a kernel or Linux comparison.
   VirtualBox EFI boot is still untested.
 - UEFI boot has not been run (no OVMF firmware). The UEFI El Torito entry is
   verified; a catalog entry is not a boot test.
-- No networking, PCI, driver model, Windows PE/API compatibility or GPU
-  acceleration. There is no general on-disk filesystem: persistence is the
+- No PCI driver model, Windows PE/API compatibility or GPU acceleration.
+  Networking exists as stage 5 (one polled e1000 with static addressing);
+  there is no general on-disk filesystem: persistence is the
   whole-tree checkpoint image (stage 2) described above.
+- Phase 6 stage-5 limits (spec/ADR: `docs/NETWORK.md` §10, ADR-0018): one
+  polled e1000 on bus 0 with static `10.0.2.15/24`; no DHCP/DNS/TCP/sockets,
+  no interrupt/MSI receive or background RX (packets are processed only while
+  a command polls the ring), no routing beyond the local subnet, fragmented
+  IPv4 rejected and `udpecho` payloads over 1024 B dropped. QEMU slirp is the
+  network evidence; VirtualBox detected the NIC but its headless NAT did not
+  answer the gateway ARP (non-fatal, no claim). QEMU's e1000 model implements
+  only PHY `BMCR` loopback, so `net: loopback selftest: unsupported` is the
+  expected QEMU/VirtualBox outcome (R-012 corrected during implementation).
+- Stage-5 bring-up defect found and fixed by the end-to-end harness: the ICMP
+  echo request/reply paths wrote the echo payload after the checksum had been
+  computed, so every echo request was dropped (`net selftest: no gateway reply
+  (echo timeout)`); ARP was unaffected because it carries no checksum. Writing
+  the payload first fixed it and the selftest passed instantly (`icmp echo
+  reply in 0 ms`). Details: `docs/NETWORK.md` §11.
 - Phase 6 stage-2 limits (spec: `docs/PERSISTENCE.md`): ATA PIO touches only
   the PIIX primary master in LBA28 polled mode — no AHCI, virtio, DMA, IRQ14
   or real-hardware validation; evidence is QEMU `-machine pc` only, and the
@@ -566,10 +686,12 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 6 stages 1–4 are complete, verified, committed (`fb2da14`) and pushed to
-`orgin/main`. The remaining Phase 6 acceptance item is networking, which the
-roadmap already stages last; the user selects the scope for the next stage (a
-minimal ARP/IPv4/ICMP path over QEMU's e1000 is the likely first step, but
-nothing is started). The persistence path beyond stage 2 — AHCI (needs PCI,
-Phase 9), a general on-disk filesystem, or a VirtualBox disk smoke test —
-remains available afterwards.
+Phase 6 is complete: all five stages are implemented, verified and committed
+— `b257a1e` (stage 5) pushed to `orgin/main`, with this progress edit as its
+follow-up commit. The user selects the next phase; candidate work, none of it
+started: APIC timer/IOAPIC/SMP and the remaining Phase 2–4 scope gaps
+(recoverable exceptions, user address-space hardening, heap growth), Phase 7
+(PE loader and minimal native Windows console compatibility), and Phase 9
+(minimal PCI/driver framework — which also unblocks AHCI — plus a virtual GPU
+target). The persistence path beyond stage 2 (AHCI, a general on-disk
+filesystem) remains available.

@@ -1,13 +1,13 @@
 //! Minimal PE32+ (`IMAGE_FILE_MACHINE_AMD64`) parser for the ring-3 PE loader.
 //!
 //! Pure, checked little-endian reads over an in-memory byte slice so every
-//! rejection path is host-testable. Only the DOS header, COFF header, PE32+
-//! optional header, section table and base-relocation directory are
-//! validated and yielded; anything else is either rejected by policy
-//! (imports, delay imports, TLS, CLR) or ignored (exports, resources,
-//! exception data, debug data). The parser is deliberately address-space
-//! agnostic: the fixed load window, W^X policy and relocation *application*
-//! live in the kernel loader (`kernel/src/pe_loader.rs`).
+//! rejection path is host-testable. The DOS header, COFF header, PE32+
+//! optional header, section table, base-relocation directory and import
+//! directory are validated and yielded; anything else is either rejected by
+//! policy (delay imports, TLS, CLR) or ignored (exports, resources, exception
+//! data, debug data). The parser is deliberately address-space agnostic: the
+//! fixed load window, W^X policy, relocation *application* and import
+//! *resolution* live in the kernel loader (`kernel/src/pe_loader.rs`).
 
 use core::ops::Range;
 
@@ -32,6 +32,8 @@ const OPT_DIRECTORIES_OFFSET: usize = 112;
 
 pub const MAX_SECTIONS: usize = 32;
 pub const MAX_RELOCATIONS: usize = 256;
+pub const MAX_IMPORT_DLLS: usize = 2;
+pub const MAX_IMPORTS: usize = 16;
 
 pub const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
 pub const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
@@ -98,6 +100,38 @@ impl Section {
     }
 }
 
+/// One resolved-by-name import: which DLL, which exported function, and the
+/// image RVA of the 8-byte IAT slot the kernel loader must patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportSlot {
+    pub dll: [u8; MAX_IMPORT_DLL_NAME],
+    pub dll_len: u8,
+    pub name: [u8; MAX_IMPORT_FUNCTION_NAME],
+    pub name_len: u8,
+    pub iat_rva: u32,
+}
+
+pub const MAX_IMPORT_DLL_NAME: usize = 16;
+pub const MAX_IMPORT_FUNCTION_NAME: usize = 32;
+
+impl ImportSlot {
+    pub const EMPTY: ImportSlot = ImportSlot {
+        dll: [0; MAX_IMPORT_DLL_NAME],
+        dll_len: 0,
+        name: [0; MAX_IMPORT_FUNCTION_NAME],
+        name_len: 0,
+        iat_rva: 0,
+    };
+
+    pub fn dll(&self) -> &[u8] {
+        &self.dll[..self.dll_len as usize]
+    }
+
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+}
+
 /// Every way an image can be rejected; `label()` strings are stable and used
 /// verbatim in boot logs and test assertions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +155,11 @@ pub enum PeError {
     SectionOutOfFile,
     EntryNotExecutable,
     UnsupportedSubsystem,
-    ImportsUnsupported,
+    BadImportTable,
+    ImportOrdinal,
+    ImportNameTooLong,
+    TooManyImportDlls,
+    TooManyImports,
     DelayImportsUnsupported,
     TlsUnsupported,
     ClrUnsupported,
@@ -152,7 +190,11 @@ impl PeError {
             PeError::SectionOutOfFile => "section out of file",
             PeError::EntryNotExecutable => "entry not executable",
             PeError::UnsupportedSubsystem => "unsupported subsystem",
-            PeError::ImportsUnsupported => "imports unsupported",
+            PeError::BadImportTable => "bad import table",
+            PeError::ImportOrdinal => "import by ordinal is not supported",
+            PeError::ImportNameTooLong => "import name too long",
+            PeError::TooManyImportDlls => "too many import dlls",
+            PeError::TooManyImports => "too many imports",
             PeError::DelayImportsUnsupported => "delay imports unsupported",
             PeError::TlsUnsupported => "tls unsupported",
             PeError::ClrUnsupported => "clr unsupported",
@@ -175,6 +217,8 @@ pub struct PeImage<'a> {
     section_count: usize,
     relocations: [u32; MAX_RELOCATIONS],
     relocation_count: usize,
+    imports: [ImportSlot; MAX_IMPORTS],
+    import_count: usize,
 }
 
 impl<'a> PeImage<'a> {
@@ -316,9 +360,6 @@ impl<'a> PeImage<'a> {
             return Err(PeError::UnsupportedSubsystem);
         }
 
-        if is_nonempty(bytes, optional, num_dirs, IMAGE_DIRECTORY_ENTRY_IMPORT) {
-            return Err(PeError::ImportsUnsupported);
-        }
         if is_nonempty(
             bytes,
             optional,
@@ -343,6 +384,9 @@ impl<'a> PeImage<'a> {
         let relocation_count =
             parse_relocations(bytes, sections, optional, num_dirs, &mut relocations)?;
 
+        let mut imports = [ImportSlot::EMPTY; MAX_IMPORTS];
+        let import_count = parse_imports(bytes, sections, optional, num_dirs, &mut imports)?;
+
         Ok(PeImage {
             bytes,
             image_base,
@@ -357,6 +401,8 @@ impl<'a> PeImage<'a> {
             section_count: num_sections,
             relocations,
             relocation_count,
+            imports,
+            import_count,
         })
     }
 
@@ -388,6 +434,11 @@ impl<'a> PeImage<'a> {
     /// DIR64 target RVAs in table order; `ABSOLUTE` padding is skipped.
     pub fn relocations(&self) -> &[u32] {
         &self.relocations[..self.relocation_count]
+    }
+
+    /// Import-by-name slots in descriptor order; ordinals are rejected.
+    pub fn imports(&self) -> &[ImportSlot] {
+        &self.imports[..self.import_count]
     }
 }
 
@@ -500,6 +551,159 @@ fn parse_relocations(
     Ok(count)
 }
 
+/// Walk the import directory and copy import-by-name slots.
+///
+/// The descriptor table must live in one section's raw data, end with an
+/// all-zero descriptor and stay within `MAX_IMPORT_DLLS` descriptors; each
+/// descriptor's ILT (falling back to the IAT when `OriginalFirstThunk` is
+/// zero) must terminate with a zero entry inside its section. One slot is
+/// produced per imported *name*, even when the same name appears twice or
+/// appears in two DLLs; the kernel loader applies uniqueness policy.
+fn parse_imports(
+    bytes: &[u8],
+    sections: &[Section],
+    optional: usize,
+    num_dirs: u32,
+    imports: &mut [ImportSlot; MAX_IMPORTS],
+) -> Result<usize, PeError> {
+    if IMAGE_DIRECTORY_ENTRY_IMPORT >= num_dirs {
+        return Ok(0);
+    }
+    let dir = optional + OPT_DIRECTORIES_OFFSET + IMAGE_DIRECTORY_ENTRY_IMPORT as usize * 8;
+    let directory_rva = read_u32(bytes, dir);
+    let directory_size = read_u32(bytes, dir + 4) as usize;
+    if directory_rva == 0 && directory_size == 0 {
+        return Ok(0);
+    }
+    if directory_rva == 0 || directory_size < 20 || !directory_size.is_multiple_of(20) {
+        return Err(PeError::BadImportTable);
+    }
+
+    let start = rva_to_raw_offset(sections, directory_rva, directory_size)
+        .ok_or(PeError::BadImportTable)?;
+    let end = start + directory_size;
+
+    let mut count = 0usize;
+    let mut dll_count = 0usize;
+    let mut cursor = start;
+    loop {
+        if cursor + 20 > end {
+            return Err(PeError::BadImportTable);
+        }
+        let ilt = read_u32(bytes, cursor);
+        let timestamp = read_u32(bytes, cursor + 4);
+        let forwarder = read_u32(bytes, cursor + 8);
+        let name_rva = read_u32(bytes, cursor + 12);
+        let first_thunk = read_u32(bytes, cursor + 16);
+        if ilt == 0 && timestamp == 0 && forwarder == 0 && name_rva == 0 && first_thunk == 0 {
+            break;
+        }
+        if dll_count == MAX_IMPORT_DLLS {
+            return Err(PeError::TooManyImportDlls);
+        }
+        dll_count += 1;
+        if name_rva == 0 || first_thunk == 0 {
+            return Err(PeError::BadImportTable);
+        }
+
+        let mut dll = [0u8; MAX_IMPORT_DLL_NAME];
+        let dll_len = read_c_string(bytes, sections, name_rva, &mut dll)?;
+
+        let list_rva = if ilt != 0 { ilt } else { first_thunk };
+        let mut index = 0u32;
+        loop {
+            let entry_rva = list_rva
+                .checked_add(index.checked_mul(8).ok_or(PeError::BadImportTable)?)
+                .ok_or(PeError::BadImportTable)?;
+            let entry_offset =
+                rva_to_raw_offset(sections, entry_rva, 8).ok_or(PeError::BadImportTable)?;
+            let entry = read_u64(bytes, entry_offset);
+            if entry == 0 {
+                break;
+            }
+            if entry >> 63 != 0 {
+                return Err(PeError::ImportOrdinal);
+            }
+            if count == MAX_IMPORTS {
+                return Err(PeError::TooManyImports);
+            }
+            let hint_name_rva = (entry & 0x7FFF_FFFF) as u32;
+            let hint_offset =
+                rva_to_raw_offset(sections, hint_name_rva, 2).ok_or(PeError::BadImportTable)?;
+            let _hint = read_u16(bytes, hint_offset);
+            let name_rva = hint_name_rva
+                .checked_add(2)
+                .ok_or(PeError::BadImportTable)?;
+            let mut name = [0u8; MAX_IMPORT_FUNCTION_NAME];
+            let name_len = read_c_string(bytes, sections, name_rva, &mut name)?;
+            let iat_rva = first_thunk
+                .checked_add(index * 8)
+                .ok_or(PeError::BadImportTable)?;
+            imports[count] = ImportSlot {
+                dll,
+                dll_len,
+                name,
+                name_len,
+                iat_rva,
+            };
+            count += 1;
+            index += 1;
+        }
+        cursor += 20;
+    }
+    Ok(count)
+}
+
+/// Read a NUL-terminated ASCII string at `rva`, requiring the terminator to
+/// be inside the same section's raw data and the string to be non-empty and
+/// no longer than `out`. A missing terminator within the section is reported
+/// as `ImportNameTooLong` (the cap and the terminator share one scan).
+fn read_c_string(
+    bytes: &[u8],
+    sections: &[Section],
+    rva: u32,
+    out: &mut [u8],
+) -> Result<u8, PeError> {
+    let offset = rva_to_raw_offset(sections, rva, 1).ok_or(PeError::BadImportTable)?;
+    let raw_end = section_raw_end(sections, rva).ok_or(PeError::BadImportTable)?;
+
+    let mut len = 0usize;
+    loop {
+        let cursor = offset + len;
+        if cursor >= raw_end {
+            return Err(PeError::ImportNameTooLong);
+        }
+        let byte = bytes[cursor];
+        if byte == 0 {
+            break;
+        }
+        if len == out.len() {
+            return Err(PeError::ImportNameTooLong);
+        }
+        out[len] = byte;
+        len += 1;
+    }
+    if len == 0 {
+        return Err(PeError::ImportNameTooLong);
+    }
+    Ok(len as u8)
+}
+
+/// File offset one past the raw data of the section containing `rva`.
+fn section_raw_end(sections: &[Section], rva: u32) -> Option<usize> {
+    for section in sections {
+        if section.raw_size == 0 {
+            continue;
+        }
+        let start = u64::from(section.virtual_address);
+        let end = start + u64::from(section.raw_size);
+        if u64::from(rva) >= start && u64::from(rva) < end {
+            return Some((u64::from(section.raw_offset) + u64::from(section.raw_size)) as usize);
+        }
+    }
+    None
+}
+
 /// Translate an RVA range into a file offset, requiring it to live entirely
 /// inside one section's raw data.
 fn rva_to_raw_offset(sections: &[Section], rva: u32, size: usize) -> Option<usize> {
@@ -563,6 +767,11 @@ mod tests {
     const RELOC_RVA: u32 = 0x4000;
     const IMAGE_BASE: u64 = 0x1_4000_0000;
     const SIZE_OF_IMAGE: u32 = 0x6000;
+    const IMPORT_DESC_RVA: u32 = 0x2000;
+    const IMPORT_ILT_RVA: u32 = 0x2040;
+    const IMPORT_IAT_RVA: u32 = 0x2060;
+    const IMPORT_DLL_RVA: u32 = 0x2080;
+    const IMPORT_NAME_RVA: u32 = 0x2090;
 
     fn patch_u16(image: &mut [u8], offset: usize, value: u16) {
         image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -716,6 +925,57 @@ mod tests {
             IMAGE_DIRECTORY_ENTRY_BASERELOC as usize,
             RELOC_RVA,
             (offset - RELOC_RAW) as u32,
+        );
+    }
+
+    fn rdata_at(rva: u32) -> usize {
+        RDATA_RAW + (rva - IMPORT_DESC_RVA) as usize
+    }
+
+    fn write_c_string(image: &mut [u8], rva: u32, value: &[u8]) {
+        let offset = rdata_at(rva);
+        image[offset..offset + value.len()].copy_from_slice(value);
+        image[offset + value.len()] = 0;
+    }
+
+    fn write_hint_name(image: &mut [u8], rva: u32, name: &[u8]) {
+        let offset = rdata_at(rva);
+        image[offset..offset + 2].copy_from_slice(&[0, 0]);
+        image[offset + 2..offset + 2 + name.len()].copy_from_slice(name);
+        image[offset + 2 + name.len()] = 0;
+    }
+
+    fn patch_descriptor(image: &mut [u8], index: usize, dll_rva: u32, ilt_rva: u32, iat_rva: u32) {
+        let desc = rdata_at(IMPORT_DESC_RVA) + index * 20;
+        patch_u32(image, desc, ilt_rva);
+        patch_u32(image, desc + 4, 0);
+        patch_u32(image, desc + 8, 0);
+        patch_u32(image, desc + 12, dll_rva);
+        patch_u32(image, desc + 16, iat_rva);
+    }
+
+    /// One descriptor (plus terminator) importing `names` from `dll`, with the
+    /// ILT at `IMPORT_ILT_RVA`, the IAT at `IMPORT_IAT_RVA` and hint/name pairs
+    /// at `IMPORT_NAME_RVA + i * 0x20`.
+    fn write_imports(image: &mut [u8], dll: &[u8], names: &[&[u8]]) {
+        let desc = rdata_at(IMPORT_DESC_RVA);
+        image[desc..desc + 40].fill(0);
+        write_c_string(image, IMPORT_DLL_RVA, dll);
+        for (index, name) in names.iter().enumerate() {
+            write_hint_name(image, IMPORT_NAME_RVA + index as u32 * 0x20, name);
+            patch_u64(
+                image,
+                rdata_at(IMPORT_ILT_RVA) + index * 8,
+                u64::from(IMPORT_NAME_RVA + index as u32 * 0x20),
+            );
+        }
+        patch_u64(image, rdata_at(IMPORT_ILT_RVA) + names.len() * 8, 0);
+        patch_descriptor(image, 0, IMPORT_DLL_RVA, IMPORT_ILT_RVA, IMPORT_IAT_RVA);
+        patch_dir(
+            image,
+            IMAGE_DIRECTORY_ENTRY_IMPORT as usize,
+            IMPORT_DESC_RVA,
+            40,
         );
     }
 
@@ -1081,15 +1341,224 @@ mod tests {
     }
 
     #[test]
-    fn rejects_imports() {
+    fn no_import_directory_means_no_imports() {
+        let image = base_image();
+        let pe = parse(&image).unwrap();
+        assert!(pe.imports().is_empty());
+    }
+
+    #[test]
+    fn parses_imports_by_name() {
+        let mut image = base_image();
+        write_imports(
+            &mut image,
+            b"kernel32.dll",
+            &[b"ExitProcess", b"WriteConsoleA"],
+        );
+        let pe = parse(&image).unwrap();
+        let imports = pe.imports();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].dll(), b"kernel32.dll");
+        assert_eq!(imports[0].name(), b"ExitProcess");
+        assert_eq!(imports[0].iat_rva, IMPORT_IAT_RVA);
+        assert_eq!(imports[1].dll(), b"kernel32.dll");
+        assert_eq!(imports[1].name(), b"WriteConsoleA");
+        assert_eq!(imports[1].iat_rva, IMPORT_IAT_RVA + 8);
+    }
+
+    #[test]
+    fn parses_ilt_fallback_to_iat() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"GetStdHandle"]);
+        patch_u32(&mut image, rdata_at(IMPORT_DESC_RVA), 0);
+        patch_u64(
+            &mut image,
+            rdata_at(IMPORT_IAT_RVA),
+            u64::from(IMPORT_NAME_RVA),
+        );
+        patch_u64(&mut image, rdata_at(IMPORT_IAT_RVA) + 8, 0);
+        let pe = parse(&image).unwrap();
+        assert_eq!(pe.imports().len(), 1);
+        assert_eq!(pe.imports()[0].name(), b"GetStdHandle");
+        assert_eq!(pe.imports()[0].iat_rva, IMPORT_IAT_RVA);
+    }
+
+    #[test]
+    fn parses_same_name_in_two_dlls() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        write_c_string(&mut image, IMPORT_DLL_RVA + 0x40, b"user32.dll");
+        patch_descriptor(
+            &mut image,
+            1,
+            IMPORT_DLL_RVA + 0x40,
+            IMPORT_ILT_RVA,
+            IMPORT_IAT_RVA + 8,
+        );
+        patch_dir(
+            &mut image,
+            IMAGE_DIRECTORY_ENTRY_IMPORT as usize,
+            IMPORT_DESC_RVA,
+            60,
+        );
+        let pe = parse(&image).unwrap();
+        let imports = pe.imports();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].dll(), b"kernel32.dll");
+        assert_eq!(imports[1].dll(), b"user32.dll");
+        assert_eq!(imports[0].name(), imports[1].name());
+        assert_eq!(imports[1].iat_rva, IMPORT_IAT_RVA + 8);
+    }
+
+    #[test]
+    fn rejects_import_directory_zero_rva_with_size() {
+        let mut image = base_image();
+        patch_dir(&mut image, IMAGE_DIRECTORY_ENTRY_IMPORT as usize, 0, 40);
+        assert_rejects(&image, PeError::BadImportTable);
+    }
+
+    #[test]
+    fn rejects_import_directory_size_not_multiple_of_descriptor() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        patch_dir(
+            &mut image,
+            IMAGE_DIRECTORY_ENTRY_IMPORT as usize,
+            IMPORT_DESC_RVA,
+            30,
+        );
+        assert_rejects(&image, PeError::BadImportTable);
+    }
+
+    #[test]
+    fn rejects_import_directory_outside_sections() {
         let mut image = base_image();
         patch_dir(
             &mut image,
             IMAGE_DIRECTORY_ENTRY_IMPORT as usize,
-            0x2000,
-            0x40,
+            0x9000,
+            40,
         );
-        assert_rejects(&image, PeError::ImportsUnsupported);
+        assert_rejects(&image, PeError::BadImportTable);
+    }
+
+    #[test]
+    fn rejects_import_directory_past_section_raw_data() {
+        let mut image = base_image();
+        patch_dir(
+            &mut image,
+            IMAGE_DIRECTORY_ENTRY_IMPORT as usize,
+            IMPORT_DESC_RVA,
+            0x208,
+        );
+        assert_rejects(&image, PeError::BadImportTable);
+    }
+
+    #[test]
+    fn rejects_import_descriptor_missing_terminator() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        patch_dir(
+            &mut image,
+            IMAGE_DIRECTORY_ENTRY_IMPORT as usize,
+            IMPORT_DESC_RVA,
+            20,
+        );
+        assert_rejects(&image, PeError::BadImportTable);
+    }
+
+    #[test]
+    fn rejects_import_descriptor_without_name() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        patch_u32(&mut image, rdata_at(IMPORT_DESC_RVA) + 12, 0);
+        assert_rejects(&image, PeError::BadImportTable);
+    }
+
+    #[test]
+    fn rejects_import_descriptor_without_first_thunk() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        patch_u32(&mut image, rdata_at(IMPORT_DESC_RVA) + 16, 0);
+        assert_rejects(&image, PeError::BadImportTable);
+    }
+
+    #[test]
+    fn rejects_import_ilt_outside_sections() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        patch_u32(&mut image, rdata_at(IMPORT_DESC_RVA), 0x9000);
+        assert_rejects(&image, PeError::BadImportTable);
+    }
+
+    #[test]
+    fn rejects_ordinal_import() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        patch_u64(&mut image, rdata_at(IMPORT_ILT_RVA), 0x8000_0000_0000_0007);
+        assert_rejects(&image, PeError::ImportOrdinal);
+    }
+
+    #[test]
+    fn rejects_import_function_name_too_long() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[&[b'x'; 33]]);
+        assert_rejects(&image, PeError::ImportNameTooLong);
+    }
+
+    #[test]
+    fn rejects_import_dll_name_too_long() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        write_c_string(&mut image, 0x2180, b"kernel32.dllx.yyy");
+        patch_u32(&mut image, rdata_at(IMPORT_DESC_RVA) + 12, 0x2180);
+        assert_rejects(&image, PeError::ImportNameTooLong);
+    }
+
+    #[test]
+    fn rejects_unterminated_import_name() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        patch_u64(&mut image, rdata_at(IMPORT_ILT_RVA), 0x21F0);
+        for byte in image[rdata_at(0x21F2)..RDATA_RAW + 0x200].iter_mut() {
+            *byte = b'A';
+        }
+        assert_rejects(&image, PeError::ImportNameTooLong);
+    }
+
+    #[test]
+    fn rejects_too_many_import_dlls() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        for index in 1..=MAX_IMPORT_DLLS {
+            patch_descriptor(
+                &mut image,
+                index,
+                IMPORT_DLL_RVA,
+                IMPORT_ILT_RVA,
+                IMPORT_IAT_RVA,
+            );
+        }
+        patch_dir(
+            &mut image,
+            IMAGE_DIRECTORY_ENTRY_IMPORT as usize,
+            IMPORT_DESC_RVA,
+            20 * (MAX_IMPORT_DLLS as u32 + 2),
+        );
+        assert_rejects(&image, PeError::TooManyImportDlls);
+    }
+
+    #[test]
+    fn rejects_too_many_imports() {
+        let mut image = base_image();
+        write_imports(&mut image, b"kernel32.dll", &[b"ExitProcess"]);
+        write_hint_name(&mut image, 0x2100, b"ExitProcess");
+        patch_u32(&mut image, rdata_at(IMPORT_DESC_RVA), 0x2140);
+        for index in 0..(MAX_IMPORTS + 1) {
+            patch_u64(&mut image, rdata_at(0x2140) + index * 8, 0x2100);
+        }
+        patch_u64(&mut image, rdata_at(0x2140) + (MAX_IMPORTS + 1) * 8, 0);
+        assert_rejects(&image, PeError::TooManyImports);
     }
 
     #[test]

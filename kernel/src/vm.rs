@@ -325,8 +325,10 @@ impl AddressSpace {
         Ok(released)
     }
 
-    /// Translate one address, returning the physical base address of the
-    /// mapping and the raw entry flags, or `None` if unmapped.
+    /// Translate one address, returning the physical address the virtual
+    /// address maps to (frame base plus the in-page offset, so a page-aligned
+    /// input yields the frame base) and the raw entry flags, or `None` if
+    /// unmapped.
     pub fn translate(&self, virtual_address: u64) -> Option<(u64, u64)> {
         if !page_math::is_canonical_4level(virtual_address) {
             return None;
@@ -360,7 +362,10 @@ impl AddressSpace {
         if !page_math::entry_present(leaf) {
             return None;
         }
-        Some((page_math::entry_address(leaf), leaf))
+        Some((
+            page_math::entry_address(leaf) + (virtual_address & 0xfff),
+            leaf,
+        ))
     }
 
     /// Tear the space down: free the user half and the PML4. The space must

@@ -82,10 +82,10 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/heap.rs` | fixed 8 MiB kernel heap, `#[global_allocator]`, stats/validate | working |
 | `kernel/src/vm.rs` | own 4-level PML4, map/unmap/translate, W^X, user-half teardown | working |
 | `kernel/src/sched.rs` | 16 kernel threads, round-robin yield + timer preemption | working |
-| `kernel/src/syscall.rs` | `int 0x80` dispatch, pointer validation, user-fault kill path | working |
-| `kernel/src/user.rs` | ring-3 module life cycle (ELF and PE), iretq trampoline, teardown | working (ELF + PE32+ modules) |
+| `kernel/src/syscall.rs` | `int 0x80` dispatch, pointer validation, user-fault kill path; services 3–5 are the Win32-shaped `GetStdHandle`/`WriteConsoleA`/`ExitProcess` | working |
+| `kernel/src/user.rs` | ring-3 module life cycle (ELF and PE), iretq trampoline, teardown | working (ELF + PE32+ modules, Win32 console phase) |
 | `kernel/src/loader.rs` | two-phase ELF64 module loader (`inspect`/`map`), code window, rollback | working (ADR-0017) |
-| `kernel/src/pe_loader.rs` | two-phase PE32+ loader: window/W^X policy and DIR64 base relocations | working (stage 1, ADR-0019) |
+| `kernel/src/pe_loader.rs` | two-phase PE32+ loader: window/W^X policy, DIR64 base relocations, `kernel32.dll` allowlist, stub page + HHDM IAT patch | working (stages 1–2, ADR-0019/0020) |
 | `kernel/src/console.rs` | IRQ4 receive ring, echo and line editing | working (serial only) |
 | `kernel/src/vfs.rs` | in-memory arena VFS, boot self-test, dirty tracking, export/replace for checkpoints | working |
 | `kernel/src/blk.rs` | ATA PIO block device (PIIX primary master, LBA28, polled) | working (QEMU `-machine pc`) |
@@ -104,7 +104,7 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/sync.rs` | `SpinLock` and RFLAGS-saving `IrqSpinLock` | working |
 | `kernel/src/panic.rs` | panic report and halt | working |
 | `userland/` | independent no_std cargo workspace: syscall runtime plus the `hello`/`fault` ELF programs | working (ADR-0017) |
-| `userland/pe/` | separate workspace: the `pehello` PE32+ fixture, linked by rust-lld without an SDK | working (ADR-0019) |
+| `userland/pe/` | separate workspace: `pehello` (stage 1) and `peconsole` (`raw-dylib` import fixture, stage 2), linked by rust-lld without an SDK | working (ADR-0019/0020) |
 | `os_core::memmap` | classification/accounting/validation | host-tested |
 | `os_core::fb` | geometry, pixel format, bounds, colour packing | host-tested |
 | `os_core::frame` | bitmap frame allocator | host- and in-VM-tested |
@@ -112,7 +112,7 @@ writable, which the segment permissions above guarantee.
 | `os_core::path` | VFS path validation and component splitting | host-tested |
 | `os_core::pofs` | checkpoint header/payload encode, decode, CRC32 | host-tested |
 | `os_core::elf` | ELF64 `ET_EXEC` parser: headers, segments, W^X and overlap policy | host-tested |
-| `os_core::pe` | PE32+ parser: headers, sections, data-directory policy, DIR64 relocations | host-tested |
+| `os_core::pe` | PE32+ parser: headers, sections, import directory (ILT/IAT/names), data-directory policy, DIR64 relocations | host-tested |
 | `os_core::pci` | config-address construction, BAR decode and sizing | host-tested |
 | `os_core::net` | Ethernet/ARP/IPv4/ICMP/UDP codecs, RFC 1071 checksums, ARP cache with expiry | host-tested |
 | `os_core::font` | original 5x7 bitmap font (moved from the kernel for host tests) | host-tested |
@@ -185,8 +185,11 @@ as well (ADR-0014).
   policy belongs above it.
 - The framebuffer log console is a debugging/UI aid, not a graphics driver. No GPU
   acceleration, command submission or display-driver interface exists.
-- No Windows/NT compatibility code is present yet. `docs/WINDOWS_COMPATIBILITY.md`
-  describes the intended path.
+- Windows/NT compatibility code is limited to what Phase 7 stages 1–2
+  implement: the PE32+ loader and three `kernel32.dll`-shaped console services
+  resolved through a real import table (`docs/WIN32_CONSOLE.md`). Everything
+  beyond that is unimplemented; `docs/WINDOWS_COMPATIBILITY.md` describes the
+  intended path.
 
 ## Known limitations
 
@@ -199,9 +202,12 @@ as well (ADR-0014).
 - One user thread at a time (single TSS `rsp0`); program images are our own
   ELF64 `ET_EXEC` modules and PE32+ images loaded from Limine, with no
   PIE/dynamic linking, no ASLR, no filesystem-backed exec and no process model
-  (ADR-0017, ADR-0019). The PE path is a loader only: no imports/IAT, DLLs,
-  exports, SEH/unwind, TLS, CLR, resources, PE32 or Win32 API surface exists,
-  so it is not Windows application compatibility (stage 1 of Phase 7).
+  (ADR-0017, ADR-0019). The PE path resolves imports only against a fixed
+  three-name `kernel32.dll` allowlist (stub page + `int 0x80` dispatch,
+  ADR-0020): no real DLL loading, exports, forwarders, ordinals, delay
+  imports, SEH/unwind, TLS, CLR, resources, PE32 or general Win32 API surface
+  exists, so it is not Windows application compatibility (Phase 7 stages 1–2
+  of the roadmap).
 - The filesystem is a whole-tree checkpoint image: two 1 MiB slots on a
   PIIX-legacy ATA disk, flushed write-through at shell-command boundaries
   (ADR-0016). No journal, no AHCI/virtio, no DMA or IRQ14, and the disk path

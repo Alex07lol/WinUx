@@ -12,7 +12,7 @@ were run and observed. No dates or completion percentages are implied.
 | 4 | kernel heap, slab/size classes, performance harness | **partial** — fixed 8 MiB first-fit free-list heap with global allocator, IRQ-safe locking, poisoning, double-free detection, `validate()` walk, host tests (14) and in-kernel self-test; growth, slabs per measurement and the heap benchmark harness outstanding |
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
-| 7 | PE loader and minimal native Windows console compatibility | not started |
+| 7 | PE loader and minimal native Windows console compatibility | **partial (stages 1–2 done)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving three `kernel32.dll`-shaped console services against our own kernel implementations; broader API surface, real DLL loading, SEH, TLS and PE32 not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
@@ -185,9 +185,20 @@ loader (`kernel/src/pe_loader.rs`) that maps W^X sections into a fresh user
 address space and applies DIR64 base relocations under a fixed 1 MiB window at
 `0x400000`, and a genuine rust-lld PE fixture executed at CPL3 via `int 0x80`
 (see R-013, ADR-0019, `docs/PE_LOADER.md`). A corrupt PE module is rejected
-without harming boot; `test_all.sh` reports PASS=22 FAIL=0 SKIP=4. Remaining
-Phase 7 items (Win32/NT console API surface, imports, DLLs, SEH, TLS, PE32)
-are explicitly deferred; no compatibility claim is made.
+without harming boot; `test_all.sh` reports PASS=22 FAIL=0 SKIP=4.
+
+## Phase 7 stage 2 (2026-10-18): native Win32 console surface
+
+Implemented and verified: a genuine `raw-dylib` import directory in a rust-lld
+fixture (`userland/pe/peconsole`) parsed by `os_core::pe`, resolved against an
+exact-name allowlist of three `kernel32.dll` functions (`GetStdHandle`,
+`WriteConsoleA`, `ExitProcess`) through a kernel stub page and `int 0x80`
+dispatch, with the IAT patched via the HHDM before protection; two negative
+mutants (`pebadimp`, `pebadfn`) are rejected before any allocation (see R-014,
+ADR-0020, `docs/WIN32_CONSOLE.md`). Remaining Phase 7 items (broader API
+surface, imports from real system DLLs, ordinals, forwarders, delay imports,
+SEH/unwind, TLS, CLR, PE32) are explicitly deferred; no compatibility claim is
+made.
 
 ## Phase 7 acceptance (planned)
 

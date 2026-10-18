@@ -656,9 +656,9 @@ target is x86-64); accepting import/TLS directories and ignoring them
 mapping of the target page (needs page-table walking that `AddressSpace`
 does not expose; rejected as stage-1 scope creep).
 
-**Evidence.** Observed (to be recorded with logs in `progress.md`):
+**Evidence.** Observed (recorded with logs in `progress.md`):
 `scripts/test_pe_qemu.sh` PASS with `pe: pehello.exe loaded at 0x400000
-(entry 0x401000, 5 sections, 1 relocation applied)`, fixture lines
+(entry 0x401000, 4 sections, 1 relocation applied)`, fixture lines
 `pe: hello from a PE32+ image via int 0x80` / `pe: base relocation verified`,
 `user: /boot/pebad.exe rejected (bad signature)`, `pe selftest: passed (...)`,
 marker `...,user,elf,pe,vfs`; unit tests for the parser and builder; full
@@ -672,4 +672,84 @@ of Phase 7), no SEH/TLS/CLR, no PE32, fixed window, one thread at a time,
 bootloader-provided modules only. No compatibility claim of any kind is made
 from this stage; the word "Windows" in the roadmap refers to this format and
 these fixtures, not to application support.
+
+*Superseded in part by ADR-0020:* the reject-by-directory rule for the
+**import** directory (index 1) no longer applies as of stage 2; imports are
+parsed and resolved against a fixed allowlist. Delay imports, TLS and CLR
+are still rejected.
+
+## ADR-0020 – Import-mediated Win32 console surface via user-space stubs (Phase 7, stage 2)
+
+**Context.** Stage 1 proved PE32+ parsing, mapping and base relocations with
+import-free fixtures. Stage 2 must make the *import mechanism* real: a
+Windows-target image declares `kernel32.dll` functions and expects the
+loader to fill its IAT, while the project rules forbid Wine, binary
+translation and Windows code. The full contract (pinned serial lines, test
+plan, limits) lives in `docs/WIN32_CONSOLE.md`; the research record is R-014.
+
+**Decision.**
+
+- **Imports are produced by `raw-dylib`, not by an import library.**
+  `userland/pe/peconsole` declares `#[link(name = "kernel32", kind =
+  "raw-dylib")] extern "system"` functions, so `rustc` + `rust-lld` emit a
+  genuine import descriptor, ILT and IAT directly (probe: 3 names, hint 0).
+  A hand-built import library or a hand-patched `.idata` section was
+  rejected: both test our own emitter instead of the real toolchain path,
+  and `raw-dylib` needs nothing beyond the pinned toolchain.
+- **The IAT is patched through the HHDM, before it is ever executed
+  through the mapping.** `rust-lld` places IAT slots in read-only `.rdata`
+  (probe); real Windows applies import fixups before final section
+  protections. The loader therefore writes each resolved address via the
+  physical frame like base relocations do, and never makes `.rdata`
+  writable. Rejected alternative: requiring a writable IAT section (would
+  reject real toolchain output).
+- **Resolution is an exact-name allowlist, not a search.** DLL `kernel32.dll`
+  only; functions `GetStdHandle` (service 3), `WriteConsoleA` (service 4),
+  `ExitProcess` (service 5) only; no ordinals, no `TimeDateStamp` binding,
+  no forwarders, no API-set names. Unknown DLL or function is a named
+  rejection (`unknown import dll` / `unknown import function`) *before* any
+  page is allocated. Rejected alternatives: ordinal support (no consumer,
+  no ordinal table work wanted yet), case-insensitive names (Windows is
+  case-insensitive, but a byte-exact allowlist is easier to audit; revisit
+  when real third-party modules are in scope).
+- **User-space stub page + `int 0x80`, never kernel code called from CPL3.**
+  One RX page at `0x51_0000` holds deduplicated stubs of the form
+  `mov eax, service; int 0x80; ret`; IAT slots receive the stub addresses.
+  This keeps the page-table isolation property (the whole kernel stays
+  supervisor-only) and reuses the existing gate, whose `rcx/rdx/r8/r9`
+  find the Win64 argument registers already in place. Rejected
+  alternatives: pointing the IAT directly at kernel functions (requires
+  mapping kernel text as user-executable — disqualifying), syscall-less
+  function-pointer callbacks (no privilege boundary left).
+- **The API surface is three functions with honest partial semantics.**
+  `GetStdHandle` returns `1` for `STD_OUTPUT_HANDLE` and
+  `INVALID_HANDLE_VALUE` otherwise; `WriteConsoleA` validates like the
+  syscall `write` (handle `1`, `MAX_WRITE` cap, user-page-validated buffer
+  and out-pointer), stores the count and mirrors the bytes to the console;
+  `ExitProcess` records the code and ends the thread through `sched::exit`.
+  No process object, no DLL detach, no `GetLastError` — the documented
+  gap, not a silent one.
+- **Marker token `,win32` after `,pe`**, gated on the new self-test verdict,
+  keeping every existing marker-suffix test valid.
+
+**Alternatives considered.** Forwarding the IAT to a mapped *copy* of the
+DLL code (nothing to copy — no DLL is loaded); emulating `kernel32` entries
+as one generic dispatcher with a name lookup in the fixture (moves
+resolution out of the loader, which is the actual stage goal); supporting a
+wider API set now (`WriteFile`, `GetLastError`, W-variants) — each needs
+semantics we do not have; making the stub page writable so the fixture
+could patch itself (violates W^X for no benefit).
+
+**Evidence.** Observed (recorded with logs in `progress.md`):
+toolchain probe import dump (R-014), `scripts/test_pe_qemu.sh` PASS with the
+win32 lines and marker `...,user,elf,pe,win32,vfs`; the two named import
+rejections; unit tests for every new parser row; full `test_all.sh` run
+including VirtualBox.
+
+**Consequences.** PROJECT_OS now has the import-resolution *mechanism* and
+three native reimplementations behind it. This is still not Windows
+application compatibility: no third-party binary runs, no real DLL is
+loaded, no handle/process semantics exist beyond the single console handle,
+and the allowlist means an image importing anything else is rejected by
+design. Limits stay as stated in `docs/WIN32_CONSOLE.md` §1/§9.
 

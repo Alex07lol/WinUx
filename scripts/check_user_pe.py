@@ -5,12 +5,18 @@ Verifies: MS-DOS stub with "PE\\0\\0" at e_lfanew, COFF header for AMD64
 (0x8664) marked EXECUTABLE and not a DLL, PE32+ optional header (0x20B) with
 CUI subsystem, valid alignments and SizeOfImage, sections whose page-rounded
 ranges live inside the kernel's user code window (0x400000..0x500000) without
-write+execute flags, an entry point inside an executable section, no
-import/delay-import/TLS/CLR directories, and (because the fixture links at
-0x140000000) a base-relocation directory whose DIR64 targets each sit inside a
-writable section and do not cross a page boundary.
+write+execute flags, an entry point inside an executable section, delay-
+import/TLS/CLR directories empty, an import directory matching the expected
+signature (or empty), and (because the fixture links at 0x140000000) a
+base-relocation directory whose DIR64 targets each sit inside a writable
+section and do not cross a page boundary.
 
-Usage: check_user_pe.py <file>
+Usage: check_user_pe.py <file> [--imports <spec>]
+  --imports -             the import directory must be empty (default)
+  --imports dll:fn,fn,... every import must be by name, from that exact DLL,
+                          with that exact function-name set (order-insensitive);
+                          ILT entries must be ordinal-free, and each IAT slot
+                          must sit inside a readable section inside the window.
 
 Exit status: 0 on pass (prints a one-line summary), 1 on any violation.
 """
@@ -34,6 +40,7 @@ IMAGE_FILE_MACHINE_AMD64 = 0x8664
 IMAGE_SUBSYSTEM_WINDOWS_CUI = 3
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
+IMAGE_SCN_MEM_READ = 0x40000000
 IMAGE_SCN_MEM_WRITE = 0x80000000
 
 DIR_IMPORT = 1
@@ -45,17 +52,40 @@ DIR_CLR = 14
 REL_BASED_ABSOLUTE = 0
 REL_BASED_DIR64 = 10
 
+IMPORT_DESCRIPTOR_SIZE = 20
+ORDINAL_FLAG64 = 1 << 63
+
 
 def fail(message: str) -> None:
     print(f"FAIL: {message}", file=sys.stderr)
     raise SystemExit(1)
 
 
+def parse_import_spec(spec: str) -> tuple[str, list[str]] | None:
+    if spec == "-":
+        return None
+    if ":" not in spec:
+        fail(f"bad --imports spec (expected dll:fn,fn,...): {spec}")
+    dll, functions = spec.split(":", 1)
+    if not dll or not functions:
+        fail(f"bad --imports spec (expected dll:fn,fn,...): {spec}")
+    return dll, functions.split(",")
+
+
 def main() -> None:
-    if len(sys.argv) != 2:
-        print(f"usage: {Path(sys.argv[0]).name} <file>", file=sys.stderr)
+    arguments = sys.argv[1:]
+    expected_imports = None
+    if "--imports" in arguments:
+        index = arguments.index("--imports")
+        if index + 1 >= len(arguments):
+            print(f"usage: {Path(sys.argv[0]).name} <file> [--imports <spec>]", file=sys.stderr)
+            raise SystemExit(2)
+        expected_imports = parse_import_spec(arguments[index + 1])
+        del arguments[index : index + 2]
+    if len(arguments) != 1:
+        print(f"usage: {Path(sys.argv[0]).name} <file> [--imports <spec>]", file=sys.stderr)
         raise SystemExit(2)
-    path = Path(sys.argv[1])
+    path = Path(arguments[0])
     if not path.is_file():
         fail(f"file not found: {path}")
     image = path.read_bytes()
@@ -114,7 +144,6 @@ def main() -> None:
         return struct.unpack_from("<II", image, base)
 
     for index, name in (
-        (DIR_IMPORT, "import"),
         (DIR_DELAY_IMPORT, "delay-import"),
         (DIR_TLS, "tls"),
         (DIR_CLR, "clr"),
@@ -177,14 +206,105 @@ def main() -> None:
     ):
         fail(f"entry {entry_rva:#x} is not inside an executable section")
 
-    if characteristics & IMAGE_FILE_RELOCS_STRIPPED:
-        fail("relocations stripped")
-
     def section_for_rva(rva: int) -> dict | None:
         for section in sections:
             if section["va"] <= rva < section["va"] + max(section["raw_size"], section["memory_size"]):
                 return section
         return None
+
+    def read_c_string(start: int, limit: int) -> str:
+        end = start
+        while end < limit and image[end] != 0:
+            end += 1
+        if end == limit:
+            fail("unterminated string in import data")
+        return image[start:end].decode("ascii", "replace")
+
+    imported_dll = None
+    imported_functions: list[str] = []
+    (import_rva, import_size) = directory(DIR_IMPORT)
+    if expected_imports is None:
+        if (import_rva, import_size) != (0, 0):
+            fail("import directory is not empty")
+    else:
+        expected_dll, expected_functions = expected_imports
+        if (
+            import_rva == 0
+            or import_size < IMPORT_DESCRIPTOR_SIZE
+            or import_size % IMPORT_DESCRIPTOR_SIZE
+        ):
+            fail(f"import directory malformed ({import_rva:#x}, {import_size:#x})")
+        anchor = section_for_rva(import_rva)
+        if (
+            anchor is None
+            or not anchor["raw_size"]
+            or import_rva - anchor["va"] + import_size > anchor["raw_size"]
+        ):
+            fail("import directory outside section raw data")
+        cursor = anchor["raw_offset"] + (import_rva - anchor["va"])
+        end = cursor + import_size
+        descriptors = []
+        while cursor < end:
+            fields = struct.unpack_from("<IIIII", image, cursor)
+            if fields == (0, 0, 0, 0, 0):
+                break
+            descriptors.append(fields)
+            cursor += IMPORT_DESCRIPTOR_SIZE
+        else:
+            fail("import descriptor table has no terminator")
+        if len(descriptors) != 1:
+            fail(f"expected exactly one import descriptor, found {len(descriptors)}")
+        (ilt_rva, _timestamp, _forwarder, name_rva, iat_rva) = descriptors[0]
+        if ilt_rva == 0:
+            fail("import descriptor has no lookup table (OriginalFirstThunk = 0)")
+        name_section = section_for_rva(name_rva)
+        if name_section is None or not name_section["raw_size"]:
+            fail("dll name outside section raw data")
+        imported_dll = read_c_string(
+            name_section["raw_offset"] + (name_rva - name_section["va"]),
+            name_section["raw_offset"] + name_section["raw_size"],
+        )
+        if imported_dll != expected_dll:
+            fail(f"import dll {imported_dll!r} != expected {expected_dll!r}")
+        ilt_section = section_for_rva(ilt_rva)
+        if ilt_section is None or not ilt_section["raw_size"]:
+            fail("ILT outside section raw data")
+        index = 0
+        while True:
+            relative = ilt_rva + index * 8 - ilt_section["va"]
+            if relative < 0 or relative + 8 > ilt_section["raw_size"]:
+                fail("ILT is not terminated inside its section raw data")
+            (thunk,) = struct.unpack_from("<Q", image, ilt_section["raw_offset"] + relative)
+            if thunk == 0:
+                break
+            if thunk & ORDINAL_FLAG64:
+                fail(f"import by ordinal (index {index})")
+            hint_name_rva = thunk & 0x7FFFFFFF
+            entry_section = section_for_rva(hint_name_rva)
+            if entry_section is None or not entry_section["raw_size"]:
+                fail(f"import name {index} outside section raw data")
+            entry_offset = entry_section["raw_offset"] + (hint_name_rva - entry_section["va"])
+            imported_functions.append(
+                read_c_string(entry_offset + 2, entry_section["raw_offset"] + entry_section["raw_size"])
+            )
+            slot_rva = iat_rva + index * 8
+            slot_section = section_for_rva(slot_rva)
+            if (
+                slot_section is None
+                or not slot_section["chars"] & IMAGE_SCN_MEM_READ
+                or slot_rva % PAGE_SIZE + 8 > PAGE_SIZE
+                or CODE_BASE + slot_rva + 8 > CODE_END
+            ):
+                fail(f"IAT slot {index} ({slot_rva:#x}) is not patchable inside a readable section")
+            index += 1
+        if sorted(imported_functions) != sorted(expected_functions):
+            fail(
+                f"import function set {sorted(imported_functions)} "
+                f"!= expected {sorted(expected_functions)}"
+            )
+
+    if characteristics & IMAGE_FILE_RELOCS_STRIPPED:
+        fail("relocations stripped")
 
     (reloc_rva, reloc_size) = directory(DIR_BASERELOC)
     relocations = []
@@ -218,10 +338,14 @@ def main() -> None:
                 relocations.append(target)
             offset += block_size
 
+    if imported_functions:
+        imports_summary = f"{imported_dll}:{','.join(sorted(imported_functions))}"
+    else:
+        imports_summary = "none"
     print(
         f"OK: {path.name}: entry {entry_rva:#x}, image base {image_base:#x}, "
         f"{len(sections)} sections ({', '.join(s['name'] for s in sections)}), "
-        f"{len(relocations)} relocations"
+        f"{len(relocations)} relocations, imports {imports_summary}"
     )
 
 

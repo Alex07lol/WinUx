@@ -1,8 +1,12 @@
 # Windows application compatibility (future)
 
-Status: **not implemented.** There is no PE loader, no Win32 implementation, no NT
-system-service layer and no Windows driver support. This document describes the
-intended architecture and its strict boundaries so future work does not silently
+Status: **not implemented** as application compatibility. Phase 7 stages 1–2
+provide a PE32+ loader and an import mechanism for one allowlisted surface:
+three `kernel32.dll`-shaped console services resolved through a genuine import
+directory and served by the kernel (`docs/WIN32_CONSOLE.md`). There is still no
+NT system-service layer, no real DLL loading, no general Win32 implementation
+and no Windows driver support. This document describes the intended
+architecture and its strict boundaries so future work does not silently
 reintroduce Wine/Proton or translation.
 
 ## Target execution path
@@ -48,8 +52,8 @@ This is a target diagram, not an assertion that any layer exists.
 
 | Layer | Needs | Status |
 |---|---|---|
-| PE/PE32+ loader | sections, alignments, imports/exports, base relocations, TLS, bounds checks | not started |
-| Native execution | user/kernel boundary, per-process address spaces, W^X | not started |
+| PE/PE32+ loader | sections, alignments, imports/exports, base relocations, TLS, bounds checks | partial (stages 1–2): PE32+ parsing/loading, W^X mapping, DIR64 relocations, import directory against a three-name `kernel32.dll` allowlist; no exports, forwarders, ordinals, delay imports, TLS/SEH or PE32 |
+| Native execution | user/kernel boundary, per-process address spaces, W^X | partial: ring-3 `int 0x80` boundary, per-program address space with teardown, W^X; one user thread at a time, no process model |
 | Win32 runtime | files, console, process/thread, synchronization, registry-like config, memory | not started |
 | NT-style services | handles/objects, waitable objects, events/semaphores/mutexes, IPC, tokens/ACLs | not started |
 | GUI layer | window manager, messages, text/font, input, GDI-like drawing | not started |
@@ -58,8 +62,9 @@ This is a target diagram, not an assertion that any layer exists.
 
 The kernel must eventually expose versioned internal interfaces for processes,
 virtual address spaces, waitable objects, handles, IPC, file objects, security
-contexts and device resources. None are implemented yet; the current kernel has
-only boot-time memory and interrupt foundations.
+contexts and device resources. None of these NT-shaped interfaces exist yet;
+the current kernel has boot-time memory management, a thread table, a ring-3
+`int 0x80` gate and a checkpoint VFS, but no objects, handles or IPC.
 
 ## Test corpus strategy
 
@@ -90,13 +95,18 @@ Running a console program is not GUI, Direct3D or driver compatibility.
 
 ## Current gaps
 
-- No user mode, syscalls, process/thread model, handles, IPC, VFS or security.
-- No PE parser/loader.
+- No process model, handles/IPC, security tokens or multi-process memory
+  isolation. (Ring-3 execution with our own `int 0x80` syscalls, a kernel
+  thread table and a checkpoint VFS exist; none of them are NT-shaped.)
+- PE32+ parsing/loading exists, but not exports, real DLL loading, SEH/TLS,
+  PE32 or imports beyond the three-name allowlist.
 - No Win32/COM/DXGI/Direct3D runtime.
 - No registry-like configuration store.
-- No networking, audio, printing or installers.
+- No audio, printing or installers (networking is a single polled e1000 with
+  static addressing, Phase 6).
 - No Windows kernel-driver environment.
-- No compatibility test corpus has been built or run.
+- No compatibility test corpus has been built or run beyond our own controlled
+  fixtures; no third-party Windows binary has been executed.
 
 No claim of "Windows compatible" is made anywhere in this repository.
 

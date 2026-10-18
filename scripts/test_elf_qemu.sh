@@ -23,6 +23,6 @@ require_line "syscall: thread exits with code 0"
 require_line "user fault isolated: vector=14"
 require_line "user: /boot/bad.elf rejected (bad magic)"
 require_line "user selftest: passed (ELF64 modules loaded"
-require_line "sched,user,elf,pe,vfs"
+require_line "sched,user,elf,pe,win32,vfs"
 
 log "PASS: ELF64 modules loaded, executed at CPL3, fault isolated, corrupt module rejected"

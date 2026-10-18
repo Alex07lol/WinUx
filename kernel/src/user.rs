@@ -1,5 +1,5 @@
 //! Ring-3 user-mode demonstration and self-test (Phase 6, stage 3; PE32+
-//! phase 7, stage 1).
+//! phase 7, stages 1 and 2).
 //!
 //! User programs are ELF64 executables built from `userland/` (Rust, no_std)
 //! and PE32+ executables built from `userland/pe`, shipped as Limine modules
@@ -18,11 +18,17 @@
 //!   checks the DIR64 fixup at runtime), two console writes, exit 0.
 //! * `pebad.exe` (signature bytes zeroed) must be rejected with
 //!   `bad signature` before any page is allocated.
+//! * `peconsole.exe` (stage 2) runs at CPL3 and calls `GetStdHandle`,
+//!   `WriteConsoleA` and `ExitProcess` through a real `rust-lld`-produced
+//!   import table, dispatched by the kernel-owned stub page.
+//!   `pebadimp.exe` (unknown DLL) and `pebadfn.exe` (unknown function) must
+//!   be rejected by the import allowlist before any page is allocated.
 //!
 //! Each program runs one at a time on its own scheduler thread. The thread
 //! publishes its address space and load plan into a static slot; after the
 //! thread dies the boot context switches CR3 back to the kernel template,
-//! unmaps every page of the load plan plus the stack, and destroys the space.
+//! unmaps every page of the load plan (including the import stub page) plus
+//! the stack, and destroys the space.
 
 use core::arch::global_asm;
 use core::sync::atomic::Ordering;
@@ -47,6 +53,9 @@ const FAULT_PATH: &str = "/boot/fault.elf";
 const BAD_PATH: &str = "/boot/bad.elf";
 const PEHELLO_PATH: &str = "/boot/pehello.exe";
 const PEBAD_PATH: &str = "/boot/pebad.exe";
+const PECONSOLE_PATH: &str = "/boot/peconsole.exe";
+const PEBADIMP_PATH: &str = "/boot/pebadimp.exe";
+const PEBADFN_PATH: &str = "/boot/pebadfn.exe";
 
 /// Single user stack page, at the stage-5b placement just above the code
 /// window (`loader::CODE_END` == `STACK_VA`).
@@ -90,7 +99,7 @@ unsafe extern "C" {
 #[allow(clippy::large_enum_variant)]
 enum LoadedPlan {
     Elf(loader::Inspection),
-    Pe(pe_loader::Inspection),
+    Pe(pe_loader::Loaded),
 }
 
 /// The running thread publishes its address space and load plan here; the
@@ -109,6 +118,8 @@ pub struct DemoReport {
     pub elf: bool,
     /// False when the PE self-test was skipped (no modules / missing module).
     pub pe: bool,
+    /// False when the Win32 console self-test was skipped.
+    pub win32: bool,
 }
 
 fn thread_fatal(message: core::fmt::Arguments<'_>) -> ! {
@@ -198,8 +209,9 @@ fn thread_fault() {
 }
 
 /// Build the address space for one PE module (inspect, map, apply DIR64 base
-/// relocations), map the zeroed stack, switch CR3, program the TSS stack and
-/// enter ring 3 at the PE entry. Returns only through the kernel on failure.
+/// relocations, resolve imports), map the zeroed stack, switch CR3, program
+/// the TSS stack and enter ring 3 at the PE entry. Returns only through the
+/// kernel on failure.
 fn run_pe(path: &'static str) -> ! {
     let Some(module) = limine::module_by_path(path) else {
         thread_fatal(format_args!("module {} disappeared before load", path));
@@ -215,22 +227,26 @@ fn run_pe(path: &'static str) -> ! {
         Ok(space) => space,
         Err(_) => thread_fatal(format_args!("cannot create the user address space")),
     };
-    let applied = match pe_loader::map(&mut space, module, &image) {
-        Ok(applied) => applied,
+    let loaded = match pe_loader::map(&mut space, module, &image) {
+        Ok(loaded) => loaded,
         Err(reject) => {
             let _ = space.destroy();
             thread_fatal(format_args!("cannot load {}: {}", path, reject.label()));
         }
     };
-    let entry = loader::CODE_BASE + u64::from(image.entry_rva());
+    let entry = loader::CODE_BASE + u64::from(loaded.image.entry_rva());
     kprintln!(
         "pe: {} loaded at {:#x} (entry {:#x}, {} sections, {} relocation{} applied)",
         path.rsplit('/').next().unwrap_or(path),
         loader::CODE_BASE,
         entry,
-        image.sections().len(),
-        applied,
-        if applied == 1 { "" } else { "s" }
+        loaded.image.sections().len(),
+        loaded.applied_relocations,
+        if loaded.applied_relocations == 1 {
+            ""
+        } else {
+            "s"
+        }
     );
     let stack_frame = match memory::alloc_frame() {
         Ok(frame) => frame,
@@ -261,7 +277,7 @@ fn run_pe(path: &'static str) -> ! {
     if space.activate().is_err() {
         thread_fatal(format_args!("activating the user address space failed"));
     }
-    *USER_SLOT.lock() = Some((space, LoadedPlan::Pe(image)));
+    *USER_SLOT.lock() = Some((space, LoadedPlan::Pe(loaded)));
 
     set_tss_rsp0(kernel_stack_top);
     // SAFETY: `entry` points into a mapped executable section of the
@@ -278,6 +294,10 @@ fn run_pe(path: &'static str) -> ! {
 
 fn thread_pehello() {
     run_pe(PEHELLO_PATH);
+}
+
+fn thread_peconsole() {
+    run_pe(PECONSOLE_PATH);
 }
 
 fn unmap_and_free(space: &mut AddressSpace, virtual_address: u64) -> Result<(), &'static str> {
@@ -304,14 +324,17 @@ fn cleanup_slot() -> Result<(), &'static str> {
                 }
             }
         }
-        LoadedPlan::Pe(image) => {
-            for section in image.sections() {
+        LoadedPlan::Pe(loaded) => {
+            for section in loaded.image.sections() {
                 let range = pe_loader::section_page_range(section);
                 let mut page = range.start;
                 while page < range.end {
                     unmap_and_free(&mut space, page)?;
                     page += PAGE_SIZE;
                 }
+            }
+            if loaded.stub_page != 0 {
+                unmap_and_free(&mut space, loaded.stub_page)?;
             }
         }
     }
@@ -330,6 +353,7 @@ fn idle_report() -> DemoReport {
         rejected_syscalls: syscall::REJECTED_SYSCALLS.load(Ordering::SeqCst),
         elf: false,
         pe: false,
+        win32: false,
     }
 }
 
@@ -447,11 +471,85 @@ pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
         return Err("pehello.exe produced a user fault");
     }
 
+    // Phase 7, stage 2: the native Win32 console surface. The negative
+    // fixtures are probed first — a rejection here proves the import
+    // allowlist before any page is allocated — then `peconsole.exe` runs at
+    // CPL3 and reaches our implementations through resolved `kernel32.dll`
+    // imports.
+    for path in [PECONSOLE_PATH, PEBADIMP_PATH, PEBADFN_PATH] {
+        if limine::module_by_path(path).is_none() {
+            kprintln!("user: Win32 self-test skipped (`{}` module missing)", path);
+            kprintln!("win32 selftest: skipped (no Win32 fixtures present)");
+            sched::set_preemption(false);
+            return Ok(DemoReport {
+                elf: true,
+                pe: true,
+                ..idle_report()
+            });
+        }
+    }
+
+    let Some(bad_import) = limine::module_by_path(PEBADIMP_PATH) else {
+        return Err("pebadimp.exe module vanished after the presence check");
+    };
+    match pe_loader::inspect(bad_import) {
+        Ok(_) => return Err("module pebadimp.exe was accepted despite an unknown import dll"),
+        Err(pe_loader::Reject::UnknownImportDll) => {
+            kprintln!("user: /boot/pebadimp.exe rejected (unknown import dll)");
+        }
+        Err(_) => return Err("module pebadimp.exe was rejected for an unexpected reason"),
+    }
+
+    let Some(bad_function) = limine::module_by_path(PEBADFN_PATH) else {
+        return Err("pebadfn.exe module vanished after the presence check");
+    };
+    match pe_loader::inspect(bad_function) {
+        Ok(_) => return Err("module pebadfn.exe was accepted despite an unknown import function"),
+        Err(pe_loader::Reject::UnknownImportFunction) => {
+            kprintln!("user: /boot/pebadfn.exe rejected (unknown import function)");
+        }
+        Err(_) => return Err("module pebadfn.exe was rejected for an unexpected reason"),
+    }
+
+    let writes_before_win32 = syscall::WRITE_CALLS.load(Ordering::SeqCst);
+    let bytes_before_win32 = syscall::BYTES_WRITTEN.load(Ordering::SeqCst);
+    let faults_before_win32 = syscall::USER_FAULTS.load(Ordering::SeqCst);
+    let get_before_win32 = syscall::WIN32_GET_STD_HANDLE_CALLS.load(Ordering::SeqCst);
+    let console_before_win32 = syscall::WIN32_WRITE_CONSOLE_CALLS.load(Ordering::SeqCst);
+    let exit_before_win32 = syscall::WIN32_EXIT_PROCESS_CALLS.load(Ordering::SeqCst);
+
+    sched::spawn("user-win32", thread_peconsole)?;
+    sched::wait_all_finished(300, tsc_frequency)?;
+    vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
+    cleanup_slot()?;
+    if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
+        return Err("peconsole.exe did not exit with code 0");
+    }
+    if syscall::WIN32_GET_STD_HANDLE_CALLS.load(Ordering::SeqCst) != get_before_win32 + 1 {
+        return Err("peconsole.exe did not call GetStdHandle exactly once");
+    }
+    if syscall::WIN32_WRITE_CONSOLE_CALLS.load(Ordering::SeqCst) != console_before_win32 + 2 {
+        return Err("peconsole.exe did not call WriteConsoleA exactly twice");
+    }
+    if syscall::WIN32_EXIT_PROCESS_CALLS.load(Ordering::SeqCst) != exit_before_win32 + 1 {
+        return Err("peconsole.exe did not call ExitProcess exactly once");
+    }
+    if syscall::WRITE_CALLS.load(Ordering::SeqCst) != writes_before_win32 + 2 {
+        return Err("peconsole.exe did not perform exactly two console writes");
+    }
+    if syscall::BYTES_WRITTEN.load(Ordering::SeqCst) != bytes_before_win32 + 76 {
+        return Err("peconsole.exe did not write exactly 76 bytes");
+    }
+    if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_before_win32 {
+        return Err("peconsole.exe produced a user fault");
+    }
+
     sched::set_preemption(false);
 
     let report = DemoReport {
         elf: true,
         pe: true,
+        win32: true,
         ..idle_report()
     };
     if report.rejected_syscalls != 0 {

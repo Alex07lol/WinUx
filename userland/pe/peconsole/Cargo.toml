@@ -1,0 +1,11 @@
+[package]
+name = "peconsole"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PROJECT_OS PE32+ Win32 console surface fixture (raw-dylib imports)"
+
+[[bin]]
+name = "peconsole"
+path = "src/main.rs"

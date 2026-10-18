@@ -45,10 +45,10 @@ for name in hello fault bad; do
     USER_ELFS="$USER_ELFS $artifact"
 done
 
-# PE32+ fixtures (Phase 7, stage 1) are modules too; build on demand and never
-# produce an ISO that references a missing .exe module.
+# PE32+ fixtures (Phase 7, stages 1-2) are modules too; build on demand and
+# never produce an ISO that references a missing .exe module.
 USER_PES=""
-for name in pehello pebad; do
+for name in pehello pebad peconsole pebadimp pebadfn; do
     artifact="$ROOT_DIR/artifacts/$name.exe"
     if [ ! -f "$artifact" ]; then
         log "PE fixture missing ($artifact); building"
@@ -56,7 +56,7 @@ for name in pehello pebad; do
         break
     fi
 done
-for name in pehello pebad; do
+for name in pehello pebad peconsole pebadimp pebadfn; do
     artifact="$ROOT_DIR/artifacts/$name.exe"
     [ -f "$artifact" ] || die "PE fixture missing: $artifact"
     USER_PES="$USER_PES $artifact"

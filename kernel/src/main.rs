@@ -479,6 +479,11 @@ pub extern "C" fn kmain() -> ! {
             } else {
                 kprintln!("pe selftest: skipped (no PE modules present)");
             }
+            if report.win32 {
+                kprintln!(
+                    "win32 selftest: passed (kernel32.dll imports resolved, WriteConsoleA wrote to the console fd, ExitProcess ended the thread)"
+                );
+            }
             report
         }
         Err(error) => fatal(format_args!("user-mode selftest failed: {}", error)),
@@ -511,6 +516,9 @@ pub extern "C" fn kmain() -> ! {
     }
     if user_report.pe {
         checks.push_str(",pe");
+    }
+    if user_report.win32 {
+        checks.push_str(",win32");
     }
     checks.push_str(",vfs");
     if blk::info().is_some() {

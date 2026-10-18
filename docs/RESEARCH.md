@@ -512,6 +512,95 @@ rejection labels), `kernel/src/pe_loader.rs` (window/W^X/relocation policy),
 load base, no third-party binaries) stay as stated in `docs/PE_LOADER.md`
 §1 and §9.
 
+## R-014 — PE import tables, a raw-dylib fixture pipeline and three Win32 console contracts
+
+**Question.** How does a PE32+ image declare DLL imports (descriptor array,
+ILT/IAT, hint/name entries, ordinals), how does the Windows loader resolve
+them into the IAT, can genuine import tables be produced by the pinned Rust
+toolchain without an import library or any Windows SDK component, and what
+are the exact documented contracts of `GetStdHandle`, `WriteConsoleA` and
+`ExitProcess`?
+
+**Sources.**
+- Microsoft *PE Format* specification (Win32 docs; import-directory section,
+  same revision family as R-013): 20-byte import descriptors terminated by an
+  all-zero record; `OriginalFirstThunk` (ILT) with fallback to `FirstThunk`
+  (IAT); 64-bit thunks whose bit 63 marks ordinal imports; `IMAGE_IMPORT_BY_
+  NAME` = 16-bit hint + NUL-terminated name; the loader writes each resolved
+  function address into the respective IAT slot.
+- Microsoft Learn `GetStdHandle` (fetched 2026-10-18, Console-Docs revision
+  425fa47): `HANDLE GetStdHandle(DWORD nStdHandle)`; `STD_OUTPUT_HANDLE` is
+  `((DWORD)-11)` = `0xFFFF_FFF5`; failure returns `INVALID_HANDLE_VALUE`; the
+  function itself performs no handle validation.
+- Microsoft Learn `WriteConsole` (fetched 2026-10-18, same revision):
+  `BOOL WriteConsole(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID)` with the
+  ANSI name `WriteConsoleA`; nonzero on success; `lpReserved` must be NULL;
+  the A-variant writes bytes.
+- Microsoft Learn `ExitProcess` (fetched 2026-10-18): `VOID
+  ExitProcess(UINT uExitCode)`; ends the calling process; its thread/DLL
+  bookkeeping steps presuppose objects this kernel does not have.
+- Rust `raw-dylib` linkage: `#[link(name = "kernel32", kind =
+  "raw-dylib")]` is stable in the pinned 1.99.1 toolchain and makes
+  `rustc`/`rust-lld` synthesize the import descriptor, ILT and IAT without
+  any import library file or Windows SDK tool.
+- Toolchain probe (this checkout, 2026-10-18, temp workspace, same flags as
+  stage 1): the probe linked as a 2560-byte PE32+ with sections `.text`,
+  `.rdata`, `.data`, `.pdata`, `.reloc`; one import descriptor
+  (`kernel32.dll`, ILT RVA `0x2088`, IAT RVA `0x20A8`, `TimeDateStamp` 0,
+  `ForwarderChain` 0) and three name entries (`ExitProcess`, `GetStdHandle`,
+  `WriteConsoleA`, all hint 0); one DIR64 relocation from the `global_asm!`
+  marker slot. The IAT and the name strings live in read-only `.rdata`.
+
+**Claim.** Import resolution requires only the descriptor/ILT/name walk with
+the documented fallback and ordinal rule, plus an IAT write for each slot;
+the fixed allowlist against our own native implementations is sufficient for
+a first console surface. Genuine import tables need no SDK: `raw-dylib`
+plus `rust-lld` emits them, and because the IAT lands in a read-only
+section the loader must apply fixups through the physical frame (as it
+already does for base relocations), which is also the Windows fixup-before-
+protection order. Confidence high for the format and API contracts
+(specification/doc text); the fixture pipeline is verified by the probe and
+must additionally be verified end-to-end under our loader (see
+`docs/WIN32_CONSOLE.md`).
+
+**Experiment.** PASSED (2026-10-18). `scripts/build_user_pe.sh` built and
+checked five fixtures (peconsole.exe 3584 bytes, SHA-256
+`1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; the two
+mutants patched a single unique byte pattern each and stayed structurally
+valid). `scripts/test_pe_qemu.sh` (QEMU 11.1.0, BIOS, 512 MiB, serial log
+`artifacts/qemu-serial-pe.log`) observed, in order:
+`pe: 5 modules present`,
+`pe: peconsole.exe loaded at 0x400000 (entry 0x401000, 5 sections, 1 relocation applied)`,
+`win32: GetStdHandle(-11) -> 1`,
+`win32: hello from the Win32 console surface`,
+`win32: WriteConsoleA(1, 44 bytes) -> 1`,
+`win32: console surface verified`,
+`win32: WriteConsoleA(1, 32 bytes) -> 1`,
+`win32: ExitProcess(0)`,
+`user: /boot/pebadimp.exe rejected (unknown import dll)`,
+`user: /boot/pebadfn.exe rejected (unknown import function)`,
+`win32 selftest: passed (kernel32.dll imports resolved, WriteConsoleA wrote to the console fd, ExitProcess ended the thread)`,
+marker `checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs`,
+and exit via isa-debug-exit. The full `scripts/test_all.sh` run finished
+PASS=22 FAIL=0 SKIP=4 with the `pe` step covering the win32 assertions.
+Bring-up defects found and fixed (all recorded in `progress.md`):
+`pe_loader::map` iterated the full `Inspection::imports` array instead of
+`imports[..import_count]` (a stale stage-1-shaped loop), and
+`AddressSpace::translate` returned the frame base without the in-page offset,
+which broke the unaligned IAT-slot fixups at `0x2108`/`0x2110` and would have
+misplaced any unaligned write done through a translated address (the stage-1
+relocation target happened to be page-aligned, so the defect stayed latent);
+both fixed before the PASS, and the Windows-fixup-before-protection order
+(HHDM write into read-only `.rdata`) held exactly as predicted.
+
+**Conclusion.** Implemented: `os_core::pe` import parsing (allowlisted names,
+named rejection labels), `pe_loader` resolution with a user-space stub page
+and HHDM IAT patch, syscall services 3–5, the `peconsole` fixture plus two
+deterministic negative mutants, and the extended fixture checker; recorded
+as ADR-0020. Limits (three functions, one console handle, no DLL loading,
+no ordinals/forwarders, no general compatibility) stay as stated in
+`docs/WIN32_CONSOLE.md` §1 and §9.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

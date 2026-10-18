@@ -22,25 +22,34 @@ screendump) and the **e1000 network stack** (a polled 82540EM driver over a
 minimal PCI scan, host-tested ARP/IPv4/ICMP/UDP codecs, static `10.0.2.15/24`,
 and a scripted QEMU slirp round trip proving ARP, three ICMP replies and a
 UDP echo) — are implemented and verified in QEMU/VirtualBox BIOS boots.
-Phase 6 scope is complete for that environment. PE loading and Windows
-compatibility remain unstarted.
+Phase 6 scope is complete for that environment. **Phase 7 stage 1** — a native
+PE32+ loader — is implemented and verified: a host-tested `os_core::pe` parser,
+a kernel loader (`kernel/src/pe_loader.rs`) that maps W^X sections and applies
+DIR64 base relocations under the fixed `0x400000` window, and a genuine PE32+
+fixture produced by `rustc` + `rust-lld` (no MSVC/MinGW/Windows SDK) executing
+at CPL3 via `int 0x80`; a corrupt PE module is rejected without harming boot.
+The remaining Phase 7 scope (a minimal native Win32/NT console surface,
+imports, DLLs, SEH, TLS) is not started; there is still no Windows API
+compatibility.
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
 ## Repository state
 
 - Workspace root: this thread's local checkout.
-- Git: branch `main`; seven commits before this progress edit (`77bb56e
+- Git: branch `main`; eight commits before this progress edit (`77bb56e
   phase1`, `0cc9372 heap, kernel-owned page tables, threads, ring 3`,
   `43fdd7b phase6: serial console, vfs, shell, ata checkpoint persistence,
   ring-3 elf64 module loader`, `f3b17a3 progress: record phase6 commit and
   push`, `fb2da14 phase6: framebuffer log console with readback selftest and
   screendump test`, `5467bde progress: record phase6 stage 4 commit and push`,
   `b257a1e phase6: e1000 networking with arp/icmp/udp and qemu slirp
-  round-trip test`). The stage-5 commit was pushed to `orgin/main`
-  (github.com/Alex07lol/WinUx, `5467bde..b257a1e`); this progress edit is the
-  eighth commit, the follow-up recording it, same pattern as `f3b17a3` and
-  `5467bde`. Nothing was reset or discarded.
+  round-trip test`, `25606ad progress: record phase6 stage 5 commit and push`).
+  `b257a1e..25606ad` is pushed to `orgin/main` (github.com/Alex07lol/WinUx).
+  The Phase 7 stage-1 commit is `b37b371` (`phase7: pe32+ loader, dir64 base
+  relocations, rust-lld fixture at cpl3`), pushed (`25606ad..b37b371`); this
+  progress edit is its follow-up commit, same pattern as `f3b17a3`,
+  `5467bde` and `25606ad`. Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
 - Case-insensitive host: `agents.md`, `STOP.md` and `PROGRESS.md` resolve to
@@ -316,8 +325,40 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   default e1000e is unsupported by design). Asserts the pinned bring-up
   lines, the `,net` marker, `net` counters, three `ping` replies with `0%
   loss`, and a 19-byte host→guest UDP echo (`udpecho: echoed 19 bytes`);
-  `test_all.sh` gained the `net` step (19 → 20 PASS); VirtualBox now
-  attaches `--nic1 nat --nictype1 82540EM`.
+   `test_all.sh` gained the `net` step (19 → 20 PASS); VirtualBox now
+   attaches `--nic1 nat --nictype1 82540EM`.
+- Phase 7 stage 1 — host-tested parser (`os_core/src/pe.rs`): PE32+/AMD64/CUI
+  validation, section layout and file-range checks, data-directory policy
+  (imports/delay/TLS/CLR must be empty), a DIR64 relocation walk (ABSOLUTE
+  padding skipped, type 10 only) with compact RVA storage, and stable
+  rejection labels; 56 new host tests (235 total). Contract: spec
+  `docs/PE_LOADER.md`, decision ADR-0019, research R-013.
+- Phase 7 stage 1 — kernel loader (`kernel/src/pe_loader.rs`): two-phase
+  `inspect` (window `0x400000..0x500000` page-rounded, ≤16 sections, W^X,
+  nonzero delta requires present non-stripped relocs) and `map` (alloc,
+  zero-fill, payload copy through the HHDM, per-section W^X flags, DIR64
+  application with per-target writable/page-cross checks, full rollback on
+  failure). `kernel/src/user.rs` gained the PE thread path, a
+  `LoadedPlan { Elf, Pe }` teardown enum and the PE phase in `demo()`
+  (skip without PE modules, `pebad.exe` probe, spawn `user-pe`, exit/write/
+  fault checks); `main.rs` gates the `,pe` marker and prints the PE verdict.
+- Phase 7 stage 1 — fixture pipeline: `userland/pe` (separate workspace,
+  `pehello` fixture: `#![no_std]`, rust-lld links it with
+  `/nodefaultlib /entry:_start /subsystem:console`, a `global_asm!` `.quad`
+  slot forces a real DIR64 relocation, the fixture compares the relocated
+  value against a rip-relative address), `scripts/build_user_pe.sh` (target +
+  rust-lld checks, builds, generates deterministic `pebad.exe` by zeroing the
+  signature, runs the checker on both), `scripts/check_user_pe.py`
+  (dependency-free contract check: image base, section ranges, W^X, entry,
+  relocation targets), `scripts/test_pe_qemu.sh` (pinned serial assertions),
+  `test_all.sh` gained `userland-pe` and `pe` steps (20 → 22 PASS),
+  `test_elf_qemu.sh` marker now `sched,user,elf,pe,vfs`, `bootstrap.sh` checks
+  the msvc target and rust-lld, `lint.sh`/`format.sh` cover `userland/pe`,
+  and `boot/limine.conf` + `make_iso.sh` stage both `.exe` modules.
+- Phase 7 stage 1 — bring-up corrections recorded: the fixture ends with
+  **4** sections (no `.pdata`; the probe's 5-section form was larger), and
+  the parser's per-image relocation cap is 256 (not 1024) so the plan fits
+  the 16 KiB kernel thread stacks; `docs/PE_LOADER.md` and R-013 state both.
 
 ## Exact commands and results
 
@@ -325,11 +366,15 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
 |---|---|
 | `cargo build -p project_os_kernel --target x86_64-unknown-none --release` | PASS |
 | `cargo test -p os_core` | PASS: 179 passed, 0 failed (includes 14 heap, 9 path, 14 checkpoint-format, 19 ELF-parser, 5 font, 14 text-grid, 13 renderer, and 51 new stage-5 PCI/BAR + Ethernet/ARP/IPv4/ICMP/UDP codec tests) |
+| `cargo test -p os_core` (Phase 7 stage 1) | PASS: 235 passed, 0 failed (adds 56 PE32+ parser tests: every `PeError` row, relocation walk, accessor coverage) |
 | `cargo clippy` (os_core, membench, kernel, userland) with `-D warnings` | PASS |
+| `cargo clippy` (+ `userland/pe`, release, `--target x86_64-pc-windows-msvc`) with `-D warnings` (Phase 7 stage 1) | PASS |
 | `cargo fmt --all -- --check` (kernel workspace and userland) | PASS |
+| `cargo fmt --all -- --check` (+ `userland/pe`) (Phase 7 stage 1) | PASS |
 | `scripts/build_user.sh` | PASS: hello/fault built and header-checked; bad.elf rejected with `bad magic` |
+| `scripts/build_user_pe.sh` (Phase 7 stage 1) | PASS: `pehello.exe` 3072 bytes, entry `0x1000`, image base `0x140000000`, 4 sections, 1 DIR64 relocation; `pebad.exe` rejected by `check_user_pe.py` with `bad signature` |
 | `scripts/fetch_limine.sh` | PASS: checksum verified, assets installed |
-| `scripts/make_iso.sh` | PASS: ISO built, BIOS+UEFI catalog entries verified |
+| `scripts/make_iso.sh` | PASS: ISO built (kernel + three ELF modules + two PE modules), BIOS+UEFI catalog entries verified |
 | `scripts/test_boot_qemu.sh` (BIOS, 256 MiB / 512 MiB / 1 GiB) | PASS: marker reached, QEMU exit 33 at each size |
 | `scripts/test_memory.sh` | PASS: host allocator tests + in-VM self-test |
 | `scripts/test_vfs.sh` | PASS: host path tests + in-VM VFS self-test |
@@ -340,6 +385,8 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
 | `scripts/test_net_qemu.sh` | PASS (reproduced twice): `net: e1000 at 00:02.0`, MAC `52:54:00:12:34:56`, `net: ip 10.0.2.15/24 gw 10.0.2.2`, `net: loopback selftest: unsupported`, `net selftest: passed (arp resolved, icmp echo reply in 0 ms)`, `,net` marker; `net` → `tx 3 frames, rx 2 frames, arp 1/8 entries, errors 0`; `ping 10.0.2.2 -c 3` → 3/3 replies, `0% loss`; host→guest 19-byte UDP echo byte-identical (`udpecho: echoed 19 bytes to 10.0.2.2:57841`) |
 | `scripts/test_graphics_host.sh` | PASS: framebuffer tests |
 | `scripts/test_all.sh` (Phase 6 stage 5, final) | PASS: 20 PASS, 0 FAIL, 4 SKIP (UEFI/pci/driver-model/gpu-vm; skipped is not passed); unit suite 179 passed |
+| `scripts/test_pe_qemu.sh` (Phase 7 stage 1) | PASS: `pe: 2 modules present`; `pe: pehello.exe loaded at 0x400000 (entry 0x401000, 4 sections, 1 relocation applied)`; `pe: hello from a PE32+ image via int 0x80`; `pe: base relocation verified`; `user: /boot/pebad.exe rejected (bad signature)`; `pe selftest: passed (...)`; marker `checks=...,sched,user,elf,pe,vfs`; exit 33 |
+| `scripts/test_all.sh` (Phase 7 stage 1, final) | PASS: 22 PASS, 0 FAIL, 4 SKIP (skipped is not passed); unit suite 235 passed; ELF, persistence, net and VirtualBox steps stayed green in the same run |
 | QEMU BIOS boot matrix, 256 MiB / 512 MiB / 1 GiB | PASS at each size: marker `checks=...,sched,user,elf,vfs`, exit 33; q35's default e1000e is deliberately unclaimed, so these boots log `net: inactive (no supported e1000 NIC)` and `net selftest: skipped (no NIC)` |
 | VirtualBox BIOS (`scripts/test_virtualbox.sh`) | PASS with ELF-module ring-3 checks, `fbcon: enabled 85x48 cells at scale 2` / `3133440 bytes match after 1088 redraws`, and the 82540EM NIC observed: `net: e1000 at 00:03.0`, MAC `08:00:27:c4:5d:0a`, loopback `unsupported`, `net selftest: no gateway reply (arp timeout)` — non-fatal, marker without `,net` (`vbox-serial.log`); isolated VM created and deleted |
 | `scripts/test_boot_qemu.sh --firmware uefi` | SKIP: no `OVMF_FD` / OVMF firmware |
@@ -391,6 +438,26 @@ PROJECT_OS_BOOT_SUCCESS:0.1.0-0cc93723 checks=handoff,memmap,gdt,idt,exceptions,
 The stage-2 log above keeps its historical `...,user,vfs` marker; the
 stage-3 boot inserts `elf` between `user` and `vfs` and the corruption probe
 rejects `bad.elf` before any frame is allocated.
+
+Recorded QEMU boot log (Phase 7 stage 1, 512 MiB, `artifacts/qemu-serial-pe.log`,
+ring-3 section):
+
+```text
+elf: 3 modules present
+pe: 2 modules present
+user: /boot/bad.elf rejected (bad magic)
+user: /boot/pebad.exe rejected (bad signature)
+pe: pehello.exe loaded at 0x400000 (entry 0x401000, 4 sections, 1 relocation applied)
+pe: hello from a PE32+ image via int 0x80
+pe: base relocation verified
+user selftest: passed (ELF64 modules loaded, int 0x80 write/exit from CPL3, user fault isolated, corrupt module rejected)
+pe selftest: passed (PE32+ module loaded, base relocation applied, int 0x80 write from CPL3, corrupt module rejected)
+PROJECT_OS_BOOT_SUCCESS:0.1.0-25606ad5 checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,vfs
+```
+
+The fixture has 4 sections (no `.pdata`); the loader's DIR64 delta is
+`0x400000 - 0x140000000` and the relocation target check lives in the
+fixture itself (`pe: base relocation verified` only prints on a match).
 
 Interactive session (`artifacts/qemu-shell-session.log`, 512 MiB):
 
@@ -517,13 +584,14 @@ build from HEAD would carry a new ID.)
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 1,350,832 bytes (Phase 6 stage 5) |
-| Kernel SHA-256 | `8ae5f608209303f4700c7bf8942a294a358aa0e9aabf512d26479a6edb4f00c8` |
+| Kernel ELF | `artifacts/kernel.elf`, 1,341,664 bytes (Phase 7 stage 1) |
+| Kernel SHA-256 | `874e0fb1cda57e9d5102bfb7e57da7d7452c981f4bcd3827514b4f6e8bfb73b2` |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
+| PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d` (both hash-stable from a clean rebuild) |
 | ISO | `artifacts/project-os.iso` |
 | ISO size | 7,358,464 bytes |
-| ISO SHA-256 | `e8a21258551197f2e818fd0cad6849e9123fa90216c51ef7fdffc2dbc3eef044` |
+| ISO SHA-256 | `57fa6150f9d9cce4113940dffe8a89f734de39d1c1cdce0453355e62783eab09` |
 | Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline; rebuilt by each session harness) |
 | Interactive ISO SHA-256 | `9ddb437e3a21f640663b96ee9572dd548d7074699201d4ab7cd8a228e42d20bf` (rebuilt during the final `net` harness run) |
 | Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `002f45ab44049304dbf7f8605b58a597791caba5c6837ec7e4311c4ea73c0c40`; checker PASS (rebuilt in the stage-5 suite run; the boot log now includes the `net:` lines) |
@@ -531,17 +599,19 @@ build from HEAD would carry a new ID.)
 | Net session log | `artifacts/qemu-net-session.log`, 4,494 bytes, SHA-256 `940b29fbdd4477e325164e2df7615ef690947de1ca4dff7e6a5cda624ed3eb44`; `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
 | Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the 4-boot test: fresh format, slot A seq 0), SHA-256 `cb97111ff33d7e456e5ea82d9352ed3281e93c882fb02a02bd1947fc8f4857de` |
 | ISO boot entries | BIOS platform 0x00 (4 sectors), UEFI platform 0xEF (6144 sectors), both no-emulation, verified by `scripts/verify_iso.py` |
-| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-net-session.log` (e1000 network session) |
+| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+ module boot), `artifacts/qemu-net-session.log` (e1000 network session) |
 | VirtualBox result | `artifacts/vbox-test.log`: VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed; with the 82540EM NAT NIC the kernel detected the NIC and reported `net: loopback selftest: unsupported` + `net selftest: no gateway reply (arp timeout)` — non-fatal, no VirtualBox networking claim |
 
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
-The kernel build is deterministic for identical sources, flags and build ID.
-The checksums above are from the final Phase 6 stage 5 `scripts/test_all.sh`
-run (20 PASS / 0 FAIL / 4 SKIP, unit suite 179 passed). The ISO includes
+The kernel and fixture builds are deterministic for identical sources, flags
+and build ID. The checksums above are from the final Phase 7 stage 1
+`scripts/test_all.sh` run (22 PASS / 0 FAIL / 4 SKIP, unit suite 235 passed).
+The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
-the kernel (including linked Rust runtime code) and Limine binaries.
+the kernel (including linked Rust runtime code), the PE fixtures (linked
+`core`/`compiler_builtins` for `x86_64-pc-windows-msvc`) and Limine binaries.
 
 ## Benchmarks
 
@@ -562,9 +632,13 @@ This is a host model, not a kernel or Linux comparison.
   deviation (ADR-0017), the framebuffer log console
   (`docs/FRAMEBUFFER_CONSOLE.md`, research R-011; no ADR — the spec is the
   contract), and the e1000 network stack (`docs/NETWORK.md`, ADR-0018,
-  research R-012 including the corrected QEMU loopback finding). ADR-0006's
-  framing still holds: serial is authoritative for
-  tests, the framebuffer is a display mirror, not a gate.
+  research R-012 including the corrected QEMU loopback finding). The PE32+
+  loader stage is governed by `docs/PE_LOADER.md` (the contract), ADR-0019
+  (real-linker PE fixtures via rust-lld, fixed load base with always-on
+  relocation, reject-by-directory policy, two-phase loader) and research
+  R-013 (MS PE format spec + toolchain probe, now recorded as PASSED with the
+  observed boot log). ADR-0006's framing still holds: serial is authoritative
+  for tests, the framebuffer is a display mirror, not a gate.
 - [docs/RESEARCH.md](docs/RESEARCH.md): primary sources, findings, confidence and
   open questions.
 - [docs/MEMORY_MANAGEMENT.md](docs/MEMORY_MANAGEMENT.md): invariants, tests,
@@ -581,10 +655,22 @@ This is a host model, not a kernel or Linux comparison.
   VirtualBox EFI boot is still untested.
 - UEFI boot has not been run (no OVMF firmware). The UEFI El Torito entry is
   verified; a catalog entry is not a boot test.
-- No PCI driver model, Windows PE/API compatibility or GPU acceleration.
+- No PCI driver model, no general Win32/API compatibility and no GPU
+  acceleration. The PE32+ loader is stage 1 of Phase 7 only: it runs
+  filesystem-less, import-free fixtures; see the stage-1 limits bullet below.
   Networking exists as stage 5 (one polled e1000 with static addressing);
   there is no general on-disk filesystem: persistence is the
   whole-tree checkpoint image (stage 2) described above.
+- Phase 7 stage-1 limits (spec: `docs/PE_LOADER.md` §1/§9, ADR-0019): PE32+
+  (AMD64) only — no PE32, no imports/IAT, no DLLs/exports, no delay imports,
+  TLS, CLR, resources, SEH/unwind (`.pdata` ignored) or dynamic code; images
+  are Limine modules (no filesystem-backed exec); fixed 1 MiB code window at
+  `0x400000` with the one-page stack at `0x500000`; max 16 sections / 256
+  DIR64 relocations per load, W^X per section, relocation targets must not
+  cross a page; a nonzero load delta requires a present, non-stripped
+  relocation table and relocations are always applied against the fixed base
+  (no ASLR). The loader is not Windows API compatibility, and the claim
+  boundaries in §9 stay in force.
 - Phase 6 stage-5 limits (spec/ADR: `docs/NETWORK.md` §10, ADR-0018): one
   polled e1000 on bus 0 with static `10.0.2.15/24`; no DHCP/DNS/TCP/sockets,
   no interrupt/MSI receive or background RX (packets are processed only while
@@ -639,9 +725,11 @@ This is a host model, not a kernel or Linux comparison.
   after the first scanline. The final comparison is per scanline, and the
   self-test's diagnostic fields (row, offset, expected, actual) made the
   failures analyzable.
-- User-mode limits (Phase 6 stage 3): programs are our own ELF64 `ET_EXEC`
-  modules loaded from Limine — no PE loader, no PIE/dynamic linking,
-  relocations, PT_INTERP or ASLR, no filesystem-backed exec, and the code
+- User-mode limits (Phase 6 stage 3, extended by Phase 7 stage 1): programs
+  are our own ELF64 `ET_EXEC` modules or PE32+ images loaded from Limine —
+  the PE path has no imports/DLL/API surface (see the stage-1 limits above),
+  and neither path has PIE/dynamic linking, PT_INTERP or ASLR, and there is
+  no filesystem-backed exec; the code
   window is fixed at 0x400000..0x500000 with a one-page stack at 0x500000.
   One user program runs at a time (the TSS `rsp0` is programmed for the sole
   user thread, so concurrent user threads are not supported); there is no
@@ -686,12 +774,12 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 6 is complete: all five stages are implemented, verified and committed
-— `b257a1e` (stage 5) pushed to `orgin/main`, with this progress edit as its
-follow-up commit. The user selects the next phase; candidate work, none of it
-started: APIC timer/IOAPIC/SMP and the remaining Phase 2–4 scope gaps
-(recoverable exceptions, user address-space hardening, heap growth), Phase 7
-(PE loader and minimal native Windows console compatibility), and Phase 9
-(minimal PCI/driver framework — which also unblocks AHCI — plus a virtual GPU
-target). The persistence path beyond stage 2 (AHCI, a general on-disk
-filesystem) remains available.
+Phase 7 stage 1 is complete: the PE32+ loader, fixture pipeline, harnesses and
+documentation are implemented and verified (22 PASS / 0 FAIL / 4 SKIP; PE boot
+log in `artifacts/qemu-serial-pe.log`); commit and push `orgin/main`, then the
+user selects the next stage. Candidate work, none of it started: Phase 7
+stage 2 (a minimal native Win32/NT console surface for the PE fixture —
+imports/IAT resolution would become unavoidable), the remaining Phase 2–4
+scope gaps (APIC timer/IOAPIC/SMP, recoverable exceptions, user
+address-space hardening, heap growth), and Phase 9 (minimal PCI/driver
+framework — which also unblocks AHCI — plus a virtual GPU target).

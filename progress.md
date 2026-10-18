@@ -28,9 +28,16 @@ a kernel loader (`kernel/src/pe_loader.rs`) that maps W^X sections and applies
 DIR64 base relocations under the fixed `0x400000` window, and a genuine PE32+
 fixture produced by `rustc` + `rust-lld` (no MSVC/MinGW/Windows SDK) executing
 at CPL3 via `int 0x80`; a corrupt PE module is rejected without harming boot.
-The remaining Phase 7 scope (a minimal native Win32/NT console surface,
-imports, DLLs, SEH, TLS) is not started; there is still no Windows API
-compatibility.
+**Phase 7 stage 2** — a native Win32 console surface — is implemented and
+verified: a `raw-dylib` import directory in a new fixture (`peconsole.exe`) is
+parsed by `os_core::pe`, resolved against an exact-name allowlist of three
+`kernel32.dll`-shaped services (`GetStdHandle`, `WriteConsoleA`, `ExitProcess`)
+through a kernel stub page and `int 0x80` dispatch, with the IAT patched via
+the HHDM before protection; two negative mutants (`pebadimp.exe`,
+`pebadfn.exe`) are rejected before any allocation. The remaining Phase 7 scope
+(broader API surface, imports from real system DLLs, ordinals, forwarders,
+delay imports, SEH/unwind, TLS, CLR, PE32) is not started; there is still no
+Windows application compatibility.
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
@@ -47,9 +54,13 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   round-trip test`, `25606ad progress: record phase6 stage 5 commit and push`).
   `b257a1e..25606ad` is pushed to `orgin/main` (github.com/Alex07lol/WinUx).
   The Phase 7 stage-1 commit is `b37b371` (`phase7: pe32+ loader, dir64 base
-  relocations, rust-lld fixture at cpl3`), pushed (`25606ad..b37b371`); this
-  progress edit is its follow-up commit, same pattern as `f3b17a3`,
-  `5467bde` and `25606ad`. Nothing was reset or discarded.
+  relocations, rust-lld fixture at cpl3`), pushed (`25606ad..b37b371`) together
+  with its progress follow-up `b8a2910` (`progress: record phase7 stage 1
+  commit and push`). The Phase 7 stage-2 commit is `b19670f` (`phase7: native
+  win32 console surface (raw-dylib imports, stub page, three kernel32
+  services)`), pushed (`b8a2910..b19670f`); this progress edit is its
+  follow-up commit, same pattern as `f3b17a3`, `5467bde` and `25606ad`.
+  Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
 - Case-insensitive host: `agents.md`, `STOP.md` and `PROGRESS.md` resolve to
@@ -359,6 +370,62 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   **4** sections (no `.pdata`; the probe's 5-section form was larger), and
   the parser's per-image relocation cap is 256 (not 1024) so the plan fits
   the 16 KiB kernel thread stacks; `docs/PE_LOADER.md` and R-013 state both.
+- Phase 7 stage 2 — host-tested import parsing (`os_core/src/pe.rs`): the
+  import directory (index 1) is now parsed — descriptor scan with caps
+  (`MAX_IMPORT_DLLS=2`, `MAX_IMPORTS=16`, name caps 16/32), ILT with IAT
+  fallback, hint/name entries, case-insensitive `kernel32.dll` match,
+  ordinal/TLS-callable/JMP-thunk imports rejected with stable labels, and
+  `iat_rva = first_thunk + index*8` recorded per slot; 17 new host tests
+  (252 total). Contract: spec `docs/WIN32_CONSOLE.md`, decision ADR-0020,
+  research R-014.
+- Phase 7 stage 2 — kernel resolver (`kernel/src/pe_loader.rs`):
+  `WIN32_DLL`/`WIN32_SERVICES` allowlist (`GetStdHandle`, `WriteConsoleA`,
+  `ExitProcess`), new `Reject::{UnknownImportDll, UnknownImportFunction,
+  ImportTarget}` checks in `inspect`, and `map` now plans a one-page stub
+  page at `WIN32_STUB_VA = 0x510000` (deduplicated `B8 <service> CD 80 C3`
+  entries, stride 16) and patches each IAT slot through the HHDM before the
+  section protection call (the Windows fixup-before-protection order);
+  `map` returns `Loaded { image, stub_page, applied_relocations }`.
+- Phase 7 stage 2 — kernel services (`kernel/src/syscall.rs`): services 3–5
+  implement `GetStdHandle` (STD_OUTPUT_HANDLE → handle 1, pinned log),
+  `WriteConsoleA` (validated user pointer + length against `MAX_WRITE`,
+  writes to the serial console fd, pinned log) and `ExitProcess`
+  (`sched::exit()` after a pinned log), with counters
+  `WIN32_GET_STD_HANDLE_CALLS`/`WIN32_WRITE_CONSOLE_CALLS`/
+  `WIN32_EXIT_PROCESS_CALLS`. `kernel/src/user.rs` gained the win32 demo
+  phase (skip when fixtures absent), the `user-win32` thread, stub-page
+  teardown, and a `win32` flag in `DemoReport`; `main.rs` gates the
+  `,win32` marker and prints the verdict.
+- Phase 7 stage 2 — fixtures (`userland/pe/peconsole`, workspace member
+  added): `#![no_std]`, `#[link(name = "kernel32", kind = "raw-dylib")]`
+  extern block, `global_asm!` marker slot checked against a rip-relative
+  reference (M3 on mismatch), M1/M2 console writes, `ExitProcess(0)`;
+  stage-2 exit codes 1/2/3/5/0 and panic `0xBEEF` are pinned in
+  `docs/WIN32_CONSOLE.md` §4.
+- Phase 7 stage 2 — pipeline and harness: `scripts/check_user_pe.py` gained
+  `--imports <dll:fn,...>` / `--imports -` (descriptor termination, exact
+  DLL name, ordinal-free ILT, name-set equality, IAT slots patchable and
+  in-image); `scripts/build_user_pe.sh` builds/copies five artifacts and
+  generates `pebadimp.exe` (`kernel32.dll` → `user32.dll`, unique-pattern
+  patch) and `pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB`), failing
+  loudly if a pattern is not unique; `boot/limine.conf` and
+  `scripts/make_iso.sh` stage five `.exe` modules; `scripts/test_pe_qemu.sh`
+  asserts the full stage-2 set (`pe: 5 modules present`, both load lines,
+  seven `win32:` lines, both rejection lines, `win32 selftest: passed`);
+  `scripts/test_elf_qemu.sh` marker is now `sched,user,elf,pe,win32,vfs`.
+- Phase 7 stage 2 — two bring-up defects found by the end-to-end harness and
+  fixed before the PASS: (1) `pe_loader::map` iterated the full
+  `image.imports` array (16 slots, including the `EMPTY` tail) instead of
+  `image.imports[..image.import_count]` in both the stub-planning and
+  IAT-patching loops, so valid modules were rejected with
+  `unknown import function`; (2) `AddressSpace::translate`
+  (`kernel/src/vm.rs`) returned the frame base without the in-page offset,
+  so unaligned IAT writes (slots at `0x2108`/`0x2110`) landed on the wrong
+  offset inside the page and the fixture faulted at `rip=0x212e`
+  (`cr2=0x212e`, the raw hint/name RVA). The fix (`entry_address(leaf) +
+  (virtual & 0xfff)`) also corrects any other unaligned write through
+  `translate` — stage-1 relocation targets were page-aligned, so the bug
+  was latent there. Both are recorded in R-014; no test was loosened.
 
 ## Exact commands and results
 
@@ -387,6 +454,11 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
 | `scripts/test_all.sh` (Phase 6 stage 5, final) | PASS: 20 PASS, 0 FAIL, 4 SKIP (UEFI/pci/driver-model/gpu-vm; skipped is not passed); unit suite 179 passed |
 | `scripts/test_pe_qemu.sh` (Phase 7 stage 1) | PASS: `pe: 2 modules present`; `pe: pehello.exe loaded at 0x400000 (entry 0x401000, 4 sections, 1 relocation applied)`; `pe: hello from a PE32+ image via int 0x80`; `pe: base relocation verified`; `user: /boot/pebad.exe rejected (bad signature)`; `pe selftest: passed (...)`; marker `checks=...,sched,user,elf,pe,vfs`; exit 33 |
 | `scripts/test_all.sh` (Phase 7 stage 1, final) | PASS: 22 PASS, 0 FAIL, 4 SKIP (skipped is not passed); unit suite 235 passed; ELF, persistence, net and VirtualBox steps stayed green in the same run |
+| `cargo test -p os_core` (Phase 7 stage 2) | PASS: 252 passed, 0 failed (adds 17 import-directory tests: descriptor/caps, ILT↔IAT fallback, names, ordinal rejection, empty imports) |
+| `scripts/build_user_pe.sh` (Phase 7 stage 2) | PASS: five artifacts — `pehello.exe` unchanged (SHA-256 `96e2e6d6…`, hash-stable from clean rebuilds); `peconsole.exe` 3584 bytes, entry `0x1000`, 5 sections, 1 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`; `pebad.exe` unchanged (SHA-256 `a0f8a2b4…`); `pebadimp.exe` + `pebadfn.exe` generated from unique byte patterns and structurally valid |
+| `scripts/make_iso.sh` (Phase 7 stage 2) | PASS: ISO built (kernel + three ELF modules + **five** PE modules), BIOS+UEFI catalog entries verified |
+| `scripts/test_pe_qemu.sh` (Phase 7 stage 2) | PASS: `pe: 5 modules present`; `pe: peconsole.exe loaded at 0x400000 (entry 0x401000, 5 sections, 1 relocation applied)`; the seven `win32:` lines (`GetStdHandle(-11) -> 1`, M1, `WriteConsoleA(1, 44 bytes) -> 1`, M2, `WriteConsoleA(1, 32 bytes) -> 1`, `ExitProcess(0)`); `user: /boot/pebadimp.exe rejected (unknown import dll)`; `user: /boot/pebadfn.exe rejected (unknown import function)`; `win32 selftest: passed (...)`; marker `checks=...,sched,user,elf,pe,win32,vfs`; exit 33 |
+| `scripts/test_all.sh` (Phase 7 stage 2, final) | PASS: 22 PASS, 0 FAIL, 4 SKIP (skipped is not passed); unit suite 252 passed; the `pe` step ran the stage-2 assertions with `,win32`, the `elf` step used the new marker, and the persistence/net/VirtualBox steps stayed green in the same run |
 | QEMU BIOS boot matrix, 256 MiB / 512 MiB / 1 GiB | PASS at each size: marker `checks=...,sched,user,elf,vfs`, exit 33; q35's default e1000e is deliberately unclaimed, so these boots log `net: inactive (no supported e1000 NIC)` and `net selftest: skipped (no NIC)` |
 | VirtualBox BIOS (`scripts/test_virtualbox.sh`) | PASS with ELF-module ring-3 checks, `fbcon: enabled 85x48 cells at scale 2` / `3133440 bytes match after 1088 redraws`, and the 82540EM NIC observed: `net: e1000 at 00:03.0`, MAC `08:00:27:c4:5d:0a`, loopback `unsupported`, `net selftest: no gateway reply (arp timeout)` — non-fatal, marker without `,net` (`vbox-serial.log`); isolated VM created and deleted |
 | `scripts/test_boot_qemu.sh --firmware uefi` | SKIP: no `OVMF_FD` / OVMF firmware |
@@ -458,6 +530,42 @@ PROJECT_OS_BOOT_SUCCESS:0.1.0-25606ad5 checks=handoff,memmap,gdt,idt,exceptions,
 The fixture has 4 sections (no `.pdata`); the loader's DIR64 delta is
 `0x400000 - 0x140000000` and the relocation target check lives in the
 fixture itself (`pe: base relocation verified` only prints on a match).
+
+Recorded QEMU boot log (Phase 7 stage 2, 512 MiB, `artifacts/qemu-serial-pe.log`,
+ring-3 section):
+
+```text
+elf: 3 modules present
+pe: 5 modules present
+user: /boot/bad.elf rejected (bad magic)
+user: hello from ring 3 via int 0x80
+syscall: thread exits with code 0
+user fault isolated: vector=14 error=0x6 rip=0x40000a cr2=0x500000000 (thread killed, kernel continues)
+user: /boot/pebad.exe rejected (bad signature)
+pe: pehello.exe loaded at 0x400000 (entry 0x401000, 4 sections, 1 relocation applied)
+pe: hello from a PE32+ image via int 0x80
+pe: base relocation verified
+syscall: thread exits with code 0
+user: /boot/pebadimp.exe rejected (unknown import dll)
+user: /boot/pebadfn.exe rejected (unknown import function)
+pe: peconsole.exe loaded at 0x400000 (entry 0x401000, 5 sections, 1 relocation applied)
+win32: GetStdHandle(-11) -> 1
+win32: hello from the Win32 console surface
+win32: WriteConsoleA(1, 44 bytes) -> 1
+win32: console surface verified
+win32: WriteConsoleA(1, 32 bytes) -> 1
+win32: ExitProcess(0)
+user: ring-3 program exited (code 0), 5 write(s), 184 bytes, 1 isolated fault(s), 0 rejected syscall(s)
+user selftest: passed (ELF64 modules loaded, int 0x80 write/exit from CPL3, user fault isolated, corrupt module rejected)
+pe selftest: passed (PE32+ module loaded, base relocation applied, int 0x80 write from CPL3, corrupt module rejected)
+win32 selftest: passed (kernel32.dll imports resolved, WriteConsoleA wrote to the console fd, ExitProcess ended the thread)
+PROJECT_OS_BOOT_SUCCESS:0.1.0-b8a2910d checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs
+```
+
+`peconsole.exe` has 5 sections (the `raw-dylib` import directory adds
+`.idata`) and one forced DIR64 marker relocation; both mutants are rejected
+by `inspect` before any frame is allocated, and the Win32 fixture's M1/M2
+texts are asserted verbatim by `scripts/test_pe_qemu.sh`.
 
 Interactive session (`artifacts/qemu-shell-session.log`, 512 MiB):
 
@@ -584,29 +692,29 @@ build from HEAD would carry a new ID.)
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 1,341,664 bytes (Phase 7 stage 1) |
-| Kernel SHA-256 | `874e0fb1cda57e9d5102bfb7e57da7d7452c981f4bcd3827514b4f6e8bfb73b2` |
+| Kernel ELF | `artifacts/kernel.elf`, 1,269,912 bytes (Phase 7 stage 2) |
+| Kernel SHA-256 | `ffa56e2420a73e46aeabf76f1a5917655bf8e1999fec097e20721ab59c963bcc` |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
-| PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d` (both hash-stable from a clean rebuild) |
+| PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1` (pehello/pebad hash-stable from clean rebuilds; the three stage-2 add-ons rebuild deterministically from their patches) |
 | ISO | `artifacts/project-os.iso` |
-| ISO size | 7,358,464 bytes |
-| ISO SHA-256 | `57fa6150f9d9cce4113940dffe8a89f734de39d1c1cdce0453355e62783eab09` |
+| ISO size | 7,299,072 bytes |
+| ISO SHA-256 | `ab1e46c3710d4d77629e91feb86201213978e20566dbdb3aa59eedee06d38f5e` |
 | Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline; rebuilt by each session harness) |
-| Interactive ISO SHA-256 | `9ddb437e3a21f640663b96ee9572dd548d7074699201d4ab7cd8a228e42d20bf` (rebuilt during the final `net` harness run) |
+| Interactive ISO SHA-256 | `538e63479a3d1c8b6a5335dabb114ca565caa99fec05e7d2b097bfe84f7b3a3a` (rebuilt during the final stage-2 `test_all.sh` run) |
 | Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `002f45ab44049304dbf7f8605b58a597791caba5c6837ec7e4311c4ea73c0c40`; checker PASS (rebuilt in the stage-5 suite run; the boot log now includes the `net:` lines) |
 | Framebuffer session log | `artifacts/qemu-console-session.log`, SHA-256 `501334a8fde73879a109602782a68a7591c8c571c2ca3e09f119ff8ad6c296e3` |
 | Net session log | `artifacts/qemu-net-session.log`, 4,494 bytes, SHA-256 `940b29fbdd4477e325164e2df7615ef690947de1ca4dff7e6a5cda624ed3eb44`; `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
 | Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the 4-boot test: fresh format, slot A seq 0), SHA-256 `cb97111ff33d7e456e5ea82d9352ed3281e93c882fb02a02bd1947fc8f4857de` |
 | ISO boot entries | BIOS platform 0x00 (4 sectors), UEFI platform 0xEF (6144 sectors), both no-emulation, verified by `scripts/verify_iso.py` |
-| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+ module boot), `artifacts/qemu-net-session.log` (e1000 network session) |
+| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot; stage-2 log 6738 bytes, SHA-256 `4259ec213189c53310b57e23f16d65998839185efa19c8f268f3496c5a98515a`), `artifacts/qemu-net-session.log` (e1000 network session) |
 | VirtualBox result | `artifacts/vbox-test.log`: VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed; with the 82540EM NAT NIC the kernel detected the NIC and reported `net: loopback selftest: unsupported` + `net selftest: no gateway reply (arp timeout)` — non-fatal, no VirtualBox networking claim |
 
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
 The kernel and fixture builds are deterministic for identical sources, flags
-and build ID. The checksums above are from the final Phase 7 stage 1
-`scripts/test_all.sh` run (22 PASS / 0 FAIL / 4 SKIP, unit suite 235 passed).
+and build ID. The checksums above are from the final Phase 7 stage 2
+`scripts/test_all.sh` run (22 PASS / 0 FAIL / 4 SKIP, unit suite 252 passed).
 The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
@@ -637,7 +745,13 @@ This is a host model, not a kernel or Linux comparison.
   (real-linker PE fixtures via rust-lld, fixed load base with always-on
   relocation, reject-by-directory policy, two-phase loader) and research
   R-013 (MS PE format spec + toolchain probe, now recorded as PASSED with the
-  observed boot log). ADR-0006's framing still holds: serial is authoritative
+  observed boot log). The stage-2 import-mediated Win32 console surface is
+  governed by `docs/WIN32_CONSOLE.md` (the contract), ADR-0020 (`raw-dylib`
+  imports without an import library, user-space stub page + `int 0x80`
+  dispatch, HHDM IAT patch before protection, exact-name allowlist of three
+  `kernel32.dll` functions, `,win32` marker) and research R-014 (MS PE import
+  format + probe; PASSED with the observed stage-2 log and the two bring-up
+  defects recorded). ADR-0006's framing still holds: serial is authoritative
   for tests, the framebuffer is a display mirror, not a gate.
 - [docs/RESEARCH.md](docs/RESEARCH.md): primary sources, findings, confidence and
   open questions.
@@ -656,21 +770,32 @@ This is a host model, not a kernel or Linux comparison.
 - UEFI boot has not been run (no OVMF firmware). The UEFI El Torito entry is
   verified; a catalog entry is not a boot test.
 - No PCI driver model, no general Win32/API compatibility and no GPU
-  acceleration. The PE32+ loader is stage 1 of Phase 7 only: it runs
-  filesystem-less, import-free fixtures; see the stage-1 limits bullet below.
+  acceleration. The PE32+ path is Phase 7 stages 1–2 only: it runs
+  filesystem-less fixtures and resolves imports against a three-name
+  `kernel32.dll` allowlist; see the stage-1/stage-2 limits bullets below.
   Networking exists as stage 5 (one polled e1000 with static addressing);
   there is no general on-disk filesystem: persistence is the
   whole-tree checkpoint image (stage 2) described above.
 - Phase 7 stage-1 limits (spec: `docs/PE_LOADER.md` §1/§9, ADR-0019): PE32+
-  (AMD64) only — no PE32, no imports/IAT, no DLLs/exports, no delay imports,
-  TLS, CLR, resources, SEH/unwind (`.pdata` ignored) or dynamic code; images
-  are Limine modules (no filesystem-backed exec); fixed 1 MiB code window at
-  `0x400000` with the one-page stack at `0x500000`; max 16 sections / 256
-  DIR64 relocations per load, W^X per section, relocation targets must not
-  cross a page; a nonzero load delta requires a present, non-stripped
-  relocation table and relocations are always applied against the fixed base
-  (no ASLR). The loader is not Windows API compatibility, and the claim
-  boundaries in §9 stay in force.
+  (AMD64) only — no PE32, no DLLs/exports, no delay imports, TLS, CLR,
+  resources, SEH/unwind (`.pdata` ignored) or dynamic code; images are Limine
+  modules (no filesystem-backed exec); fixed 1 MiB code window at `0x400000`
+  with the one-page stack at `0x500000`; max 16 sections / 256 DIR64
+  relocations per load, W^X per section, relocation targets must not cross a
+  page; a nonzero load delta requires a present, non-stripped relocation table
+  and relocations are always applied against the fixed base (no ASLR).
+  Imports existed only in stage 2 and only as below. The loader is not
+  Windows API compatibility, and the claim boundaries in §9 stay in force.
+- Phase 7 stage-2 limits (spec: `docs/WIN32_CONSOLE.md` §1/§9, ADR-0020):
+  exactly three allowlisted `kernel32.dll` names (`GetStdHandle`,
+  `WriteConsoleA`, `ExitProcess`), exact-name match with case-insensitive DLL
+  compare; no real DLL loading, exports, forwarders, ordinals, delay imports,
+  API sets or bound imports (rejected); one stub page at `0x510000` with one
+  `int 0x80` stub per service; one console handle (`1`), 4-argument services,
+  `MAX_WRITE` byte cap, one user thread at a time; no CRT startup, SEH, TLS or
+  Unicode/W variants; the mechanism proves our own import path, not Windows
+  compatibility. Stage-2 bring-up defects (import-count slice, unaligned
+  `translate` writes) were fixed before the PASS and are recorded in R-014.
 - Phase 6 stage-5 limits (spec/ADR: `docs/NETWORK.md` §10, ADR-0018): one
   polled e1000 on bus 0 with static `10.0.2.15/24`; no DHCP/DNS/TCP/sockets,
   no interrupt/MSI receive or background RX (packets are processed only while
@@ -725,11 +850,11 @@ This is a host model, not a kernel or Linux comparison.
   after the first scanline. The final comparison is per scanline, and the
   self-test's diagnostic fields (row, offset, expected, actual) made the
   failures analyzable.
-- User-mode limits (Phase 6 stage 3, extended by Phase 7 stage 1): programs
+- User-mode limits (Phase 6 stage 3, extended by Phase 7 stages 1–2): programs
   are our own ELF64 `ET_EXEC` modules or PE32+ images loaded from Limine —
-  the PE path has no imports/DLL/API surface (see the stage-1 limits above),
-  and neither path has PIE/dynamic linking, PT_INTERP or ASLR, and there is
-  no filesystem-backed exec; the code
+  the PE path resolves only the three stage-2 `kernel32.dll` names (see the
+  stage-2 limits above), and neither path has PIE/dynamic linking, PT_INTERP
+  or ASLR, and there is no filesystem-backed exec; the code
   window is fixed at 0x400000..0x500000 with a one-page stack at 0x500000.
   One user program runs at a time (the TSS `rsp0` is programmed for the sole
   user thread, so concurrent user threads are not supported); there is no
@@ -774,12 +899,13 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 7 stage 1 is complete: the PE32+ loader, fixture pipeline, harnesses and
-documentation are implemented and verified (22 PASS / 0 FAIL / 4 SKIP; PE boot
-log in `artifacts/qemu-serial-pe.log`); commit and push `orgin/main`, then the
-user selects the next stage. Candidate work, none of it started: Phase 7
-stage 2 (a minimal native Win32/NT console surface for the PE fixture —
-imports/IAT resolution would become unavoidable), the remaining Phase 2–4
+Phase 7 stage 2 is complete: the native Win32 console surface (import
+directory, allowlist resolution, stub page, three services), fixture pipeline
+and harnesses are implemented and verified (22 PASS / 0 FAIL / 4 SKIP; Win32
+boot log in `artifacts/qemu-serial-pe.log`); commit and push `orgin/main`,
+then the user selects the next stage. Candidate work, none of it started: a
+wider Win32/NT surface (more console/file/process functions beyond the three
+named ones, imports from more than one synthetic DLL), the remaining Phase 2–4
 scope gaps (APIC timer/IOAPIC/SMP, recoverable exceptions, user
 address-space hardening, heap growth), and Phase 9 (minimal PCI/driver
 framework — which also unblocks AHCI — plus a virtual GPU target).

@@ -26,13 +26,14 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
 ## Repository state
 
 - Workspace root: this thread's local checkout.
-- Git: branch `main`, four commits (`77bb56e phase1`, `0cc9372 heap,
+- Git: branch `main`, five commits (`77bb56e phase1`, `0cc9372 heap,
   kernel-owned page tables, threads, ring 3`, `43fdd7b phase6: serial console,
   vfs, shell, ata checkpoint persistence, ring-3 elf64 module loader`,
-  `f3b17a3 progress: record phase6 commit and push`). Stage-4 work was done on
-  top of those and is committed separately (the exact hash and push are
-  recorded in the follow-up progress commit, same pattern as `f3b17a3`).
-  Nothing was reset or discarded.
+  `f3b17a3 progress: record phase6 commit and push`, `fb2da14 phase6:
+  framebuffer log console with readback selftest and screendump test`). The
+  stage-4 commit was pushed to `orgin/main` (github.com/Alex07lol/WinUx,
+  `f3b17a3..fb2da14`); this progress edit is the follow-up commit, same
+  pattern as `f3b17a3`. Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
 - Case-insensitive host: `agents.md`, `STOP.md` and `PROGRESS.md` resolve to
@@ -565,10 +566,10 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 6 stages 1–4 are complete, verified and committed (stage-4 hash recorded
-in the follow-up commit). The remaining Phase 6 acceptance item is networking,
-which the roadmap already stages last; the user selects the scope for the next
-stage (a minimal ARP/IPv4/ICMP path over QEMU's e1000 is the likely first step,
-but nothing is started). The persistence path beyond stage 2 — AHCI (needs PCI,
+Phase 6 stages 1–4 are complete, verified, committed (`fb2da14`) and pushed to
+`orgin/main`. The remaining Phase 6 acceptance item is networking, which the
+roadmap already stages last; the user selects the scope for the next stage (a
+minimal ARP/IPv4/ICMP path over QEMU's e1000 is the likely first step, but
+nothing is started). The persistence path beyond stage 2 — AHCI (needs PCI,
 Phase 9), a general on-disk filesystem, or a VirtualBox disk smoke test —
 remains available afterwards.

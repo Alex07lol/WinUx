@@ -244,6 +244,95 @@ mapping the APIC page and writing LINT0 ExtINT: `timer: 5 ticks observed` and
 **Conclusion.** Implemented as ADR-0011. The fallback path (disable LAPIC) is
 kept only for hosts where mapping or LINT0 programming fails.
 
+## R-009 — Block-device path without PCI, and QEMU machine choice
+
+**Question.** Which block-device path is reachable before a PCI enumerator
+exists, and does QEMU's `q35` machine expose the legacy ATA PIO ports?
+
+**Sources.**
+- QEMU source (master, accessed 2026-10-17): `hw/ide/piix.c` registers the
+  legacy port pairs `{0x1f0, 0x3f6, 14}` and `{0x170, 0x376, 15}`;
+  `hw/ide/ahci.c` and `hw/ide/ich.c` register no legacy ports (AHCI MMIO BAR5
+  plus the ICH9 IDP index/data pair only); `hw/i386/pc_q35.c` attaches drives
+  to `ich9-ahci`. <https://github.com/qemu/qemu>
+- OSDev wiki, "ATA PIO Mode": register map, IDENTIFY/read/write/cache-flush
+  sequences, LBA28, status bits (used as the protocol cross-check):
+  <https://wiki.osdev.org/ATA_PIO_Mode>
+- QEMU invocation docs (`-machine`, `-drive`):
+  <https://www.qemu.org/docs/master/system/invocation.html>
+- CRC-32 convention: IEEE 802.3 reflected polynomial 0xEDB88320, implemented
+  from the polynomial in our own code; standard check value 0xCBF43926 for
+  `"123456789"`.
+
+**Claim.** On QEMU master, only the PIIX southbridge (i440fx `pc` machine)
+registers the legacy primary/secondary IDE port ranges. `q35` (ICH9-AHCI)
+requires an AHCI driver via PCI BAR discovery, which the kernel does not have.
+A polling ATA PIO driver on the fixed 0x1F0/0x3F6 ports is therefore the only
+block path reachable without PCI; the persistence harness runs `-machine pc`
+while all other tests keep `q35`.
+
+**Confidence.** Medium-high from source reading (QEMU master at access date);
+the exact machine behavior could still differ, so boot 1 of the persistence
+test asserts `blk: found ...` as the experiment.
+
+**Experiment.** PASSED (QEMU 11.1.0, 2026-10-17): `-machine pc` with an 8 MiB
+zeroed raw disk attached `if=ide,index=0,media=disk` and the BIOS ISO; serial
+log shows `blk: found QEMU HARDDISK, 16384 sectors` and the boot marker with
+isa-debug-exit status 33. The no-disk path (q35) logs
+`blk: no ATA device on primary channel` and the marker is unchanged. If the
+probe had failed, implementation would have stopped and the design been
+revisited (minimal PCI + AHCI, or virtio).
+
+**Conclusion.** Confirmed. Implemented in `kernel/src/blk.rs` (primary master,
+LBA28, polled PIO); the persistence harness pins `-machine pc` while all other
+tests keep `q35`; recorded as ADR-0016.
+
+## R-010 — Limine modules and the ELF64 executable format
+
+**Question.** What are the exact Limine module request/response semantics for a
+base-revision-6 kernel (pinned Limine 12.9.3), and which ELF64 facts does a
+minimal native executable loader need before it can load our own programs?
+
+**Sources.**
+- `limine-protocol` repository (trunk, accessed 2026-10-17): PROTOCOL.md
+  "Module" feature and `include/limine.h`. The protocol documents and header
+  live in the protocol repository, **not** in the Limine main repository tree.
+  <https://github.com/Limine-Bootloader/limine-protocol>
+- System V gABI (program header table, `PT_LOAD`, `p_offset/p_vaddr/p_filesz/
+  p_memsz/p_flags/p_align`) and the x86-64 psABI (ELFCLASS64, little-endian,
+  `EM_X86_64 = 62`, `ET_EXEC = 2`); our parser is written from these field
+  definitions, no code copied.
+
+**Claim.** Verified from the header and protocol text: the module request ID is
+`{LIMINE_COMMON_MAGIC, 0x3e7e279702be32af, 0xca1c4f3bd1280cee}` with response
+`{revision, module_count, limine_file **modules}`; **if no modules are
+available, no response is provided** (NULL check required); each `limine_file`
+is 112 bytes (`revision, address, size, path, string, media_type, unused,
+tftp_ipv4[4], tftp_port, partition_index, mbr_disk_id, gpt_disk_uuid,
+gpt_part_uuid, part_uuid`); `address` has the HHDM offset pre-applied, is at
+least 4 KiB aligned, and every covered 4 KiB chunk belongs exclusively to the
+module; `path` is NUL-terminated ASCII with a leading slash. The module request
+struct carries request-revision-1 fields (`internal_module_count`,
+`internal_modules`) that a revision-0 request leaves untouched.
+
+**Confidence.** High for the ABI facts (read directly from the pinned header
+and protocol document). Medium for "the kernel can simply slice
+`address..address+size` through the HHDM" until the boot experiment — which is
+exactly what the stage-3 boot lines assert.
+
+**Experiment.** PASSED (QEMU 11.1.0 + VirtualBox 7.2.20, 2026-10-18): the ISO
+carries three modules (`hello.elf`, `fault.elf`, `bad.elf`); serial shows
+`elf: 3 modules present`, the exact ring-3 greeting from the ELF, a clean
+rejection `user: /boot/bad.elf rejected (bad magic)`, one isolated user fault,
+exit code 0, and the marker gains `,elf`. Evidence: `scripts/test_elf_qemu.sh`,
+`artifacts/qemu-serial-elf.log`, full `scripts/test_all.sh` run.
+
+**Conclusion.** Confirmed and implemented: `kernel/src/limine.rs` (module
+request + `modules()`/`module_by_path()`), `os_core::elf` parser (19 host
+tests), `kernel/src/loader.rs` (two-phase inspect/map), `userland/` workspace;
+recorded as ADR-0017 with the config-merge and MAX_PATH deviations in
+`docs/ELF_LOADER.md` §12.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

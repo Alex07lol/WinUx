@@ -95,6 +95,16 @@ pub fn init(hhdm_offset: u64) -> Result<HeapStats, &'static str> {
     GLOBAL_ALLOCATOR.install(region)
 }
 
+/// Kernel heap statistics (no validation walk).
+pub fn stats() -> Result<HeapStats, os_core::heap::HeapError> {
+    GLOBAL_ALLOCATOR.stats()
+}
+
+/// Kernel heap statistics plus a full validating walk.
+pub fn validate() -> Result<HeapStats, os_core::heap::HeapError> {
+    GLOBAL_ALLOCATOR.validate()
+}
+
 /// Exercise the global allocator: alignment, contents, growth, large
 /// allocation, deallocation and a full validation walk.
 pub fn self_test() -> Result<HeapStats, &'static str> {

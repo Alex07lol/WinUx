@@ -58,6 +58,14 @@ pub fn init(regions: &[MemoryRegion]) -> Result<FrameStats, &'static str> {
     Ok(stats)
 }
 
+/// Current allocator statistics (for the shell and diagnostics).
+pub fn stats() -> Result<FrameStats, &'static str> {
+    let slot = ALLOCATOR.lock();
+    slot.as_ref()
+        .map(|allocator| allocator.stats())
+        .ok_or("frame allocator is not initialised")
+}
+
 /// Allocate one physical frame for kernel-owned metadata (for example a page
 /// table). Returns `Err` before initialisation or on exhaustion.
 pub fn alloc_frame() -> Result<PhysFrame, &'static str> {

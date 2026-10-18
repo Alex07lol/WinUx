@@ -14,4 +14,6 @@ log "clippy: membench (host)"
 cargo clippy -p membench -- -D warnings
 log "clippy: kernel ($KERNEL_TARGET)"
 cargo clippy -p "$KERNEL_BIN" --target "$KERNEL_TARGET" --release -- -D warnings
+log "clippy: userland ($KERNEL_TARGET)"
+(cd "$ROOT_DIR/userland" && cargo clippy -- -D warnings)
 log "PASS: lint"

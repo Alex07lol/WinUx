@@ -1,0 +1,8 @@
+[build]
+target = "x86_64-unknown-none"
+
+# Rustflags cannot live in this file: cargo joins target.*.rustflags arrays
+# from every ancestor config file, so the repository-root kernel flags
+# (-Tkernel/linker.ld etc.) would be concatenated with anything set here.
+# scripts/build_user.sh passes the userland flags via the RUSTFLAGS
+# environment variable, which replaces all config rustflags.

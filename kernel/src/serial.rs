@@ -11,8 +11,21 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::x86_64::io::{inb, outb};
 
 const COM1: u16 = 0x3f8;
+const INTERRUPT_ENABLE: u16 = COM1 + 1;
 const LINE_STATUS: u16 = COM1 + 5;
 const TRANSMIT_EMPTY: u8 = 0x20;
+
+/// LSR bit 0: received data is ready in the FIFO.
+pub const LINE_DATA_READY: u8 = 0x01;
+/// LSR bit 1: at least one received byte was dropped (FIFO overrun).
+pub const LINE_OVERRUN: u8 = 0x02;
+
+/// Read the line status register. Reading it clears the error bits (overrun,
+/// parity, framing, break), so callers that track overruns must inspect the
+/// value this call returns.
+pub fn line_status() -> u8 {
+    inb(LINE_STATUS)
+}
 
 static LOCK: AtomicBool = AtomicBool::new(false);
 
@@ -40,8 +53,29 @@ pub fn init() {
     outb(COM1, 0x01);
     outb(COM1 + 1, 0x00);
     outb(COM1 + 3, 0x03);
-    outb(COM1 + 2, 0xc7);
+    // FCR: enable FIFOs, clear both, RX trigger level 1 byte. A 14-byte
+    // trigger (0xc7) strands short bursts below the threshold: the IRQ only
+    // fires once 14 bytes accumulate, and anything past the 16-byte FIFO is
+    // dropped. Level 1 raises IRQ4 for every byte so the handler can drain
+    // immediately; observed as dropped characters when typing over a pipe.
+    outb(COM1 + 2, 0x07);
     outb(COM1 + 4, 0x0b);
+}
+
+/// True when a received byte is waiting in the UART.
+pub fn rx_ready() -> bool {
+    line_status() & LINE_DATA_READY != 0
+}
+
+/// Read one received byte (call only when [`rx_ready`] is true).
+pub fn read_byte() -> u8 {
+    inb(COM1)
+}
+
+/// Route "data available" to IRQ4. `init()` disabled all UART interrupts, and
+/// the PIC must still unmask IRQ4 before any interrupt is delivered.
+pub fn enable_rx_interrupt() {
+    outb(INTERRUPT_ENABLE, 0x01);
 }
 
 /// Lock-free write used by panic and exception diagnostics.

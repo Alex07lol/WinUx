@@ -180,6 +180,60 @@ pub struct TscFrequencyResponse {
     pub frequency: u64,
 }
 
+#[repr(C)]
+pub struct Uuid {
+    pub a: u32,
+    pub b: u16,
+    pub c: u16,
+    pub d: [u8; 8],
+}
+
+/// `limine_file` (112 bytes): one module or the executable itself. `address`
+/// is HHDM-virtual for modules; `path` is a NUL-terminated ASCII path with a
+/// leading slash.
+#[repr(C)]
+pub struct File {
+    pub revision: u64,
+    pub address: *mut u8,
+    pub size: u64,
+    pub path: *const u8,
+    pub string: *const u8,
+    pub media_type: u32,
+    pub unused: u32,
+    pub tftp_ipv4: [u8; 4],
+    pub tftp_port: u32,
+    pub partition_index: u32,
+    pub mbr_disk_id: u32,
+    pub gpt_disk_uuid: Uuid,
+    pub gpt_part_uuid: Uuid,
+    pub part_uuid: Uuid,
+}
+
+#[repr(C)]
+pub struct ModuleResponse {
+    pub revision: u64,
+    pub module_count: u64,
+    pub modules: *const *const File,
+}
+
+#[repr(C)]
+pub struct ModuleRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut ModuleResponse,
+    // Request revision 1 fields; declared for ABI completeness while the
+    // kernel requests revision 0, so the bootloader leaves them as-is.
+    pub internal_module_count: u64,
+    pub internal_modules: *mut *const File,
+}
+
+impl ModuleRequest {
+    pub fn get(&self) -> Option<&'static ModuleResponse> {
+        // SAFETY: same contract as `Request::get`.
+        unsafe { self.response.as_ref() }
+    }
+}
+
 /// All requests emitted by the kernel. Field order defines the section layout;
 /// requests may appear in any order in the image.
 #[repr(C)]
@@ -195,6 +249,7 @@ pub struct Requests {
     pub memmap: Request<MemmapResponse>,
     pub framebuffer: Request<FramebufferResponse>,
     pub tsc_frequency: Request<TscFrequencyResponse>,
+    pub modules: ModuleRequest,
 }
 
 impl Requests {
@@ -239,6 +294,18 @@ impl Requests {
             memmap: Request::new(0x67cf3d9d378a806f, 0xe304acdfc50c3c62),
             framebuffer: Request::new(0x9d5827dcd881dd75, 0xa3148604f6fab11b),
             tsc_frequency: Request::new(0x10f2ee1d87d195e4, 0xf747a2b78f6ddb31),
+            modules: ModuleRequest {
+                id: [
+                    COMMON_MAGIC_0,
+                    COMMON_MAGIC_1,
+                    0x3e7e279702be32af,
+                    0xca1c4f3bd1280cee,
+                ],
+                revision: 0,
+                response: ptr::null_mut(),
+                internal_module_count: 0,
+                internal_modules: ptr::null_mut(),
+            },
         }
     }
 }
@@ -307,4 +374,34 @@ pub fn cstr(pointer: *const u8) -> &'static str {
     // SAFETY: bounded above; protocol strings are ASCII.
     let bytes = unsafe { core::slice::from_raw_parts(pointer, length) };
     core::str::from_utf8(bytes).unwrap_or("<invalid-utf8>")
+}
+
+/// The module response as a slice of pointers, or `None` when the bootloader
+/// provided no response. Per the protocol a response is only provided when at
+/// least one module is present, and "no modules available" means no response.
+pub fn modules() -> Option<&'static [*const File]> {
+    let response = get().modules.get()?;
+    if response.modules.is_null() || response.module_count == 0 {
+        return Some(&[]);
+    }
+    let count = response.module_count as usize;
+    // SAFETY: the protocol guarantees `modules` points to `module_count`
+    // valid pointers while the response lives.
+    Some(unsafe { core::slice::from_raw_parts(response.modules, count) })
+}
+
+/// Exact-match lookup by the module path given in `limine.conf`
+/// (`/boot/hello.elf` etc.). Exact matching keeps a mis-staged ISO visible.
+pub fn module_by_path(path: &str) -> Option<&'static File> {
+    for &file in modules()? {
+        if file.is_null() {
+            continue;
+        }
+        // SAFETY: non-null array entries point to valid `limine_file` structs.
+        let file = unsafe { &*file };
+        if cstr(file.path) == path {
+            return Some(file);
+        }
+    }
+    None
 }

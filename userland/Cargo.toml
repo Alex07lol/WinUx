@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["hello", "fault", "runtime"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.99"
+
+[workspace.dependencies]
+project_os_user_runtime = { path = "runtime" }
+
+[profile.release]
+opt-level = 2
+debug = 0
+lto = "thin"
+panic = "abort"
+strip = true

@@ -13,21 +13,29 @@
 extern crate alloc;
 
 mod arch;
+mod blk;
+mod console;
 mod display;
 mod font;
 mod heap;
 mod limine;
+mod loader;
 mod memory;
 mod panic;
+mod persist;
 mod sched;
 mod serial;
+mod shell;
 mod sync;
 mod syscall;
 mod user;
+mod vfs;
 mod vm;
 
 use core::arch::{asm, global_asm};
 use core::sync::atomic::Ordering;
+
+use alloc::string::String;
 
 use display::{BootDisplay, FramesInfo, Status};
 use os_core::fb::{FramebufferGeometry, PixelFormat};
@@ -434,6 +442,21 @@ pub extern "C" fn kmain() -> ! {
         vm::kernel_pml4().unwrap_or(0)
     );
     kprintln!("vm selftest: passed (map/unmap, translate, W^X, guard refusals, CR3 swap)");
+
+    if let Err(error) = vfs::init() {
+        fatal(Some(&mut display), format_args!("{}", error));
+    }
+    match vfs::self_test() {
+        Ok((nodes, files)) => kprintln!(
+            "vfs selftest: passed ({} nodes, {} files; create/read/append/overwrite/rm/list/error paths)",
+            nodes,
+            files
+        ),
+        Err(error) => fatal(
+            Some(&mut display),
+            format_args!("vfs selftest failed: {}", error),
+        ),
+    }
     display.set_frames(FramesInfo {
         free_frames: allocator_stats.free_frames as u64,
         total_frames: allocator_stats.total_frames as u64,
@@ -471,6 +494,8 @@ pub extern "C" fn kmain() -> ! {
     pic::remap_and_mask_all();
     pit::init();
     pic::unmask_irq0();
+    pic::unmask_irq(4);
+    console::init();
     if let Err(error) = setup_apic_extint(hhdm_offset) {
         kprintln!(
             "apic: ExtINT setup unavailable ({}); using disabled-LAPIC path",
@@ -480,6 +505,7 @@ pub extern "C" fn kmain() -> ! {
     }
     arch::x86_64::interrupts_enable();
     kprintln!("pit: {} Hz, IRQ0 unmasked", pit::effective_hz());
+    kprintln!("console: COM1 receive interrupt enabled (IRQ4)");
 
     if !wait_for_ticks(5) {
         fatal(
@@ -497,6 +523,13 @@ pub extern "C" fn kmain() -> ! {
         format_args!("PIT {} Hz | {} ticks", pit::effective_hz(), pit::ticks()),
         Status::Ok,
     );
+
+    // Block-device probe. Runs after the PIT is ticking so poll deadlines are
+    // real time; machines without the PIIX legacy IDE ports (e.g. q35) simply
+    // have no disk and the probe logs that in one line.
+    blk::init();
+    // Load the best checkpoint or format slot A; inactive without a disk.
+    persist::init();
 
     let tsc_frequency = limine::get()
         .tsc_frequency
@@ -524,36 +557,74 @@ pub extern "C" fn kmain() -> ! {
     }
     kprintln!("sched selftest: passed (round-robin yield + timer preemption)");
 
-    match user::demo(tsc_frequency) {
-        Ok(report) => kprintln!(
-            "user: ring-3 program exited (code {}), {} write(s), {} bytes, {} isolated fault(s), {} rejected syscall(s)",
-            report.exit_code,
-            report.write_calls,
-            report.bytes_written,
-            report.user_faults,
-            report.rejected_syscalls
-        ),
+    let user_report = match user::demo(tsc_frequency) {
+        Ok(report) => {
+            if report.elf {
+                kprintln!(
+                    "user: ring-3 program exited (code {}), {} write(s), {} bytes, {} isolated fault(s), {} rejected syscall(s)",
+                    report.exit_code,
+                    report.write_calls,
+                    report.bytes_written,
+                    report.user_faults,
+                    report.rejected_syscalls
+                );
+                kprintln!(
+                    "user selftest: passed (ELF64 modules loaded, int 0x80 write/exit from CPL3, user fault isolated, corrupt module rejected)"
+                );
+            } else {
+                kprintln!("user selftest: skipped (no ELF modules present)");
+            }
+            report
+        }
         Err(error) => fatal(
             Some(&mut display),
             format_args!("user-mode selftest failed: {}", error),
         ),
-    }
-    kprintln!("user selftest: passed (int 0x80 write/exit from CPL3, user fault isolated)");
+    };
 
     display.success();
-    kprintln!(
-        "PROJECT_OS_BOOT_SUCCESS:{} checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user",
-        BUILD_ID
-    );
+    let mut checks =
+        String::from("handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user");
+    if user_report.elf {
+        checks.push_str(",elf");
+    }
+    checks.push_str(",vfs");
+    if blk::info().is_some() {
+        checks.push_str(",blk");
+    }
+    if persist::active() {
+        checks.push_str(",persist");
+    }
+    kprintln!("PROJECT_OS_BOOT_SUCCESS:{} checks={}", BUILD_ID, checks);
 
     // QEMU's isa-debug-exit device (enabled only by the test runner) terminates
     // the VM with status (0x10 << 1) | 1 = 33. On VirtualBox the port is
-    // unassigned, the write is ignored, and the kernel falls through to idle.
+    // unassigned, the write is ignored, and the kernel continues to the shell.
     if cmdline.contains("debug_exit") {
         arch::x86_64::io::outl(0xf4, 0x10);
     }
 
+    // Interactive shell on the serial console. Boot success has already been
+    // reported above, so a serial test that exits via isa-debug-exit never
+    // reaches this code.
+    shell::configure(BUILD_ID, tsc_frequency);
+    if let Err(error) = sched::spawn("shell", shell_entry) {
+        fatal(
+            Some(&mut display),
+            format_args!("cannot start the shell: {}", error),
+        );
+    }
+    // Hand the CPU to the shell thread. It never finishes, so this boot
+    // context only runs again if the shell somehow exits; there is no
+    // scheduler idle thread yet.
+    sched::yield_now();
+
     loop {
         arch::x86_64::halt();
     }
+}
+
+/// Thread entry point for the shell (the scheduler wants a plain `fn()`).
+fn shell_entry() {
+    shell::run();
 }

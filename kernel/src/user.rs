@@ -1,25 +1,32 @@
-//! Ring-3 user-mode demonstration and self-test (Phase 5b).
+//! Ring-3 user-mode demonstration and self-test (Phase 6, stage 3).
 //!
-//! The test programs are assembled into the kernel image and copied at boot
-//! into a fresh 4-level address space whose kernel half is the boot template:
+//! User programs are ELF64 executables built from `userland/` (Rust, no_std),
+//! shipped as Limine modules and loaded by `loader.rs` into a fresh paged
+//! address space:
 //!
-//! * Program A runs at CPL3, performs one `int 0x80` console write and exits
+//! * `hello.elf` runs at CPL3, performs one `int 0x80` console write and exits
 //!   through `SYS_EXIT` with code 0.
-//! * Program B runs at CPL3 and writes to an unmapped user address, which
-//!   raises a page fault from CPL3. The kernel reports it, kills the thread,
-//!   and continues boot — the fault-isolation property.
+//! * `fault.elf` runs at CPL3 and writes to an unmapped user address, raising
+//!   a page fault from CPL3. The kernel reports it, kills the thread and
+//!   continues boot — the fault-isolation property.
+//! * `bad.elf` (a corrupted copy of `hello.elf`) must be rejected by the
+//!   loader probe before any memory is touched.
 //!
-//! Each program runs on its own scheduler thread; the boot thread joins them,
-//! then switches CR3 back to the kernel template and tears the test address
-//! spaces down (unmapping and freeing their frames and page tables).
+//! Each program runs one at a time on its own scheduler thread. The thread
+//! publishes its address space and load plan into a static slot; after the
+//! thread dies the boot context switches CR3 back to the kernel template,
+//! unmaps every page of the load plan plus the stack, and destroys the space.
 
 use core::arch::global_asm;
 use core::sync::atomic::Ordering;
 
 use os_core::frame::PhysFrame;
-use os_core::paging::{USER_CODE, USER_DATA};
+use os_core::paging::{PAGE_SIZE, USER_DATA};
 
 use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR, set_tss_rsp0};
+use crate::kprintln;
+use crate::limine;
+use crate::loader;
 use crate::memory;
 use crate::sched;
 use crate::serial;
@@ -27,9 +34,12 @@ use crate::sync::IrqSpinLock;
 use crate::syscall;
 use crate::vm::{self, AddressSpace};
 
-/// User program code window (1 MiB, away from the null guard page).
-const CODE_VA: u64 = 0x40_0000;
-/// Single user stack page.
+const HELLO_PATH: &str = "/boot/hello.elf";
+const FAULT_PATH: &str = "/boot/fault.elf";
+const BAD_PATH: &str = "/boot/bad.elf";
+
+/// Single user stack page, at the stage-5b placement just above the code
+/// window (`loader::CODE_END` == `STACK_VA`).
 const STACK_VA: u64 = 0x50_0000;
 const STACK_TOP: u64 = STACK_VA + 0x1000;
 
@@ -37,32 +47,6 @@ global_asm!(
     r#"
 .section .text
 .p2align 4
-
-.global project_os_user_program_a_start
-.global project_os_user_program_a_end
-project_os_user_program_a_start:
-    lea rdx, [rip + program_a_message]
-    lea r8, [rip + program_a_message_end]
-    sub r8, rdx
-    mov ecx, 1
-    mov eax, 1
-    int 0x80
-    mov ecx, 0
-    mov eax, 2
-    int 0x80
-    ud2
-program_a_message:
-    .ascii "user: hello from ring 3 via int 0x80\n"
-program_a_message_end:
-project_os_user_program_a_end:
-
-.global project_os_user_program_b_start
-.global project_os_user_program_b_end
-project_os_user_program_b_start:
-    movabs rax, 0x500000000
-    mov qword ptr [rax], 0xdead
-    ud2
-project_os_user_program_b_end:
 
 // fn(entry: u64, stack_top: u64, code_selector: u64, data_selector: u64) -> !
 // (SysV registers rdi, rsi, rdx, rcx). Loads the user data selector, builds
@@ -81,10 +65,6 @@ project_os_enter_user_mode:
 );
 
 unsafe extern "C" {
-    static project_os_user_program_a_start: u8;
-    static project_os_user_program_a_end: u8;
-    static project_os_user_program_b_start: u8;
-    static project_os_user_program_b_end: u8;
     fn project_os_enter_user_mode(
         entry: u64,
         stack_top: u64,
@@ -93,14 +73,10 @@ unsafe extern "C" {
     ) -> !;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Program {
-    A,
-    B,
-}
-
-static SPACE_A: IrqSpinLock<Option<AddressSpace>> = IrqSpinLock::new(None);
-static SPACE_B: IrqSpinLock<Option<AddressSpace>> = IrqSpinLock::new(None);
+/// The running thread publishes its address space and load plan here; the
+/// boot context tears both down after the thread exits or is killed. Exactly
+/// one user program runs at a time, so one slot suffices.
+static USER_SLOT: IrqSpinLock<Option<(AddressSpace, loader::Inspection)>> = IrqSpinLock::new(None);
 
 #[derive(Clone, Copy)]
 pub struct DemoReport {
@@ -109,93 +85,81 @@ pub struct DemoReport {
     pub bytes_written: u64,
     pub user_faults: u64,
     pub rejected_syscalls: u64,
+    /// False when the ELF self-test was skipped (no modules / missing module).
+    pub elf: bool,
 }
 
-fn program_bytes(program: Program) -> &'static [u8] {
-    let (start, end) = match program {
-        Program::A => (
-            core::ptr::addr_of!(project_os_user_program_a_start),
-            core::ptr::addr_of!(project_os_user_program_a_end),
-        ),
-        Program::B => (
-            core::ptr::addr_of!(project_os_user_program_b_start),
-            core::ptr::addr_of!(project_os_user_program_b_end),
-        ),
-    };
-    let length = end as usize - start as usize;
-    // SAFETY: both labels are emitted into the kernel text section; the slice
-    // is a subrange of that readonly section.
-    unsafe { core::slice::from_raw_parts(start, length) }
-}
-
-fn thread_fatal(message: &str) -> ! {
+fn thread_fatal(message: core::fmt::Arguments<'_>) -> ! {
     serial::force_print(format_args!(
-        "PROJECT_OS_FATAL: user setup: {}\r\n",
+        "\r\nPROJECT_OS_FATAL: user setup: {}\r\n",
         message
     ));
     sched::exit()
 }
 
-/// Build the user address space, copy the program, switch CR3, program the
-/// TSS stack and enter ring 3. Returns only through the kernel on failure.
-fn run(program: Program) -> ! {
-    let Some(hhdm) = vm::hhdm_offset() else {
-        thread_fatal("HHDM offset is unknown");
+/// Build the address space for one ELF module, map the zeroed stack, switch
+/// CR3, program the TSS stack and enter ring 3 at the ELF entry. Returns only
+/// through the kernel on failure.
+fn run_elf(path: &'static str) -> ! {
+    let Some(module) = limine::module_by_path(path) else {
+        thread_fatal(format_args!("module {} disappeared before load", path));
     };
-    let code = program_bytes(program);
+    let image = match loader::inspect(module) {
+        Ok(image) => image,
+        Err(reject) => thread_fatal(format_args!("{} rejected: {}", path, reject.label())),
+    };
+    let Some(hhdm) = vm::hhdm_offset() else {
+        thread_fatal(format_args!("HHDM offset is unknown"));
+    };
     let mut space = match AddressSpace::new_like_kernel(hhdm) {
         Ok(space) => space,
-        Err(_) => thread_fatal("cannot create the user address space"),
+        Err(_) => thread_fatal(format_args!("cannot create the user address space")),
     };
-    let code_frame = match memory::alloc_frame() {
-        Ok(frame) => frame,
-        Err(_) => thread_fatal("no frame for the user program"),
-    };
+    if let Err(reject) = loader::map(&mut space, module, &image) {
+        let _ = space.destroy();
+        thread_fatal(format_args!("cannot load {}: {}", path, reject.label()));
+    }
     let stack_frame = match memory::alloc_frame() {
         Ok(frame) => frame,
-        Err(_) => thread_fatal("no frame for the user stack"),
+        Err(_) => thread_fatal(format_args!("no frame for the user stack")),
     };
-
-    // Copy the program into its frame through the HHDM.
-    let code_window = match hhdm.checked_add(code_frame.address()) {
-        Some(window) => window as *mut u8,
-        None => thread_fatal("user code HHDM overflow"),
+    let Some(stack_window) = hhdm.checked_add(stack_frame.address()) else {
+        let _ = memory::free_pages(stack_frame, 1);
+        let _ = space.destroy();
+        thread_fatal(format_args!("user stack HHDM overflow"));
     };
-    // SAFETY: the frame was just allocated for this copy and is not mapped
-    // elsewhere; `code` is a kernel-text subrange.
-    unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), code_window, code.len()) };
-
+    // SAFETY: the frame was just allocated for this stack and is not mapped
+    // elsewhere; HHDM maps all of usable RAM. The stack starts zeroed so the
+    // program cannot observe stale kernel data.
+    unsafe { core::ptr::write_bytes(stack_window as *mut u8, 0, PAGE_SIZE as usize) };
     if space
-        .map_page(CODE_VA, code_frame.address(), USER_CODE)
+        .map_page(STACK_VA, stack_frame.address(), USER_DATA)
         .is_err()
-        || space
-            .map_page(STACK_VA, stack_frame.address(), USER_DATA)
-            .is_err()
     {
-        thread_fatal("mapping the user program failed");
+        let _ = memory::free_pages(stack_frame, 1);
+        let _ = space.destroy();
+        thread_fatal(format_args!("mapping the user stack failed"));
     }
     let kernel_stack_top = match sched::current_kernel_stack_top() {
         Some(top) => top,
-        None => thread_fatal("thread has no kernel stack"),
+        None => thread_fatal(format_args!("thread has no kernel stack")),
     };
 
     // Enter the new address space, then publish it for teardown. The kernel
     // half is shared with the template, so kernel code (including the timer
     // ISR and any preemption) keeps working with the user CR3 loaded.
     if space.activate().is_err() {
-        thread_fatal("activating the user address space failed");
+        thread_fatal(format_args!("activating the user address space failed"));
     }
-    match program {
-        Program::A => *SPACE_A.lock() = Some(space),
-        Program::B => *SPACE_B.lock() = Some(space),
-    }
+    let entry = image.entry();
+    *USER_SLOT.lock() = Some((space, image));
 
     set_tss_rsp0(kernel_stack_top);
-    // SAFETY: CODE_VA and STACK_VA are mapped user-accessible pages in the
-    // now-active address space, with the claimed entry and stack contents.
+    // SAFETY: `entry` points into a mapped executable segment of the
+    // now-active address space and STACK_VA is its mapped, zeroed user page.
     unsafe {
         project_os_enter_user_mode(
-            CODE_VA,
+            entry,
             STACK_TOP,
             u64::from(USER_CODE_SELECTOR),
             u64::from(USER_DATA_SELECTOR),
@@ -203,62 +167,110 @@ fn run(program: Program) -> ! {
     }
 }
 
-fn thread_a() {
-    run(Program::A);
+fn thread_hello() {
+    run_elf(HELLO_PATH);
 }
 
-fn thread_b() {
-    run(Program::B);
+fn thread_fault() {
+    run_elf(FAULT_PATH);
 }
 
-fn cleanup_slot(slot: &IrqSpinLock<Option<AddressSpace>>) -> Result<(), &'static str> {
-    let Some(mut space) = slot.lock().take() else {
+fn unmap_and_free(space: &mut AddressSpace, virtual_address: u64) -> Result<(), &'static str> {
+    if let Ok(physical) = space.unmap_page(virtual_address)
+        && let Some(frame) = PhysFrame::from_address(physical)
+    {
+        memory::free_pages(frame, 1).map_err(|_| "freeing a user frame failed")?;
+    }
+    Ok(())
+}
+
+fn cleanup_slot() -> Result<(), &'static str> {
+    let Some((mut space, image)) = USER_SLOT.lock().take() else {
         return Ok(());
     };
-    for virtual_address in [CODE_VA, STACK_VA] {
-        if let Ok(physical) = space.unmap_page(virtual_address)
-            && let Some(frame) = PhysFrame::from_address(physical)
-        {
-            memory::free_pages(frame, 1).map_err(|_| "freeing a user frame failed")?;
+    for segment in image.segments() {
+        let range = segment.page_range();
+        let mut page = range.start;
+        while page < range.end {
+            unmap_and_free(&mut space, page)?;
+            page += PAGE_SIZE;
         }
     }
+    unmap_and_free(&mut space, STACK_VA)?;
     space
         .destroy()
         .map_err(|_| "destroying a user space failed")
+}
+
+fn idle_report() -> DemoReport {
+    DemoReport {
+        exit_code: syscall::LAST_EXIT_CODE.load(Ordering::SeqCst),
+        write_calls: syscall::WRITE_CALLS.load(Ordering::SeqCst),
+        bytes_written: syscall::BYTES_WRITTEN.load(Ordering::SeqCst),
+        user_faults: syscall::USER_FAULTS.load(Ordering::SeqCst),
+        rejected_syscalls: syscall::REJECTED_SYSCALLS.load(Ordering::SeqCst),
+        elf: false,
+    }
 }
 
 /// Boot-time demonstration. The scheduler must already be initialised.
 pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
     sched::set_preemption(true);
 
-    sched::spawn("user-a", thread_a)?;
+    let Some(modules) = limine::modules().filter(|modules| !modules.is_empty()) else {
+        kprintln!("user: no Limine modules present; skipping the ELF self-test");
+        sched::set_preemption(false);
+        return Ok(idle_report());
+    };
+    kprintln!("elf: {} modules present", modules.len());
+
+    for path in [HELLO_PATH, FAULT_PATH, BAD_PATH] {
+        if limine::module_by_path(path).is_none() {
+            kprintln!("user: ELF self-test skipped (`{}` module missing)", path);
+            sched::set_preemption(false);
+            return Ok(idle_report());
+        }
+    }
+
+    // The corrupt-module probe runs before anything is allocated: a rejection
+    // here proves the parser gate, an acceptance is a boot-fatal bug.
+    let bad = match limine::module_by_path(BAD_PATH) {
+        Some(module) => module,
+        None => return Err("bad.elf module vanished after the presence check"),
+    };
+    match loader::inspect(bad) {
+        Ok(_) => return Err("corrupt module bad.elf was accepted"),
+        Err(reject) => kprintln!("user: /boot/bad.elf rejected ({})", reject.label()),
+    }
+
+    sched::spawn("user-hello", thread_hello)?;
     sched::wait_all_finished(300, tsc_frequency)?;
-    sched::spawn("user-b", thread_b)?;
+    vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
+    cleanup_slot()?;
+    if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
+        return Err("hello.elf did not exit with code 0");
+    }
+    if syscall::WRITE_CALLS.load(Ordering::SeqCst) != 1
+        || syscall::BYTES_WRITTEN.load(Ordering::SeqCst) == 0
+    {
+        return Err("hello.elf did not perform exactly one console write");
+    }
+    let faults_after_hello = syscall::USER_FAULTS.load(Ordering::SeqCst);
+
+    sched::spawn("user-fault", thread_fault)?;
     sched::wait_all_finished(300, tsc_frequency)?;
+    vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
+    cleanup_slot()?;
+    if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_after_hello + 1 {
+        return Err("fault.elf did not produce exactly one additional isolated user fault");
+    }
 
     sched::set_preemption(false);
 
-    // Back to the kernel address space, then tear the user spaces down.
-    vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
-    cleanup_slot(&SPACE_A)?;
-    cleanup_slot(&SPACE_B)?;
-
     let report = DemoReport {
-        exit_code: syscall::LAST_EXIT_CODE.load(Ordering::SeqCst),
-        write_calls: syscall::WRITE_CALLS.load(Ordering::SeqCst),
-        bytes_written: syscall::BYTES_WRITTEN.load(Ordering::SeqCst),
-        user_faults: syscall::USER_FAULTS.load(Ordering::SeqCst),
-        rejected_syscalls: syscall::REJECTED_SYSCALLS.load(Ordering::SeqCst),
+        elf: true,
+        ..idle_report()
     };
-    if report.exit_code != 0 {
-        return Err("program A did not exit with code 0");
-    }
-    if report.write_calls != 1 || report.bytes_written == 0 {
-        return Err("program A did not perform exactly one console write");
-    }
-    if report.user_faults != 1 {
-        return Err("program B did not produce exactly one isolated user fault");
-    }
     if report.rejected_syscalls != 0 {
         return Err("a syscall was rejected during the demo");
     }

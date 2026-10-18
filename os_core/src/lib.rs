@@ -10,11 +10,16 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
+pub mod elf;
 pub mod fb;
 pub mod frame;
 pub mod heap;
 pub mod memmap;
 pub mod paging;
+pub mod path;
+pub mod pofs;
 pub mod rng;
 
 /// Temporary internal project name. Branding is intentionally not part of the

@@ -30,9 +30,17 @@ pub fn remap_and_mask_all() {
     outb(0xa1, 0xff);
 }
 
-pub fn unmask_irq0() {
+/// Unmask one master-PIC line (0..=7); callers must have a handler installed
+/// for the corresponding vector (32 + line).
+pub fn unmask_irq(line: u8) {
+    debug_assert!(line < 8);
+    let bit = 1u8 << (line & 7);
     let mask = inb(0x21);
-    outb(0x21, mask & !0x01);
+    outb(0x21, mask & !bit);
+}
+
+pub fn unmask_irq0() {
+    unmask_irq(0);
 }
 
 pub fn eoi_master() {

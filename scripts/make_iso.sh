@@ -4,8 +4,22 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 BUILD=1
-if [ "${1:-}" = "--no-build" ]; then
-    BUILD=0
+INTERACTIVE=0
+for argument in "$@"; do
+    case "$argument" in
+        --no-build) BUILD=0 ;;
+        --interactive)
+            # Strip the isa-debug-exit cmdline flag so the kernel reaches the
+            # interactive shell instead of terminating at the success marker.
+            INTERACTIVE=1
+            ;;
+        *) die "unknown argument: $argument (use --no-build and/or --interactive)" ;;
+    esac
+done
+
+OUT_ISO="$ISO_PATH"
+if [ "$INTERACTIVE" -eq 1 ]; then
+    OUT_ISO="$ROOT_DIR/artifacts/project-os-interactive.iso"
 fi
 
 have mkisofs || die "mkisofs not found (scoop install cdrtools / apt install genisoimage or xorriso)"
@@ -13,6 +27,23 @@ if [ "$BUILD" -eq 1 ]; then
     "$ROOT_DIR/scripts/build.sh"
 fi
 [ -f "$KERNEL_ARTIFACT" ] || die "kernel artifact missing: $KERNEL_ARTIFACT"
+
+# Ring-3 programs are Limine modules on the ISO. Mirror the Limine fetch
+# behavior: build them on demand, and never produce a module-less ISO.
+USER_ELFS=""
+for name in hello fault bad; do
+    artifact="$ROOT_DIR/artifacts/$name.elf"
+    if [ ! -f "$artifact" ]; then
+        log "userland artifact missing ($artifact); building"
+        "$ROOT_DIR/scripts/build_user.sh"
+        break
+    fi
+done
+for name in hello fault bad; do
+    artifact="$ROOT_DIR/artifacts/$name.elf"
+    [ -f "$artifact" ] || die "userland artifact missing: $artifact"
+    USER_ELFS="$USER_ELFS $artifact"
+done
 
 if [ ! -f "$ROOT_DIR/boot/limine/limine-bios.sys" ]; then
     "$ROOT_DIR/scripts/fetch_limine.sh"
@@ -25,7 +56,13 @@ STAGE="$ROOT_DIR/artifacts/iso_root"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/boot" "$STAGE/EFI/BOOT" "$STAGE/licenses/rust"
 cp "$KERNEL_ARTIFACT" "$STAGE/boot/kernel.elf"
+for artifact in $USER_ELFS; do
+    cp "$artifact" "$STAGE/boot/$(basename "$artifact")"
+done
 cp "$ROOT_DIR/boot/limine.conf" "$STAGE/limine.conf"
+if [ "$INTERACTIVE" -eq 1 ]; then
+    sed -i 's/ debug_exit//' "$STAGE/limine.conf"
+fi
 cp "$ROOT_DIR/boot/limine/limine-bios.sys" "$STAGE/"
 cp "$ROOT_DIR/boot/limine/limine-bios-cd.bin" "$STAGE/"
 cp "$ROOT_DIR/boot/limine/limine-uefi-cd.bin" "$STAGE/"
@@ -47,8 +84,8 @@ done
 [ -d "$ROOT_DIR/licenses/rust" ] || die "Rust license notices missing: licenses/rust"
 cp -R "$ROOT_DIR/licenses/rust/." "$STAGE/licenses/rust/"
 
-rm -f "$ISO_PATH"
-log "creating ISO with BIOS + UEFI El Torito entries"
+rm -f "$OUT_ISO"
+log "creating ISO with BIOS + UEFI El Torito entries${INTERACTIVE:+ (interactive shell build)}"
 # cdrtools mkisofs spells the EFI platform id numerically (0xef = 239); it does
 # not accept the string "efi" that xorriso accepts.
 mkisofs \
@@ -60,11 +97,11 @@ mkisofs \
     -eltorito-platform 239 \
     -b limine-uefi-cd.bin \
     -no-emul-boot \
-    -o "$ISO_PATH" \
+    -o "$OUT_ISO" \
     "$STAGE" >/dev/null
 
 if LIMINE_TOOL=$(find_limine_tool); then
-    if "$LIMINE_TOOL" bios-install --force "$ISO_PATH" >/tmp/project-os-limine-install.log 2>&1; then
+    if "$LIMINE_TOOL" bios-install --force "$OUT_ISO" >/tmp/project-os-limine-install.log 2>&1; then
         log "Limine hybrid MBR installed (ISO also bootable as a disk image)"
     else
         warn "limine bios-install failed; El Torito ISO boot is unaffected"
@@ -75,12 +112,12 @@ else
 fi
 
 if have python; then
-    python "$ROOT_DIR/scripts/verify_iso.py" "$ISO_PATH"
+    python "$ROOT_DIR/scripts/verify_iso.py" "$OUT_ISO"
 else
     warn "python unavailable; El Torito catalog verification skipped"
 fi
 
-[ -s "$ISO_PATH" ] || die "ISO was not created"
-log "ISO: $ISO_PATH"
-log "size: $(wc -c < "$ISO_PATH") bytes"
-log "sha256: $(sha256sum "$ISO_PATH" | awk '{print $1}')"
+[ -s "$OUT_ISO" ] || die "ISO was not created"
+log "ISO: $OUT_ISO"
+log "size: $(wc -c < "$OUT_ISO") bytes"
+log "sha256: $(sha256sum "$OUT_ISO" | awk '{print $1}')"

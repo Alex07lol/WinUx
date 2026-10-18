@@ -26,6 +26,24 @@ pub fn outl(port: u16, value: u32) {
     }
 }
 
+#[inline]
+pub fn inw(port: u16) -> u16 {
+    let value: u16;
+    // SAFETY: port I/O in ring 0; callers pass valid device ports.
+    unsafe {
+        asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+#[inline]
+pub fn outw(port: u16, value: u16) {
+    // SAFETY: port I/O in ring 0; callers pass valid device ports.
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Short I/O delay using the legacy port 0x80 (POST diagnostic port). Common
 /// on PC hardware and harmless under QEMU/VirtualBox.
 pub fn io_wait() {

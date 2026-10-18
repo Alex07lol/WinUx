@@ -30,16 +30,21 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 
 | Command | Proves | Recorded result |
 |---|---|---|
-| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 13 PASS, 0 FAIL, 4 SKIP |
+| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 18 PASS, 0 FAIL, 4 SKIP |
 | `scripts/bootstrap.sh` | required tools and Rust target exist | PASS |
-| `scripts/format.sh` | `rustfmt --check` clean | PASS |
-| `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel | PASS |
-| `scripts/test_unit.sh` | 33 host tests for memmap, framebuffer, allocator, PRNG, paging math | PASS (33/33) |
+| `scripts/format.sh` | `rustfmt --check` clean (kernel workspace and userland) | PASS |
+| `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland | PASS |
+| `scripts/test_unit.sh` | 96 host tests: memmap, framebuffer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors | PASS (96/96) |
 | `scripts/build.sh` | kernel builds; ELF entry and Limine requests verified | PASS |
-| `scripts/make_iso.sh` | ISO built; both El Torito entries verified | PASS |
+| `scripts/build_user.sh` | userland workspace builds; `hello`/`fault` pass the header checker; `bad.elf` fails with `bad magic` | PASS |
+| `scripts/make_iso.sh` | ISO built (kernel + three modules); both El Torito entries verified | PASS |
 | `scripts/test_boot_qemu.sh` | BIOS boot at 256 MiB, 512 MiB and 1 GiB; marker; no panic; debug-exit 33 | PASS (all three) |
 | `scripts/test_boot_qemu.sh --firmware uefi` | UEFI boot | SKIP (no `OVMF_FD`) |
+| `scripts/test_elf_qemu.sh` | ELF64 module self-test: 3 modules present, ring-3 greeting from the ELF, exit 0, one isolated fault, `bad.elf` rejected, `,elf` marker | PASS |
 | `scripts/test_memory.sh` | allocator host tests + in-VM allocator self-test | PASS (both) |
+| `scripts/test_vfs.sh` | host path tests + in-VM VFS self-test | PASS (both) |
+| `scripts/test_shell_qemu.sh` | scripted interactive shell session over a paced TCP serial chardev | PASS (17 commands) |
+| `scripts/test_persistence_qemu.sh` | four-boot durability on a raw 8 MiB disk (format/save, reboot load, CRC fallback, fresh format) | PASS (4 boots) |
 | `scripts/test_graphics_host.sh` | framebuffer geometry/colour tests | PASS |
 | `scripts/test_virtualbox.sh` | VirtualBox BIOS boot | PASS (7.2.20; marker + 5 ticks) |
 | `scripts/test_pci.sh` | PCI enumeration | SKIP (not implemented, Phase 9) |
@@ -65,8 +70,14 @@ qemu-system-x86_64 \
 The kernel prints a unique marker only after all checks:
 
 ```text
-PROJECT_OS_BOOT_SUCCESS:<build-id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator
+PROJECT_OS_BOOT_SUCCESS:<build-id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,vfs
 ```
+
+The `,elf` component is inserted between `user` and `vfs` only when the ELF64
+module self-test ran (ADR-0017). Correction note: stage 2 described the no-disk
+marker as byte-identical to stage 1; the segment between `user` and `vfs` now
+carries `elf`, so the byte-identical wording applies to the `vfs`-onward suffix
+(`vfs,blk,persist`) that the persistence test pins, not to the full line.
 
 Failure conditions:
 
@@ -104,6 +115,81 @@ and the kernel idles, so the same ISO can be booted manually.
 8. PIC remapped/masked, PIT programmed, IRQ0 unmasked, the APIC MMIO page mapped,
    and LINT0 left in ExtINT delivery so the 8259 can reach the CPU.
 9. Five PIT ticks observed within a 2 s TSC-based bound (or bounded spin fallback).
+10. Kernel heap self-test: box allocation, `Vec` growth, a 1 MiB block, accounting restored.
+11. VM self-test: own 4-level tables active, map/unmap/translate, W^X and guard refusals, CR3 swap.
+12. Scheduler self-test: two yielding workers interleave; a CPU-bound spinner finishes under timer preemption.
+13. Ring-3 self-test: three Limine ELF64 modules located; `bad.elf` rejected
+    before any allocation; `hello.elf` performs an `int 0x80` write and exits 0
+    from CPL3; `fault.elf` produces one isolated user page fault that kills
+    only the user thread.
+14. VFS self-test: create/read/append/overwrite/remove/list and the error paths.
+
+After the timer is verified, the kernel probes the PIIX primary master
+(`blk`), then loads the best checkpoint slot or formats a fresh disk
+(`persist`). Both steps are conditional: without a disk the kernel logs
+`blk: no ATA device on primary channel` / `persist: inactive (no ATA disk)`
+and the marker is `checks=...,user,elf,vfs`. With a usable disk the marker
+gains `,blk,persist`.
+
+## Interactive shell test details
+
+`scripts/test_shell_qemu.sh` builds `artifacts/project-os-interactive.iso`
+(`make_iso.sh --interactive` strips `debug_exit` from the Limine cmdline, so
+the kernel reaches the shell instead of exiting) and drives it with
+`scripts/test_shell_qemu.py`:
+
+```text
+qemu-system-x86_64 -machine q35 -m 512M -smp 1 \
+  -cdrom artifacts/project-os-interactive.iso -boot d \
+  -display none -monitor none \
+  -serial tcp:127.0.0.1:<port>,server=on,wait=off -no-reboot
+```
+
+The Python driver connects to the TCP chardev, waits for the shell banner,
+then types 17 commands at 2 ms per byte (a UART-realistic rate) and asserts
+each response, the returning prompt, the boot marker, and `console`'s
+`0 overruns`. The transcript is written to
+`artifacts/qemu-shell-session.log`.
+
+**Why not `-serial stdio`:** QEMU's 16550 model accepts an unthrottled host
+burst straight into the 16-byte receive FIFO. A piped command can overflow
+that FIFO before the guest vCPU wakes from `hlt`, so bytes are dropped
+regardless of guest correctness (the kernel counts real overruns via LSR bit
+1 and reports them through the `console` builtin). The TCP chardev lets the
+harness pick the delivery rate, which is what a real serial line or a human
+at a terminal produces. A large paste into a stdio serial can still overrun;
+that limitation is emulation-side and documented, not hidden.
+
+## Persistence test details
+
+`scripts/test_persistence_qemu.sh` (driver `scripts/test_persistence_qemu.py`)
+reuses the paced-session machinery but boots `-machine pc` with a raw 8 MiB
+disk, because the ATA PIO driver needs the PIIX legacy ports that `q35` does
+not expose (R-009 in `docs/RESEARCH.md`):
+
+```text
+qemu-system-x86_64 -machine pc -m 512M -smp 1 \
+  -cdrom artifacts/project-os-interactive.iso -boot d \
+  -drive file=artifacts/persist-disk.img,format=raw,if=ide,index=0,media=disk \
+  -display none -monitor none \
+  -serial tcp:127.0.0.1:<port>,server=on,wait=off -no-reboot
+```
+
+Four boots against one image, each transcript kept
+(`artifacts/qemu-persist-boot{1..4}.log`):
+
+1. fresh disk → `formatted slot A seq=0`; `write /tmp/hello.txt hello world` →
+   `saved slot B seq=1`;
+2. reboot → `loaded slot B seq=1`, file readable, `mkdir` → A seq2 and
+   `write /tmp/notes/a.txt` → B seq3;
+3. the driver corrupts the newest slot's first payload sector (header intact,
+   zeroed range) → `slot B invalid (payload crc mismatch)`, fallback to A
+   seq2, and the file saved after A seq2 is gone;
+4. both payloads corrupted → both slots reported invalid, fresh format, old
+   file gone.
+
+The corruption step is byte-level on the image file, not another guest write,
+so it cannot be fooled by the guest's own consistency.
 
 ## VirtualBox
 
@@ -155,8 +241,11 @@ in `progress.md` before claiming a UEFI boot.
 ## Evidence limitations
 
 - QEMU is TCG software emulation on this host; timings are not hardware timings.
+- The ATA/checkpoint path is verified on QEMU `-machine pc` with a raw image
+  only: no AHCI, virtio, DMA, real hardware or VirtualBox disk test exists yet,
+  and VirtualBox still boots the diskless profile.
 - QEMU BIOS was exercised at 256 MiB, 512 MiB and 1 GiB. Larger sizes,
   hotplug/NUMA and physical hardware were not run.
-- VirtualBox BIOS is now verified; VirtualBox EFI, UEFI/OVMF, real hardware, SMP,
-  user mode, Windows apps and GPUs are untested or unimplemented and are not
-  claimed.
+- VirtualBox BIOS is now verified (marker with `user` checks); VirtualBox EFI,
+  UEFI/OVMF, real hardware, SMP, Windows apps and GPUs are untested or
+  unimplemented and are not claimed.

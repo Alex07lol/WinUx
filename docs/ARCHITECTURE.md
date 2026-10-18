@@ -75,33 +75,64 @@ writable, which the segment permissions above guarantee.
 | Module | Responsibility | State |
 |---|---|---|
 | `kernel/src/entry.S` | stack alignment, call into Rust | working |
-| `kernel/src/limine.rs` | protocol structs, request block, string access | working |
-| `kernel/src/serial.rs` | COM1 115200 8N1, locked logging, lock-free panic path | working |
+| `kernel/src/limine.rs` | protocol structs, request block, module request + `module_by_path`, string access | working |
+| `kernel/src/serial.rs` | COM1 115200 8N1, locked logging, lock-free panic path, RX status/byte helpers | working |
 | `kernel/src/display.rs` | validated framebuffer drawing and dashboard | working (boot framebuffer only) |
 | `kernel/src/font.rs` | original 5x7 bitmap font | working |
-| `kernel/src/memory.rs` | usable-RAM-only bitmap frame allocator + self-test | working |
-| `kernel/src/arch/x86_64/gdt.rs` | GDT, TSS, IST1 double-fault stack | working |
-| `kernel/src/arch/x86_64/idt.rs` | 32 exception gates + IRQ0, frame dispatcher | working |
-| `kernel/src/arch/x86_64/pic.rs` | 8259 remap/mask, IRQ0 unmask, EOI | working |
+| `kernel/src/memory.rs` | usable-RAM-only bitmap frame allocator, stats, self-test | working |
+| `kernel/src/heap.rs` | fixed 8 MiB kernel heap, `#[global_allocator]`, stats/validate | working |
+| `kernel/src/vm.rs` | own 4-level PML4, map/unmap/translate, W^X, user-half teardown | working |
+| `kernel/src/sched.rs` | 16 kernel threads, round-robin yield + timer preemption | working |
+| `kernel/src/syscall.rs` | `int 0x80` dispatch, pointer validation, user-fault kill path | working |
+| `kernel/src/user.rs` | ring-3 ELF module life cycle, iretq trampoline, teardown | working (ELF modules) |
+| `kernel/src/loader.rs` | two-phase ELF64 module loader (`inspect`/`map`), code window, rollback | working (ADR-0017) |
+| `kernel/src/console.rs` | IRQ4 receive ring, echo and line editing | working (serial only) |
+| `kernel/src/vfs.rs` | in-memory arena VFS, boot self-test, dirty tracking, export/replace for checkpoints | working |
+| `kernel/src/blk.rs` | ATA PIO block device (PIIX primary master, LBA28, polled) | working (QEMU `-machine pc`) |
+| `kernel/src/persist.rs` | double-buffered checkpoint slots, CRC-verified load/save | working |
+| `kernel/src/shell.rs` | serial shell builtins over kernel services | working (serial only) |
+| `kernel/src/arch/x86_64/gdt.rs` | GDT (kernel + user segments), TSS, IST1 double-fault stack | working |
+| `kernel/src/arch/x86_64/idt.rs` | exception gates, IRQ0, IRQ4, `int 0x80` gate, frame dispatcher | working |
+| `kernel/src/arch/x86_64/pic.rs` | 8259 remap/mask, per-line unmask, EOI | working |
 | `kernel/src/arch/x86_64/pit.rs` | 8254 channel 0 at 100 Hz, tick counter | working |
+| `kernel/src/arch/x86_64/context.rs` | register/RSP-swap context switch | working |
 | `kernel/src/arch/x86_64/paging.rs` | narrow uncached MMIO mapping through the live 4-level tables | working, not a VM manager |
 | `kernel/src/arch/x86_64/apic.rs` | xAPIC mode + LINT0 ExtINT for the 8259 path | working |
-| `kernel/src/sync.rs` | single-CPU spin lock | working, not IRQ-safe |
+| `kernel/src/sync.rs` | `SpinLock` and RFLAGS-saving `IrqSpinLock` | working |
 | `kernel/src/panic.rs` | panic report and halt | working |
+| `userland/` | independent no_std cargo workspace: syscall runtime plus the `hello`/`fault` ELF programs | working (ADR-0017) |
 | `os_core::memmap` | classification/accounting/validation | host-tested |
 | `os_core::fb` | geometry, pixel format, bounds, colour packing | host-tested |
 | `os_core::frame` | bitmap frame allocator | host- and in-VM-tested |
+| `os_core::heap` | free-list heap model used by the kernel heap | host-tested |
+| `os_core::path` | VFS path validation and component splitting | host-tested |
+| `os_core::pofs` | checkpoint header/payload encode, decode, CRC32 | host-tested |
+| `os_core::elf` | ELF64 `ET_EXEC` parser: headers, segments, W^X and overlap policy | host-tested |
 | `os_core::paging` | 4-level index/entry math and MMIO flags | host-tested |
+| `os_core::rng` | deterministic PRNG for tests/benchmarks | host-tested |
 
 ## Address-space policy (current)
 
-The kernel runs on the bootloader-provided 4-level page tables. It does not yet
-create its own address space, split huge pages, unmap, or enter user mode. HHDM
-mappings are used to write/read allocated physical frames and to walk the live
-tables. One narrow exception exists: `paging.rs` maps the APIC MMIO page
-uncached because Limine's HHDM does not cover it, so the kernel can program
-LINT0 ExtINT (ADR-0011). That mapper installs permanent leaves only and is not a
-general VM manager.
+The kernel builds and switches to its own 4-level PML4 at boot: entries
+256..512 (the kernel half) are copied from the bootloader tables, and CR3 is
+swapped onto the new tables (`kernel/src/vm.rs`, ADR-0012). `map_page` enforces
+W^X (writable implies non-executable), alignment, kernel-half and double-map
+refusals; `unmap` issues `invlpg` and releases frames. The bootloader tables are
+intentionally left allocated and unused for now; reclaiming bootloader-
+reclaimable memory is future work.
+
+Each ring-3 program is an ELF64 executable (`userland/` workspace, Rust
+`no_std`) shipped as a Limine module. `loader::inspect` parses and policy-checks
+it without allocating (segments inside `0x400000..0x500000`, entry executable);
+`loader::map` then allocates, zero-fills and maps each segment page with W^X
+flags and rolls every page back on failure. The program runs in a fresh address
+space cloned from the kernel-half template, with its segments and a zeroed
+one-page stack mapped in the lower half with the USER bit. Every syscall
+argument is validated against the live CR3 (`vm::translate_live`): canonical
+user range and every touched page mapped user-accessible. Teardown unmaps and
+frees the load-plan pages, the stack page and the page tables, then reactivates
+the kernel PML4 (ADR-0017). There is no demand paging, copy-on-write or
+huge-page splitting, and one user thread runs at a time (single TSS `rsp0`).
 
 Physical memory policy:
 
@@ -119,14 +150,18 @@ CPU exception / IRQ
    -> isr_N stub (assembly): push error code (0 if none), push vector
    -> isr_common: save 15 GPRs, align stack, call exception_dispatch
    -> Rust dispatcher:
-        vector 32 -> PIT tick++, EOI
-        vector 3  -> breakpoint self-test flag
-        other     -> serial fatal dump (vector, error, rip, cs, rflags; CR2 for #PF)
+        vector 32  -> PIT tick++, EOI, scheduler tick, reschedule at the tail
+        vector 36  -> COM1 receive: drain the UART into the console ring, EOI
+        vector 128 -> int 0x80 syscall dispatch (DPL3 gate); iretq to CPL3
+        vector 3   -> breakpoint self-test flag
+        CPL3 fault -> report, count, kill the user thread (kernel continues)
+        other      -> serial fatal dump (vector, error, rip, cs, rflags; CR2 for #PF)
    -> restore GPRs, discard vector/error, iretq
 ```
 
 Vector 8 (double fault) uses IST1 from the TSS. Same-ring frames contain only
-RIP/CS/RFLAGS; a user-mode frame unwinder is future work.
+RIP/CS/RFLAGS; the syscall gate's DPL3 entry means ring-3 frames carry SS/RSP
+as well (ADR-0014).
 
 ## Boundaries and dependency rules
 
@@ -143,15 +178,24 @@ RIP/CS/RFLAGS; a user-mode frame unwinder is future work.
 ## Known limitations
 
 - Single CPU only; no SMP startup, no per-CPU state.
-- Bootloader page tables plus a narrow MMIO leaf mapper; no kernel virtual-memory
-  manager, unmap, huge-page splitting or W^X enforcement for new mappings
-  (Limine's segment permissions are in effect).
+- Own 4-level VM manager; no 5-level paging, demand paging, copy-on-write or
+  huge-page splitting. The bootloader page tables remain allocated and unused.
 - Legacy PIC + PIT; xAPIC is enabled only to route LINT0 ExtINT. No APIC
-timer, IOAPIC, MSI or HPET.
-- No kernel heap, no user mode, no syscalls, no process model.
-- No filesystem, block device, PCI enumeration or driver model.
+  timer, IOAPIC, MSI or HPET.
+- The kernel heap is a fixed 8 MiB region that does not grow on demand.
+- One user thread at a time (single TSS `rsp0`); program images are our own
+  ELF64 `ET_EXEC` modules loaded from Limine, with no PIE/dynamic linking,
+  no ASLR, no filesystem-backed exec and no process model (ADR-0017).
+- The filesystem is a whole-tree checkpoint image: two 1 MiB slots on a
+  PIIX-legacy ATA disk, flushed write-through at shell-command boundaries
+  (ADR-0016). No journal, no AHCI/virtio, no DMA or IRQ14, and the disk path
+  is verified on QEMU `-machine pc` only. The console and shell are
+  serial-only; there is no framebuffer console input. No PCI enumeration or
+  driver model.
 - No reclaim of bootloader-reclaimable memory.
-- Spin locks are not interrupt-safe; no lock is taken from an interrupt handler.
+- `IrqSpinLock` is safe to share with interrupt handlers on a single CPU; the
+  plain `SpinLock` is not and must not be taken from code an interrupt handler
+  can preempt.
 - Framebuffer only, 16/24/32 bpp formats, software drawing.
 - The 64 GiB bitmap cap is a bring-up constraint, not an allocator requirement.
 

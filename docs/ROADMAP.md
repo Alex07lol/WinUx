@@ -11,7 +11,7 @@ were run and observed. No dates or completion percentages are implied.
 | 3 | physical/virtual memory, page tables, permissions | **partial (kernel-side VM manager done)** — bitmap frame allocator; kernel-owned 4-level address space with CR3 switch, map/unmap/translate, on-demand tables, W^X enforcement and guard refusals, all self-tested in QEMU/VirtualBox BIOS boots; user address spaces, guard-page and fragmentation stress tests outstanding |
 | 4 | kernel heap, slab/size classes, performance harness | **partial** — fixed 8 MiB first-fit free-list heap with global allocator, IRQ-safe locking, poisoning, double-free detection, `validate()` walk, host tests (14) and in-kernel self-test; growth, slabs per measurement and the heap benchmark harness outstanding |
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
-| 6 | VFS, storage, console/shell, persistence, networking | not started |
+| 6 | VFS, storage, console/shell, persistence, networking | in progress (stages 1–3 verified) |
 | 7 | PE loader and minimal native Windows console compatibility | not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
@@ -106,11 +106,41 @@ no process model, handle table, or invalid-pointer fuzz corpus beyond the
 single unmapped-write case; no guard pages around the user stack; no
 `fork`/`exec`/`wait`; syscalls are console-write only.
 
-## Phase 6 acceptance (planned)
+## Phase 6 acceptance (in progress)
 
-Reproducible launch of small native programs; initial VFS/filesystem; persistent
-test state on a VM disk; console/shell; logging. Networking only after the core
-services are stable.
+Stage 1 (complete and verified): interactive serial console (IRQ4 receive ring
+with line editing), in-memory VFS with a host-tested path parser and boot
+self-test, and a kernel shell over the frame allocator, heap, scheduler,
+timer, VFS and console. Scripted end-to-end shell session test
+(`scripts/test_shell_qemu.sh`): 17 commands over a paced serial chardev, all
+outputs asserted, `console` reports 0 overruns. Verified in QEMU BIOS (256
+MiB / 512 MiB / 1 GiB) and VirtualBox BIOS; the marker is
+`checks=...,user,vfs`.
+
+Stage 2 (complete and verified): ATA PIO block device (PIIX primary master,
+LBA28, polled; ADR-0016) and durable checkpoint persistence — a CRC32-checked
+whole-tree image in two alternating 1 MiB slots, flushed write-through at
+shell-command boundaries, loaded at boot with fallback to the older slot when
+the newest fails its CRC. Four-boot harness (`scripts/test_persistence_qemu.sh`,
+`-machine pc` + 8 MiB raw disk): format/save, reboot load plus further saves,
+deliberate payload corruption → fallback, both slots corrupt → fresh format.
+No-disk boots are unchanged (`checks` without `blk,persist`); with a disk the
+marker is `checks=...,vfs,blk,persist`.
+
+Stage 3 (complete and verified): native ELF64 program loading (ADR-0017). Three
+Limine modules (`hello.elf`, `fault.elf`, `bad.elf`) are built from the
+independent `userland/` Rust workspace; the kernel parses them with the
+host-tested `os_core::elf` parser (77 → 96 unit tests), loads them into a fresh
+user address space and runs them at CPL3, and rejects the corrupt module before
+allocating anything. Evidence: `scripts/test_elf_qemu.sh` asserts
+`elf: 3 modules present`, the exact ring-3 greeting, `syscall: thread exits with
+code 0`, `user fault isolated: vector=14`, `user: /boot/bad.elf rejected
+(bad magic)`, the ELF verdict line and the `sched,user,elf,vfs` marker; the
+full suite is PASS=18 FAIL=0 SKIP=4 with VirtualBox BIOS and the four-boot
+persistence test still green.
+
+Remaining for Phase 6 acceptance: logging beyond COM1; networking is staged
+later in the phase.
 
 ## Phase 7 acceptance (planned)
 

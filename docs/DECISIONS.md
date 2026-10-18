@@ -352,3 +352,193 @@ continues)`, `user: ring-3 program exited (code 0), 1 write(s), 37 bytes,
 but user programs are embedded test fixtures, one runs at a time, and there is
 no process model (no fork/exec, handles or per-process resources). Those arrive
 with the VFS/process work (Phase 6).
+
+## ADR-0015 – Serial console, in-memory VFS and shell (Phase 6, stage 1)
+
+**Context.** Phase 5b proved ring-3 execution, but the only input path was the
+bootloader handoff and there was no way to name or store anything at runtime.
+Phase 6 starts the interactive surface: serial console input, a filesystem to
+name things, and a shell. On-disk persistence and a real program loader are
+later stages.
+
+**Decision.**
+
+- **Console input:** COM1 receive via IRQ4 (vector 36) only. The interrupt
+  handler drains the UART into a 256-byte software ring under an IRQ-safe
+  lock; echo, line editing and assembly happen in the reader thread, never in
+  the handler. The reader blocks with `hlt` and never busy-polls. `read_line`
+  accepts CR/LF, backspace (0x08/0x7F) and printable ASCII up to 128 bytes.
+- **UART FIFO trigger level 1 (`FCR` 0x07):** the common `0xc7` value sets a
+  14-byte trigger level, which strands short input bursts below the threshold
+  until later bytes push the FIFO over it — observed as reordered and dropped
+  characters when QEMU was driven through a pipe. Trigger level 1 raises IRQ4
+  on every byte. The ISR additionally counts true hardware FIFO overruns
+  (LSR bit 1) and full-ring drops into `RX_OVERRUNS`, viewable via the
+  `console` builtin (`0 overruns` in the recorded session).
+- **In-memory VFS:** an arena of at most 64 nodes in kernel heap memory with
+  inline data capped at 8192 bytes per file. Path rules (absolute, no `.` or
+  `..`, printable ASCII, component and total length caps) live in
+  `os_core::path` and are host-tested. The kernel tree seeds `/etc`,
+  `/etc/motd`, `/etc/version` and `/tmp`, and runs a boot self-test covering
+  create/read/append/overwrite/remove/list and the error paths. `write`
+  creates or replaces (`write_file` resolves the parent and pushes a new file
+  when missing); `append` requires an existing file. Nothing persists across
+  reboots — the `version` builtin states this explicitly.
+- **Shell:** one kernel thread spawned after the success marker; the boot
+  thread hands it the CPU with `yield_now()` and only runs again if the shell
+  exits (there is no scheduler idle thread yet). Builtins cover the kernel
+  services above (see `help`). Input and output are serial-only; there is no
+  framebuffer console input.
+- **Interactive ISO:** `make_iso.sh --interactive` produces
+  `artifacts/project-os-interactive.iso` with `debug_exit` stripped from the
+  staged Limine cmdline so the kernel falls through to the shell; the default
+  ISO keeps the gated `isa-debug-exit` for boot tests.
+- **Shell test:** `scripts/test_shell_qemu.sh` (with
+  `scripts/test_shell_qemu.py`) boots the interactive ISO in QEMU with a
+  **TCP serial chardev** and types a paced session (2 ms per byte),
+  asserting each command's output and the prompt. `-serial stdio` is
+  deliberately not used: QEMU's 16550 model inserts an unthrottled host
+  burst straight into the 16-byte FIFO, which overruns before any guest can
+  wake from `hlt` — a harness artifact, not kernel behaviour. The TCP path
+  lets the host choose the delivered byte rate, like a real UART.
+
+**Alternatives considered.** Polling the UART from the reader loop (wastes
+CPU and cannot recover bytes the emulated FIFO already dropped); a larger
+hardware FIFO (not emulated by QEMU's 16550); software flow control (the guest
+cannot throttle a host pipe); running the shell as a function of the boot
+thread (discards the scheduler integration Phase 5 built); `-serial pipe` on
+this host (no pacer available on Windows).
+
+**Evidence.** Every boot prints `vfs selftest: passed (6 nodes, 3 files; ...)`
+and the marker gains `,vfs`. `scripts/test_all.sh`: 15 PASS, 0 FAIL, 4 SKIP
+(UEFI/pci/driver-model/gpu-vm) with the shell session step included.
+Interactive session: `session: 17 commands, 3900 bytes received, 0 failures`,
+`console: ... 0 overruns`; host unit suite 63 passed.
+
+**Consequences.** The OS now has a real interactive surface and a filesystem
+namespace, but the filesystem is volatile, the console is serial-only, the
+shell has no history/job control, and pasting a large burst into a QEMU stdio
+serial can still overrun the emulated FIFO (counted, not hidden). On-disk
+persistence, an ELF64 module loader and framebuffer console input are the next
+Phase 6 work.
+
+## ADR-0016 – ATA PIO block device and checkpoint persistence (Phase 6, stage 2)
+
+**Context.** Stage 1 (ADR-0015) had a volatile VFS. Phase 6 acceptance needs
+on-disk persistence verified across reboots in a VM. The register-level and
+byte-level contract lives in `docs/PERSISTENCE.md`; this ADR records the
+load-bearing choices.
+
+**Decision.**
+
+- **Driver:** classic ATA PIO on the primary PIIX channel (`0x1F0`/`0x3F6`),
+  master drive, LBA28, polled with a PIT-based 5 s deadline; no IRQ14, no DMA.
+  QEMU `q35` exposes only ICH9-AHCI and no legacy ports (R-009 in
+  `docs/RESEARCH.md`), so the persistence harness boots `-machine pc` with
+  `-drive file=...,format=raw,if=ide,index=0,media=disk`; every other QEMU
+  test stays on q35. Drive/head select is `0xE0 | lba[24:28]` (master, LBA
+  mode). An early implementation wrote `0xA0` (master, CHS mode); QEMU then
+  translated the LBA registers through the disk geometry and both slots landed
+  on wrong sectors while staying self-consistent — only byte-level inspection
+  of the image exposed it.
+- **Format:** `os_core::pofs` — one CRC32-checked header sector (magic `POFS`,
+  version, sequence number, payload length, payload CRC, header CRC) followed
+  by a length-prefixed node-record payload; host-tested with corruption,
+  truncation and trailing-byte vectors.
+- **Slots:** two fixed 1 MiB slots (A at LBA 16, B at LBA 2064 of the 8 MiB
+  test image). Boot examines both, logs and skips invalid slots, loads the
+  valid slot with the highest sequence number, or formats slot A on a fresh
+  disk. A save targets the inactive slot at seq+1, verifies the header by
+  read-back, and only then switches the active slot; a failed save keeps the
+  previous checkpoint and is retried at the next command boundary.
+- **Write-through:** the VFS sets a dirty flag on every mutation and the shell
+  loop calls `persist::flush_if_dirty()` after each command, so a mutation is
+  already on disk by the time the next prompt prints.
+- **Evidence model:** the four-boot harness corrupts a slot's payload sector
+  (header intact) so CRC rejection and fallback are proven, not assumed.
+
+**Alternatives considered.** AHCI (needs PCI + MMIO, Phase 9); virtio-blk
+(same, plus a non-ATA protocol); IRQ14/DMA (no correctness gain at polled PIO
+rates, extra machinery); a log-structured/journal store (more write
+amplification and recovery surface than a two-slot double buffer needs);
+whole-slot zeroing as the corruption test (indistinguishable from a fresh
+empty slot, so it cannot prove CRC rejection).
+
+**Evidence.** `scripts/test_persistence_qemu.sh`: four boots against one raw
+image — fresh format and first save; reboot load, then two more saves (A seq2
+/ B seq3); corruption of the newest slot's payload → `payload crc mismatch`,
+fallback to A seq2, and the file from the lost generation is gone; both slots
+corrupt → fresh format, old file gone. Host `pofs` vectors are part of the
+77-test `os_core` suite. No-disk boots remain byte-identical to stage 1
+(marker `checks=...,vfs`, `blk: no ATA device on primary channel`,
+`persist: inactive (no ATA disk)`); with a disk the marker gains `,blk,persist`.
+
+**Consequences.** The VFS survives reboots on PIIX-legacy disks. Limits
+(documented in `docs/PERSISTENCE.md`): PIIX primary-master LBA28 PIO only —
+no AHCI/virtio/DMA/IRQ; whole-tree snapshots flushed at command boundaries;
+CRC32 is integrity checking, not security; ~1.1 MiB transient heap per save;
+evidence is QEMU `-machine pc` only. AHCI, a real on-disk filesystem and
+framebuffer console input remain future work.
+
+## ADR-0017 – Native ELF64 loading of userland programs (Phase 6, stage 3)
+
+**Context.** Stage 5b (ADR-0014) demonstrated ring 3 with two inline-assembly
+fixtures embedded in the kernel image. Phase 6 stage 3 replaces them with real
+ELF64 executables built from Rust source and shipped as Limine modules. The
+full contract (parser rules, loader API, serial lines, test plan) lives in
+`docs/ELF_LOADER.md`; this ADR records the load-bearing choices and deviations.
+
+**Decision.**
+
+- **Native ET_EXEC loading, no emulation layer.** The kernel parses ELF64
+  itself (`os_core::elf`, host-tested, 19 new unit tests) and maps `PT_LOAD`
+  segments into a fresh user address space. `ET_DYN`/PIE, relocations and
+  `PT_INTERP` are rejected with named errors — no consumer exists yet and a
+  relocation engine would be unverifiable busywork.
+- **Two-phase loader API** (`loader::inspect` then `loader::map`): rejection
+  (including the deliberately corrupt `bad.elf`) happens before any frame is
+  allocated; mapping rolls back every page on failure. The code window is
+  fixed at `0x400000..0x500000` (1 MiB); the parser additionally requires
+  page-aligned segments, no W+X, non-overlapping page ranges and an entry
+  inside an executable segment.
+- **Independent `userland/` cargo workspace** (Rust, `no_std`, no external
+  crates): a shared runtime provides the `int 0x80` syscall shims and `entry`;
+  `hello` prints the exact stage-5b greeting, `fault` writes to an unmapped
+  address, and `build_user.sh` generates `bad.elf` by zeroing the magic.
+  Userland code therefore stays in Rust, consistent with the language policy,
+  and the programs are our own binaries only.
+- **Boot self-test only** (no shell `exec` builtin): the demo runs `hello`,
+  then `fault`, one at a time on scheduler threads; `bad.elf` is a runtime
+  rejection probe. The success marker gains `,elf` between `user` and `vfs`,
+  keeping the stage-2 persistence suffix `vfs,blk,persist` byte-compatible.
+- **Rustc flags for userland via `RUSTFLAGS`** (deviation): cargo joins
+  `target.*.rustflags` arrays from ancestor config files, so the root
+  `-Tkernel/linker.ld` cannot be un-set per-key; a `build.rs` relocation of the
+  kernel flags was abandoned because build-script executable paths exceed the
+  Windows 260-character `MAX_PATH` in this checkout (MSVC `LNK1104`). The
+  remaining deviations (`limine_file` size correction, `Inspection` storing
+  `Segment`s, skip-line honesty, clippy target selection) are recorded in
+  `docs/ELF_LOADER.md` §12.
+
+**Alternatives considered.** Keeping inline-assembly fixtures (rejected:
+the stage exists to prove real binaries execute); loading from the VFS
+(rejected: no on-disk exec format and the 8192-byte file cap); `ET_DYN` with a
+relocation engine (no consumer); a bootstrap `build.rs` for kernel link flags
+(blocked by `MAX_PATH`, see above); byte-granular unaligned segments (only
+consumers would be non-conforming toolchains); masking a missing module as a
+pass (rejected: the skip path prints an explicit skipped verdict and the QEMU
+ELF test fails on it).
+
+**Evidence.** `os_core` unit tests 77 → 96 (all `elf` vectors); userland
+artifacts hash-stable from a clean rebuild (`hello.elf` `f4ae1ae1...`,
+`fault.elf` `46c45ce6...`, `bad.elf` `a8bec8d1...`); `scripts/test_elf_qemu.sh`
+asserts the seven ELF serial lines and the `,elf` marker; `test_all.sh`
+PASS=18 FAIL=0 SKIP=4 (was 16; +`userland`, +`elf`), with VirtualBox and the
+four-boot persistence test unchanged.
+
+**Consequences.** The OS now runs its own ELF64 binaries loaded from the
+bootloader; a corrupt image cannot take down boot. Limits restated in
+`docs/ELF_LOADER.md` §11: no dynamic linking/PIE/ASLR, no filesystem-backed
+exec, fixed VA windows, one user thread at a time, bootloader-provided modules
+only.
+

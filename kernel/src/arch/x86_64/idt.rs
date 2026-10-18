@@ -90,6 +90,7 @@ ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
 ISR_NOERR 32
+ISR_NOERR 36
 ISR_NOERR 128
 
 isr_common:
@@ -170,6 +171,7 @@ unsafe extern "C" {
     fn isr_30();
     fn isr_31();
     fn isr_32();
+    fn isr_36();
     fn isr_128();
 }
 
@@ -243,6 +245,8 @@ pub fn init() {
         let ist = if vector == 8 { 1 } else { 0 };
         idt.0[vector] = IdtEntry::for_handler(*handler as usize as u64, ist, false);
     }
+    // COM1 receive: IRQ4 => vector 36.
+    idt.0[36] = IdtEntry::for_handler(isr_36 as *const () as usize as u64, 0, false);
     // Syscall gate: user-callable interrupt gate (DPL3) at vector 0x80.
     idt.0[128] = IdtEntry::for_handler(isr_128 as *const () as usize as u64, 0, true);
 
@@ -308,6 +312,11 @@ pub extern "C" fn exception_dispatch(frame: *mut InterruptFrame) {
             // frame layout and iretq all work.
             BREAKPOINT_HANDLED.store(true, Ordering::SeqCst);
             kprintln!("selftest: int3 exception handled (rip={:#x})", frame.rip);
+        }
+        36 => {
+            // COM1 receive (IRQ4).
+            crate::console::on_rx_interrupt();
+            pic::eoi_master();
         }
         128 => crate::syscall::dispatch(frame),
         vector => {

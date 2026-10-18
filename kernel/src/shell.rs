@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::x86_64::{pit, read_tsc};
 use crate::sync::IrqSpinLock;
-use crate::{blk, console, heap, memory, persist, sched, serial, vfs};
+use crate::{blk, console, heap, memory, net, persist, sched, serial, vfs};
 
 static BUILD_ID: IrqSpinLock<&'static str> = IrqSpinLock::new("dev");
 static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
@@ -78,6 +78,9 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
             crate::kprintln!("  vfs               re-run the VFS self-test");
             crate::kprintln!("  blk               ATA device information");
             crate::kprintln!("  persist           checkpoint image status");
+            crate::kprintln!("  net               network interface status");
+            crate::kprintln!("  ping <ip> [-c n]  ICMP echo request (default 3, max 10)");
+            crate::kprintln!("  udpecho <port>    echo one UDP datagram back to its sender");
             crate::kprintln!("  console           serial receive statistics");
             crate::kprintln!("  clear             clear the terminal");
         }
@@ -250,6 +253,12 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
                 None => crate::kprintln!("persist: inactive (no ATA disk)"),
             }
         }
+        "net" => match net::status() {
+            Some(line) => crate::kprintln!("{}", line),
+            None => crate::kprintln!("net: inactive (no supported e1000 NIC)"),
+        },
+        "ping" => net::ping(args)?,
+        "udpecho" => net::udpecho(args)?,
         "console" => {
             crate::kprintln!(
                 "console: rx ring {}/{} bytes pending, {} overruns (uart fifo or ring)",

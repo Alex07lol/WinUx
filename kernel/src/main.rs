@@ -15,12 +15,15 @@ extern crate alloc;
 mod arch;
 mod blk;
 mod console;
+mod e1000;
 mod fbcon;
 mod heap;
 mod limine;
 mod loader;
 mod memory;
+mod net;
 mod panic;
+mod pci;
 mod persist;
 mod sched;
 mod serial;
@@ -425,6 +428,14 @@ pub extern "C" fn kmain() -> ! {
         .get()
         .map(|response| response.frequency)
         .filter(|frequency| *frequency > 0);
+
+    // PCI + network bring-up (Phase 6, stage 5). Runs with interrupts enabled
+    // and the PIT ticking (before the scheduler exists), so the driver's poll
+    // deadlines are real time. Non-fatal without a supported NIC: the probe
+    // and selftest each log one pinned line and boot continues.
+    net::init(hhdm_offset, tsc_frequency);
+    net::selftest();
+
     if let Err(error) = sched::init(hhdm_offset) {
         fatal(format_args!("{}", error));
     }
@@ -496,6 +507,9 @@ pub extern "C" fn kmain() -> ! {
     }
     if persist::active() {
         checks.push_str(",persist");
+    }
+    if net::selftest_passed() {
+        checks.push_str(",net");
     }
     kprintln!("PROJECT_OS_BOOT_SUCCESS:{} checks={}", BUILD_ID, checks);
 

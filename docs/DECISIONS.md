@@ -542,3 +542,66 @@ bootloader; a corrupt image cannot take down boot. Limits restated in
 exec, fixed VA windows, one user thread at a time, bootloader-provided modules
 only.
 
+## ADR-0018 – e1000 networking: polled driver, static IPv4, host-tested codecs (Phase 6, stage 5)
+
+**Context.** Phase 6's last scope item is networking. The full contract
+(pinned serial lines, test plan, limits) lives in `docs/NETWORK.md`; the
+research record is R-012. The kernel has no interrupt-driven device framework,
+no DHCP client and no socket layer, so the stage had to prove real NIC
+operation without inventing those subsystems.
+
+**Decision.**
+
+- **One NIC: Intel 82540EM ("e1000"), found by a minimal PCI mechanism-#1
+  scan** (`0xCF8`/`0xCFC`, bus 0, first `8086:100E`), BAR0 sized by all-ones
+  write-back with immediate restore; memory-space and bus-master bits enabled.
+  No general PCI enumeration or driver model (`scripts/test_pci.sh` remains a
+  Phase 9 SKIP).
+- **Polled, interrupt-free driver** (`kernel/src/e1000.rs`): MMIO through the
+  existing 2 MiB uncached mapper, `CTRL.RST` reset, MAC from RAL/RAH with a
+  bounded EEPROM read fallback (VirtualBox), legacy 16-byte descriptors,
+  RX 32 × 2048 B with tail/head protocol, one shared 2048 B TX buffer with
+  synchronous `STA.DD` polling and PIT-deadline watchdogs (plus a spin bound
+  for waits that run with interrupts disabled inside the network lock).
+- **Static IPv4** `10.0.2.15/24`, gateway `10.0.2.2` — the QEMU slirp and
+  VirtualBox NAT defaults. No DHCP, DNS, TCP or sockets; UDP exists only as the
+  bounded `udpecho` shell fixture used by the harness.
+- **Protocol codecs and state live in host-tested `os_core`**
+  (`pci`, `net::{eth,arp,ipv4,icmp,udp}`, RFC 1071 checksums, 51 new tests);
+  the kernel side is glue, a non-fatal loopback bring-up check and shell
+  builtins (`net`, `ping`, `udpecho`).
+- **Non-fatal by design:** no NIC (`e1000e` on q35 default), bring-up failure
+  or an unanswered gateway never kills boot; the success marker appends `,net`
+  only when the ARP+ICMP selftest passed. The MAC loopback check is a separate
+  line and all three outcomes (`passed`/`unsupported`/`unexpected frame`) are
+  accepted; QEMU's model implements only PHY `BMCR` loopback, so `unsupported`
+  is the expected QEMU result (R-012, corrected during implementation).
+
+**Alternatives considered.** virtio-net (more emulation-specific surface and no
+VirtualBox equivalent; the roadmap names e1000), e1000e support (unnecessary —
+q35 and VirtualBox both accept an 82540EM), interrupt/MSI receive (no device-IRQ
+framework exists; would broaden the stage), DHCP (needs timers and a socket
+layer; static config matches both target hypervisor defaults), TCP (out of
+scope for the stage), and a blocking shared-drain poll loop outside the lock
+(chosen: the implemented per-iteration lock keeps PIT/serial interrupts
+flowing).
+
+**Evidence.** Unit tests 128 → 179 (51 new: PCI config/BAR math, codecs, ARP
+cache, rejection vectors, known checksums). `scripts/test_net_qemu.sh` PASS
+(reproduced twice): `net: e1000 at 00:02.0 bar0 0xfebc0000 size 128 KiB`,
+`net: mac 52:54:00:12:34:56`, `net selftest: passed (arp resolved, icmp echo
+reply in 0 ms)`, marker `...,vfs,net`; `net` → `tx 3 frames, rx 2 frames,
+arp 1/8 entries, errors 0`; `ping 10.0.2.2 -c 3` → 3/3 replies, `0% loss`;
+host→guest UDP echo byte-identical. `test_all.sh` PASS=20 FAIL=0 SKIP=4.
+VirtualBox 7.2.20 (82540EM NAT): NIC detected, loopback `unsupported`, gateway
+ARP unanswered in headless mode — recorded honestly, non-fatal, no claim made.
+One bring-up defect found by the harness and fixed: ICMP checksum computed
+before the payload pattern was written (NETWORK.md §11).
+
+**Consequences.** The OS now talks on a real (emulated) wire with its own
+driver and protocol code. Limits stay as documented in `docs/NETWORK.md` §10:
+polled receive (packets processed only while a command polls), static routing
+to the local subnet only, one NIC on bus 0, no TCP/DHCP/DNS, fragmented IPv4
+rejected, no RX offload. Reconsider when interrupt-driven devices (Phase 9) or
+a socket/NIC-abstraction layer exist.
+

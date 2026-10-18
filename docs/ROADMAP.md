@@ -11,7 +11,7 @@ were run and observed. No dates or completion percentages are implied.
 | 3 | physical/virtual memory, page tables, permissions | **partial (kernel-side VM manager done)** — bitmap frame allocator; kernel-owned 4-level address space with CR3 switch, map/unmap/translate, on-demand tables, W^X enforcement and guard refusals, all self-tested in QEMU/VirtualBox BIOS boots; user address spaces, guard-page and fragmentation stress tests outstanding |
 | 4 | kernel heap, slab/size classes, performance harness | **partial** — fixed 8 MiB first-fit free-list heap with global allocator, IRQ-safe locking, poisoning, double-free detection, `validate()` walk, host tests (14) and in-kernel self-test; growth, slabs per measurement and the heap benchmark harness outstanding |
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
-| 6 | VFS, storage, console/shell, persistence, networking | in progress (stages 1–4 verified) |
+| 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
@@ -106,7 +106,7 @@ no process model, handle table, or invalid-pointer fuzz corpus beyond the
 single unmapped-write case; no guard pages around the user stack; no
 `fork`/`exec`/`wait`; syscalls are console-write only.
 
-## Phase 6 acceptance (in progress)
+## Phase 6 acceptance (met for the QEMU/VirtualBox BIOS scope)
 
 Stage 1 (complete and verified): interactive serial console (IRQ4 receive ring
 with line editing), in-memory VFS with a host-tested path parser and boot
@@ -153,7 +153,30 @@ types `version`, and validates a QEMU monitor screendump
 (`artifacts/console-screendump.ppm`) against the serial geometry; VirtualBox
 BIOS logs the same self-test at 85×48. Full suite PASS=19 FAIL=0 SKIP=4.
 
-Remaining for Phase 6 acceptance: networking (staged last).
+Stage 5 (complete and verified): e1000 networking (`docs/NETWORK.md`, ADR-0018,
+research R-012). A minimal PCI mechanism-#1 scan (bus 0, `8086:100E`, BAR0
+sizing with write-back restore) feeds the 82540EM driver: MMIO through the
+uncached 2 MiB mapper, reset, MAC from RAL/RAH with a bounded EEPROM fallback,
+legacy descriptor rings (RX 32 × 2048 B, synchronous TX), polled receive and a
+non-fatal MAC loopback check. Static `10.0.2.15/24` on the slirp/NAT defaults;
+protocol codecs (Ethernet/ARP/IPv4/ICMP/UDP with RFC 1071 checksums) live in
+host-tested `os_core::net` and `os_core::pci` (unit tests 128 → 179); the shell
+gains `net`, `ping` and `udpecho`. Evidence: `scripts/test_net_qemu.sh` boots
+q35 with a pinned `model=e1000` slirp NIC and asserts the pinned `net:` lines,
+`net selftest: passed (arp resolved, icmp echo reply in ...)`, the `...,vfs,net`
+marker, `net` counters, `ping 10.0.2.2 -c 3` (3/3 replies, 0% loss) and a
+host-forwarded 19-byte UDP echo round trip (reproduced twice); full suite
+PASS=20 FAIL=0 SKIP=4. QEMU logs `net: loopback selftest: unsupported` (its
+e1000 model implements only PHY `BMCR` loopback — the design's assumption was
+corrected in R-012), and VirtualBox detected the NIC but did not answer the
+gateway ARP in the headless run; both are non-fatal and reported as observed.
+Limits: polled, static addressing, one NIC on bus 0, no TCP/DHCP/DNS/IRQ
+(`docs/NETWORK.md` §10).
+
+All five Phase 6 scope items are implemented and verified for the
+QEMU/VirtualBox BIOS scope; the limits recorded in each stage's spec still
+apply (no filesystem beyond the checkpoint image, serial-only console, polled
+e1000 with static addressing).
 
 ## Phase 7 acceptance (planned)
 

@@ -62,7 +62,8 @@ log "creating isolated VM $NAME"
 "$VBOX" createvm --name "$NAME" --ostype Other_64 --register --basefolder "$(winpath "$BASE")" >/dev/null
 VM_CREATED=1
 "$VBOX" modifyvm "$NAME" --memory 512 --cpus 1 --firmware "$FIRMWARE" \
-    --uart1 0x3F8 4 --uartmode1 file "$(winpath "$SERIAL")" >/dev/null
+    --uart1 0x3F8 4 --uartmode1 file "$(winpath "$SERIAL")" \
+    --nic1 nat --nictype1 82540EM >/dev/null
 "$VBOX" storagectl "$NAME" --name SATA --add sata --controller IntelAhci >/dev/null
 "$VBOX" storageattach "$NAME" --storagectl SATA --port 0 --device 0 \
     --type dvddrive --medium "$(winpath "$ISO")" >/dev/null

@@ -89,6 +89,9 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/vfs.rs` | in-memory arena VFS, boot self-test, dirty tracking, export/replace for checkpoints | working |
 | `kernel/src/blk.rs` | ATA PIO block device (PIIX primary master, LBA28, polled) | working (QEMU `-machine pc`) |
 | `kernel/src/persist.rs` | double-buffered checkpoint slots, CRC-verified load/save | working |
+| `kernel/src/pci.rs` | PCI config mechanism #1: bus-0 scan for the e1000 NIC, BAR0 sizing, command-register enable | working (e1000 only) |
+| `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, polled, counters | working (QEMU/VirtualBox) |
+| `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch, `ping`, `udpecho`, status | working (static config) |
 | `kernel/src/shell.rs` | serial shell builtins over kernel services | working (serial only) |
 | `kernel/src/arch/x86_64/gdt.rs` | GDT (kernel + user segments), TSS, IST1 double-fault stack | working |
 | `kernel/src/arch/x86_64/idt.rs` | exception gates, IRQ0, IRQ4, `int 0x80` gate, frame dispatcher | working |
@@ -107,6 +110,8 @@ writable, which the segment permissions above guarantee.
 | `os_core::path` | VFS path validation and component splitting | host-tested |
 | `os_core::pofs` | checkpoint header/payload encode, decode, CRC32 | host-tested |
 | `os_core::elf` | ELF64 `ET_EXEC` parser: headers, segments, W^X and overlap policy | host-tested |
+| `os_core::pci` | config-address construction, BAR decode and sizing | host-tested |
+| `os_core::net` | Ethernet/ARP/IPv4/ICMP/UDP codecs, RFC 1071 checksums, ARP cache with expiry | host-tested |
 | `os_core::font` | original 5x7 bitmap font (moved from the kernel for host tests) | host-tested |
 | `os_core::textcon` | scrolling text-grid model: byte semantics, wrap, dirty rows | host-tested |
 | `os_core::textrender` | pitch-aware glyph/cell/rect compositor for 16/24/32 bpp | host-tested |
@@ -192,8 +197,14 @@ as well (ADR-0014).
   PIIX-legacy ATA disk, flushed write-through at shell-command boundaries
   (ADR-0016). No journal, no AHCI/virtio, no DMA or IRQ14, and the disk path
   is verified on QEMU `-machine pc` only. The console and shell are
-  serial-only; there is no framebuffer console input. No PCI enumeration or
-  driver model.
+  serial-only; there is no framebuffer console input. PCI access is a
+  single-purpose config-space scan for the e1000, not a driver model
+  (ADR-0018).
+- Networking (ADR-0018, `docs/NETWORK.md`): one polled e1000 with static
+  `10.0.2.15/24` on QEMU slirp / VirtualBox NAT — no DHCP, DNS, TCP, sockets,
+  interrupts/MSI or routing beyond the local subnet; one NIC on bus 0; IPv4
+  only, fragments rejected, no reassembly; the VirtualBox NAT run detected the
+  NIC but did not answer the gateway ARP (non-fatal, reported as observed).
 - No reclaim of bootloader-reclaimable memory.
 - `IrqSpinLock` is safe to share with interrupt handlers on a single CPU; the
   plain `SpinLock` is not and must not be taken from code an interrupt handler

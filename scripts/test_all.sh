@@ -46,6 +46,7 @@ run graphics-host "$ROOT_DIR/scripts/test_graphics_host.sh"
 run virtualbox "$ROOT_DIR/scripts/test_virtualbox.sh" "$ISO_PATH" --timeout 90
 run shell "$ROOT_DIR/scripts/test_shell_qemu.sh"
 run fbcon "$ROOT_DIR/scripts/test_console_qemu.sh"
+run net "$ROOT_DIR/scripts/test_net_qemu.sh"
 run persistence "$ROOT_DIR/scripts/test_persistence_qemu.sh"
 run pci "$ROOT_DIR/scripts/test_pci.sh"
 run driver-model "$ROOT_DIR/scripts/test_driver_model.sh"

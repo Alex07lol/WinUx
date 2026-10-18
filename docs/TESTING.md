@@ -30,11 +30,11 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 
 | Command | Proves | Recorded result |
 |---|---|---|
-| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 19 PASS, 0 FAIL, 4 SKIP |
+| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 20 PASS, 0 FAIL, 4 SKIP |
 | `scripts/bootstrap.sh` | required tools and Rust target exist | PASS |
 | `scripts/format.sh` | `rustfmt --check` clean (kernel workspace and userland) | PASS |
 | `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland | PASS |
-| `scripts/test_unit.sh` | 128 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors | PASS (128/128) |
+| `scripts/test_unit.sh` | 179 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors, PCI config/BAR math, Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (179/179) |
 | `scripts/build.sh` | kernel builds; ELF entry and Limine requests verified | PASS |
 | `scripts/build_user.sh` | userland workspace builds; `hello`/`fault` pass the header checker; `bad.elf` fails with `bad magic` | PASS |
 | `scripts/make_iso.sh` | ISO built (kernel + three modules); both El Torito entries verified | PASS |
@@ -46,8 +46,9 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_shell_qemu.sh` | scripted interactive shell session over a paced TCP serial chardev | PASS (17 commands) |
 | `scripts/test_console_qemu.sh` | framebuffer console: pinned `fbcon:` lines, selftest, shell output mirror and a validated QEMU screendump | PASS (106x50 at scale 2; screendump matches) |
 | `scripts/test_persistence_qemu.sh` | four-boot durability on a raw 8 MiB disk (format/save, reboot load, CRC fallback, fresh format) | PASS (4 boots) |
+| `scripts/test_net_qemu.sh` | e1000 end-to-end on q35 with a pinned `model=e1000` slirp NIC: pinned `net:` lines, `,net` marker, `net` counters, `ping 10.0.2.2 -c 3` (3/3), host-forwarded 19-byte UDP echo round trip | PASS (reproduced twice) |
 | `scripts/test_graphics_host.sh` | framebuffer geometry/colour tests | PASS |
-| `scripts/test_virtualbox.sh` | VirtualBox BIOS boot | PASS (7.2.20; marker + 5 ticks) |
+| `scripts/test_virtualbox.sh` | VirtualBox BIOS boot with an Intel 82540EM NAT NIC attached; kernel detects the NIC (`net: e1000 at 00:03.0`), loopback `unsupported`, gateway ARP unanswered — non-fatal | PASS (7.2.20; marker + 5 ticks) |
 | `scripts/test_pci.sh` | PCI enumeration | SKIP (not implemented, Phase 9) |
 | `scripts/test_driver_model.sh` | driver lifecycle model | SKIP (not implemented, Phase 9) |
 | `scripts/test_gpu_vm.sh` | virtual GPU driver | SKIP (framebuffer only) |
@@ -226,15 +227,51 @@ Four boots against one image, each transcript kept
 The corruption step is byte-level on the image file, not another guest write,
 so it cannot be fooled by the guest's own consistency.
 
+## Network test details
+
+`scripts/test_net_qemu.sh` (driver `scripts/test_net_qemu.py`) boots the
+interactive ISO on `q35` with an explicitly pinned NIC and a user-mode network:
+
+```text
+qemu-system-x86_64 -machine q35 -m 512M -smp 1 \
+  -cdrom artifacts/project-os-interactive.iso -boot d \
+  -display none -monitor none \
+  -nic user,model=e1000,hostfwd=udp:127.0.0.1:<host_port>-:7777 \
+  -serial tcp:127.0.0.1:<port>,server=on,wait=off -no-reboot
+```
+
+`q35` is pinned because its default NIC is an unsupported e1000e; `model=e1000`
+selects the 82540EM the driver targets. The driver picks a free host UDP port
+for `hostfwd` before starting QEMU and then asserts on serial: the
+`net: e1000 at ... bar0 ... size ... KiB` line, `net: mac 52:54:00:` (slirp's
+default OUI), the IP line, a `net: loopback selftest:` line (any of the three
+documented outcomes is accepted; QEMU reports `unsupported`),
+`net selftest: passed (arp resolved, icmp echo reply in ...)` and `,net` in the
+marker. It then types `net` (status tokens including `arp 1/8 entries`),
+`ping 10.0.2.2 -c 3` (three replies and `0% loss`) and `udpecho 7777`, sends
+`PROJECT_OS-NET-TEST` (19 bytes) over UDP to the host port, and asserts the
+identical payload returns to the same socket and the guest printed
+`udpecho: echoed 19 bytes to 10.0.2.2:<port>`. Transcripts:
+`artifacts/qemu-net-session.log` and `artifacts/qemu-net.log`.
+
 ## VirtualBox
 
 `scripts/test_virtualbox.sh` **was executed here and passed** with VirtualBox
-7.2.20r175154 on the default VM profile (BIOS, 512 MiB, one CPU, PIIX3). The
-first run exposed a real kernel defect rather than a VirtualBox bug: IRQ0 was
+7.2.20r175154 on the default VM profile (BIOS, 512 MiB, one CPU, PIIX3), now
+with `--nic1 nat --nictype1 82540EM` so the kernel's e1000 probe runs there.
+The first run exposed a real kernel defect rather than a VirtualBox bug: IRQ0 was
 pending in the PIC (`IRR=0x01`, `ISR=0x00`) while IF=1, because LINT0 was
 masked and the APIC MMIO page is not part of Limine's HHDM. The kernel now maps
 that page through the live 4-level tables and configures LINT0 ExtINT; the
 serial log then shows `timer: 5 ticks observed` and the success marker.
+
+Networking in that VM is reported as observed, not claimed green: the kernel
+detected the NIC (`net: e1000 at 00:03.0 bar0 0xf0000000 size 128 KiB`, MAC
+`08:00:27:c4:5d:0a`), logged `net: loopback selftest: unsupported`, and the
+headless NAT did not answer the gateway ARP
+(`net selftest: no gateway reply (arp timeout)`). That path is non-fatal by
+design: the boot reached the unchanged marker without `,net`.
+`docs/NETWORK.md` §11 records the exact lines.
 
 The script is deliberately defensive:
 
@@ -284,3 +321,7 @@ in `progress.md` before claiming a UEFI boot.
 - VirtualBox BIOS is now verified (marker with `user` checks); VirtualBox EFI,
   UEFI/OVMF, real hardware, SMP, Windows apps and GPUs are untested or
   unimplemented and are not claimed.
+- The e1000 path is verified on QEMU slirp only. The VirtualBox run attached
+  the 82540EM NAT NIC and the kernel detected it, but the headless NAT did not
+  answer the gateway ARP within the 3 s budget; no VirtualBox network claim is
+  made (`docs/NETWORK.md` §11).

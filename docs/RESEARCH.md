@@ -375,6 +375,69 @@ per-scanline comparison, fatal on mismatch; the framing memcmp variant (whole
 contiguous buffer against a strided framebuffer) was rejected during bring-up
 because it misaligns after the first scanline.
 
+## R-012 — e1000 networking, slirp behaviour and QEMU loopback semantics
+
+**Question.** What register/descriptor model does the Intel 82540EM need for a
+minimal polled driver (reset, MAC acquisition, TX/RX legacy rings); which
+loopback mechanisms do the emulated NICs actually implement; and what does QEMU
+user-mode (slirp) networking guarantee that an automated harness can depend on?
+
+**Sources.**
+- *8254x Family of Gigabit Ethernet Controllers Software Developer's Manual*
+  (Intel, public documentation): `CTRL.RST` self-clearing reset, `RAL/RAH`,
+  `RCTL` (EN/BAM/SECRC, `LBM` bits 7:6), `TCTL` (EN/PSP/RTLC/CT/COLD), `TIPG`,
+  legacy 16-byte descriptors (`CMD.EOP/IFCS/RS`, `STA.DD`), RX tail/head
+  protocol, EEPROM read via `EERD`.
+- QEMU source `hw/net/e1000.c` (qemu master, read 2026-10-18):
+  `e1000_send_packet` loops a frame back to the receive path only when the PHY
+  register `MII_BMCR_LOOPBACK` is set; RCTL `LBM` writes are stored but never
+  acted on. This corrects the design-time assumption in `docs/NETWORK.md` §2.
+- QEMU system-emulation documentation for slirp: guest `10.0.2.15/24`, gateway
+  and host `10.0.2.2`, ARP answering for the gateway, ICMP echo to it, and
+  `hostfwd=udp:127.0.0.1:<port>-:7777` forwarding host datagrams to a guest
+  port.
+- OSDev wiki 8254x page: VirtualBox does not implement `EERD`; a 4-wire EEPROM
+  clock fallback is needed for MAC reads there.
+- PCI Local Bus Specification 3.0: mechanism #1 config access (`0xCF8`/`0xCFC`),
+  BAR sizing by all-ones write-back with restore.
+
+**Claim.** A polled driver over legacy descriptors is sufficient for a bring-up
+stack (`RCTL = EN | BAM | SECRC`, `TCTL = EN | PSP | CT | COLD | RTLC`,
+synchronous TX with `STA.DD` polling, RX tail advance after copy). QEMU
+auto-loads the MAC into `RAL/RAH` at reset; VirtualBox needs the EEPROM
+fallback. Slirp answers ARP for the gateway and echoes ICMP locally, so a
+harness can prove ARP + ICMP + UDP end to end with no external network.
+Confidence high for the SDM-derived register model and slirp behaviour (observed
+end to end); the loopback claim is settled by source inspection: emulated e1000
+does **not** honour `RCTL.LBM`, so the loopback selftest legitimately reports
+`unsupported` on both QEMU and VirtualBox.
+
+**Experiment.** PASSED (QEMU 11.1.0, `q35`, pinned `-nic
+user,model=e1000,hostfwd=udp:...`, 2026-10-18; `scripts/test_net_qemu.sh`).
+Observed boot lines: `net: e1000 at 00:02.0 bar0 0xfebc0000 size 128 KiB`,
+`net: mac 52:54:00:12:34:56`, `net: ip 10.0.2.15/24 gw 10.0.2.2`,
+`net: loopback selftest: unsupported`,
+`net selftest: passed (arp resolved, icmp echo reply in 0 ms)`, marker
+`...,vfs,net`. Shell: `net` reported `tx 3 frames, rx 2 frames, arp 1/8
+entries, errors 0`; `ping 10.0.2.2 -c 3` → three `ttl=255` replies, `0% loss`;
+a host-forwarded 19-byte UDP datagram was echoed back byte-for-byte
+(`udpecho: echoed 19 bytes to 10.0.2.2:<port>`). VirtualBox 7.2.20 with
+`--nic1 nat --nictype1 82540EM`: NIC detected (`00:03.0`, MAC
+`08:00:27:c4:5d:0a`) but the headless NAT did not answer the gateway ARP
+(`net selftest: no gateway reply (arp timeout)`), non-fatal. A bring-up defect
+was also exposed and fixed: the ICMP echo request/reply paths wrote the payload
+after the checksum had been computed, so checksums never matched the wire
+(details in `docs/NETWORK.md` §11).
+
+**Conclusion.** Confirmed and implemented: `os_core::pci` + `os_core::net`
+(host-tested, 128 → 179 unit tests), `kernel/src/pci.rs`,
+`kernel/src/e1000.rs` (MMIO reset, RAL/RAH with EEPROM fallback, legacy rings,
+polled RX/TX, non-fatal loopback check), `kernel/src/net.rs` (ARP cache,
+IPv4/ICMP/UDP dispatch, `ping`, `udpecho`), shell builtins, and the q35 harness
+step in `test_all.sh`. Recorded as ADR-0018; the corrected loopback finding is
+also noted in `docs/NETWORK.md` §2 and §11. Limits (polled, static addressing,
+one NIC, no TCP/DHCP/IRQ) stay as stated in `docs/NETWORK.md` §10.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

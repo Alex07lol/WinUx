@@ -105,6 +105,23 @@ impl<T> IrqSpinLock<T> {
         }
         IrqSpinLockGuard { lock: self, flags }
     }
+
+    /// Attempt the lock without spinning. Returns `None` when the lock is held
+    /// (including by the caller itself), restoring interrupts immediately.
+    /// Used for best-effort work that must never deadlock, such as mirroring
+    /// panic output to the screen while the console lock may already be held.
+    pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
+        let flags = interrupts_save_disable();
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            interrupts_restore(flags);
+            return None;
+        }
+        Some(IrqSpinLockGuard { lock: self, flags })
+    }
 }
 
 pub struct IrqSpinLockGuard<'a, T> {

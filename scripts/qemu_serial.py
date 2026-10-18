@@ -39,15 +39,32 @@ def fail(message, transcript):
 class QemuSerialSession:
     """A running QEMU instance plus its paced TCP serial connection."""
 
-    def __init__(self, qemu, iso, session_log, qemu_log, machine="q35", extra_args=()):
+    def __init__(
+        self,
+        qemu,
+        iso,
+        session_log,
+        qemu_log,
+        machine="q35",
+        extra_args=(),
+        monitor_port=None,
+        serial_wait=False,
+    ):
         self.session_log = session_log
         self.data = bytearray()
         self.sock = None
+        self.monitor_port = monitor_port
 
         probe = socket.socket()
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
         probe.close()
+
+        monitor = (
+            "tcp:127.0.0.1:%d,server=on,wait=off" % monitor_port
+            if monitor_port
+            else "none"
+        )
 
         self.qemu_out = open(qemu_log, "wb")
         self.process = subprocess.Popen(
@@ -59,8 +76,10 @@ class QemuSerialSession:
                 "-cdrom", iso,
                 "-boot", "d",
                 "-display", "none",
-                "-monitor", "none",
-                "-serial", "tcp:127.0.0.1:%d,server=on,wait=off" % port,
+                "-monitor", monitor,
+                "-serial",
+                "tcp:127.0.0.1:%d,server=on,wait=%s"
+                % (port, "on" if serial_wait else "off"),
                 "-no-reboot",
             ]
             + list(extra_args),
@@ -149,3 +168,43 @@ class QemuSerialSession:
             self.sock.close()
             self.sock = None
         return status
+
+    def screendump(self, path, timeout=10.0):
+        """Ask the QEMU monitor to write a PPM screenshot, then quit QEMU.
+
+        The monitor is only enabled when the session was created with
+        `monitor_port`. HMP file names are sent with forward slashes so the
+        command parser cannot treat backslashes as escapes.
+        """
+        if not self.monitor_port:
+            raise RuntimeError("screendump requires monitor_port when creating the session")
+        monitor = socket.create_connection(
+            ("127.0.0.1", self.monitor_port), timeout=CONNECT_TIMEOUT
+        )
+        try:
+            monitor.settimeout(1.0)
+            if not self._wait_for_monitor_prompt(monitor, timeout):
+                raise RuntimeError("QEMU monitor prompt not seen")
+            command = "screendump %s\n" % str(path).replace("\\", "/")
+            monitor.sendall(command.encode())
+            if not self._wait_for_monitor_prompt(monitor, timeout):
+                raise RuntimeError("screendump was not acknowledged")
+            monitor.sendall(b"quit\n")
+        finally:
+            monitor.close()
+
+    def _wait_for_monitor_prompt(self, sock, timeout):
+        deadline = time.monotonic() + timeout
+        received = bytearray()
+        while time.monotonic() < deadline:
+            sock.settimeout(0.2)
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                return False
+            received.extend(chunk)
+            if b"(qemu)" in received:
+                return True
+        return False

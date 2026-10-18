@@ -333,6 +333,48 @@ tests), `kernel/src/loader.rs` (two-phase inspect/map), `userland/` workspace;
 recorded as ADR-0017 with the config-merge and MAX_PATH deviations in
 `docs/ELF_LOADER.md` §12.
 
+## R-011 — Framebuffer readback and write-combining ordering
+
+**Question.** Can the kernel read back what it wrote to the Limine linear
+framebuffer and compare it byte-for-byte with a software re-render, and which
+memory-ordering instruction makes that comparison valid if the mapping is
+write-combining (WC)?
+
+**Sources.**
+- Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 3A,
+  §11.3 "Methods of Caching Available" / WC memory ordering: partially filled
+  WC buffers are flushed by a serializing event such as `SFENCE` or `MFENCE`
+  (accessed 2026-10-18 via the 2007 Intel "64 Architecture Memory Ordering"
+  white paper and Intel community quotations of §11.3).
+- Intel application note 244422, write-combining implementation guidelines
+  (fetch/read-back rules around WC memory), accessed 2026-10-18.
+- Limine protocol framebuffer response: the framebuffer is described by
+  `address`, `width`, `height`, `pitch`, `bpp` and memory model; Limine maps it
+  readable/writable and the address has the HHDM offset pre-applied
+  (`limine-protocol` PROTOCOL.md, pinned Limine 12.9.3).
+
+**Claim.** Under the bootloader-provided mapping, plain stores followed by
+ordinary loads observe prior writes; if a platform maps the framebuffer WC, an
+`SFENCE` before the read-back orders the flushed WC buffers against subsequent
+reads. Pixel stores need no fence themselves (only the read-back self-test
+does). Confidence high for the fence requirement, medium that QEMU/VirtualBox
+mappings are WB (the experiment disambiguates empirically, not by assumption).
+
+**Experiment.** PASSED (QEMU 11.1.0 std VGA, 1280×800, pitch 5120; VirtualBox
+7.2.20 VBoxVGA, 1024×768, pitch 4096; 2026-10-18). The kernel re-renders the
+whole grid plus cursor into a heap scratch buffer, executes `sfence`, and
+compares scanline by scanline against the framebuffer: serial logs
+`fbcon selftest: passed (4070400 bytes match after 1059 redraws)` in QEMU and
+`fbcon selftest: passed (3133440 bytes match after 1088 redraws)` in VirtualBox.
+A QEMU monitor `screendump` (`artifacts/console-screendump.ppm`) independently
+shows the text on the scanout.
+
+**Conclusion.** Confirmed and implemented: `arch::x86_64::sfence()` with the
+SDM citation, `fbcon::verify()` doing the scratch re-render and pitch-aware
+per-scanline comparison, fatal on mismatch; the framing memcmp variant (whole
+contiguous buffer against a strided framebuffer) was rejected during bring-up
+because it misaligns after the first scanline.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

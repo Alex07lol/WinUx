@@ -17,7 +17,7 @@ _start (kernel/src/entry.S)
         |  align stack, clear direction flag, call kmain
         v
 kmain (kernel/src/main.rs)
-        |  serial -> handoff validation -> framebuffer dashboard
+        |  serial -> handoff validation -> framebuffer log console mirror
         |  memory map -> frame allocator self-test
         |  GDT/TSS/IST -> IDT -> int3 self-test
         |  PIC remap -> PIT 100 Hz -> 5 ticks
@@ -76,9 +76,8 @@ writable, which the segment permissions above guarantee.
 |---|---|---|
 | `kernel/src/entry.S` | stack alignment, call into Rust | working |
 | `kernel/src/limine.rs` | protocol structs, request block, module request + `module_by_path`, string access | working |
-| `kernel/src/serial.rs` | COM1 115200 8N1, locked logging, lock-free panic path, RX status/byte helpers | working |
-| `kernel/src/display.rs` | validated framebuffer drawing and dashboard | working (boot framebuffer only) |
-| `kernel/src/font.rs` | original 5x7 bitmap font | working |
+| `kernel/src/serial.rs` | COM1 115200 8N1, locked logging, lock-free panic path, RX helpers, framebuffer-console tap | working |
+| `kernel/src/fbcon.rs` | framebuffer log console: sizing, dirty-row repaint, cursor overlay, readback self-test | working (boot framebuffer only) |
 | `kernel/src/memory.rs` | usable-RAM-only bitmap frame allocator, stats, self-test | working |
 | `kernel/src/heap.rs` | fixed 8 MiB kernel heap, `#[global_allocator]`, stats/validate | working |
 | `kernel/src/vm.rs` | own 4-level PML4, map/unmap/translate, W^X, user-half teardown | working |
@@ -108,6 +107,9 @@ writable, which the segment permissions above guarantee.
 | `os_core::path` | VFS path validation and component splitting | host-tested |
 | `os_core::pofs` | checkpoint header/payload encode, decode, CRC32 | host-tested |
 | `os_core::elf` | ELF64 `ET_EXEC` parser: headers, segments, W^X and overlap policy | host-tested |
+| `os_core::font` | original 5x7 bitmap font (moved from the kernel for host tests) | host-tested |
+| `os_core::textcon` | scrolling text-grid model: byte semantics, wrap, dirty rows | host-tested |
+| `os_core::textrender` | pitch-aware glyph/cell/rect compositor for 16/24/32 bpp | host-tested |
 | `os_core::paging` | 4-level index/entry math and MMIO flags | host-tested |
 | `os_core::rng` | deterministic PRNG for tests/benchmarks | host-tested |
 
@@ -170,7 +172,7 @@ as well (ADR-0014).
 - `kernel` may depend on `os_core`; `os_core` must not depend on `kernel`.
 - Architecture-specific code stays under `kernel/src/arch/x86_64`; generic kernel
   policy belongs above it.
-- The framebuffer dashboard is a debugging/UI aid, not a graphics driver. No GPU
+- The framebuffer log console is a debugging/UI aid, not a graphics driver. No GPU
   acceleration, command submission or display-driver interface exists.
 - No Windows/NT compatibility code is present yet. `docs/WINDOWS_COMPATIBILITY.md`
   describes the intended path.

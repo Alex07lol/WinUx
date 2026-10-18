@@ -30,11 +30,11 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 
 | Command | Proves | Recorded result |
 |---|---|---|
-| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 18 PASS, 0 FAIL, 4 SKIP |
+| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 19 PASS, 0 FAIL, 4 SKIP |
 | `scripts/bootstrap.sh` | required tools and Rust target exist | PASS |
 | `scripts/format.sh` | `rustfmt --check` clean (kernel workspace and userland) | PASS |
 | `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland | PASS |
-| `scripts/test_unit.sh` | 96 host tests: memmap, framebuffer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors | PASS (96/96) |
+| `scripts/test_unit.sh` | 128 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors | PASS (128/128) |
 | `scripts/build.sh` | kernel builds; ELF entry and Limine requests verified | PASS |
 | `scripts/build_user.sh` | userland workspace builds; `hello`/`fault` pass the header checker; `bad.elf` fails with `bad magic` | PASS |
 | `scripts/make_iso.sh` | ISO built (kernel + three modules); both El Torito entries verified | PASS |
@@ -44,6 +44,7 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_memory.sh` | allocator host tests + in-VM allocator self-test | PASS (both) |
 | `scripts/test_vfs.sh` | host path tests + in-VM VFS self-test | PASS (both) |
 | `scripts/test_shell_qemu.sh` | scripted interactive shell session over a paced TCP serial chardev | PASS (17 commands) |
+| `scripts/test_console_qemu.sh` | framebuffer console: pinned `fbcon:` lines, selftest, shell output mirror and a validated QEMU screendump | PASS (106x50 at scale 2; screendump matches) |
 | `scripts/test_persistence_qemu.sh` | four-boot durability on a raw 8 MiB disk (format/save, reboot load, CRC fallback, fresh format) | PASS (4 boots) |
 | `scripts/test_graphics_host.sh` | framebuffer geometry/colour tests | PASS |
 | `scripts/test_virtualbox.sh` | VirtualBox BIOS boot | PASS (7.2.20; marker + 5 ticks) |
@@ -123,6 +124,11 @@ and the kernel idles, so the same ISO can be booted manually.
     from CPL3; `fault.elf` produces one isolated user page fault that kills
     only the user thread.
 14. VFS self-test: create/read/append/overwrite/remove/list and the error paths.
+15. Framebuffer console self-test: the whole grid plus cursor is re-rendered in
+    host-testable code, `sfence` is executed, and the framebuffer bytes are read
+    back and compared scanline by scanline; any mismatch is a `PROJECT_OS_FATAL`.
+    The console also logs its activation line (`fbcon: enabled ...` or the
+    disabled line) right after framebuffer validation.
 
 After the timer is verified, the kernel probes the PIIX primary master
 (`blk`), then loads the best checkpoint slot or formats a fresh disk
@@ -159,6 +165,35 @@ regardless of guest correctness (the kernel counts real overruns via LSR bit
 harness pick the delivery rate, which is what a real serial line or a human
 at a terminal produces. A large paste into a stdio serial can still overrun;
 that limitation is emulation-side and documented, not hidden.
+
+## Framebuffer console test details
+
+`scripts/test_console_qemu.sh` (driver `scripts/test_console_qemu.py`,
+checker `scripts/check_screendump.py`) boots the interactive ISO on `q35` with
+two TCP chardevs and a different serial mode than the shell test:
+
+```text
+qemu-system-x86_64 -machine q35 -m 512M -smp 1 \
+  -cdrom artifacts/project-os-interactive.iso -boot d \
+  -display none -monitor tcp:127.0.0.1:<monitor>,server=on,wait=off \
+  -serial tcp:127.0.0.1:<port>,server=on,wait=on -no-reboot
+```
+
+`wait=on` holds the guest until the harness has connected, so the transcript
+includes the early `framebuffer:`/`fbcon:` lines (with `wait=off` QEMU drops
+serial bytes emitted before the client connects). The driver asserts the
+`fbcon: enabled {cols}x{rows} cells at scale {scale}` line, the
+`fbcon selftest: passed (...)` line and the boot marker, waits for the shell,
+types `version` (its output must appear on the same serial stream that feeds the
+mirror), then asks the monitor for `screendump
+artifacts/console-screendump.ppm`. The checker parses the PPM, requires its
+dimensions to match the serial `framebuffer:` line, requires at least 500
+foreground pixels inside the grid rectangle from the `fbcon:` line, and
+requires every pixel outside that rectangle to be the pinned background
+colour. The byte-exact screen assertion is the kernel's own readback
+self-test; the screendump proves the scanout content is a real screen and is
+kept as an artifact. VirtualBox BIOS boots run the same self-test at
+1024×768 (85×48 cells at scale 2).
 
 ## Persistence test details
 

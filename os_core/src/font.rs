@@ -3,7 +3,8 @@
 //! seven rows of five bits; bit 4 is the leftmost pixel.
 //!
 //! This font is part of the project source and carries the repository licence;
-//! no third-party font data is embedded.
+//! no third-party font data is embedded. It lives in `os_core` so the
+//! framebuffer console renderer can be exercised on the host.
 
 pub const GLYPH_WIDTH: u64 = 5;
 pub const GLYPH_HEIGHT: u64 = 7;
@@ -96,5 +97,52 @@ pub fn text_width(text: &str, scale: u64) -> u64 {
         0
     } else {
         count * CELL_WIDTH * scale - scale
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_shape_is_fixed() {
+        assert_eq!(FONT.len(), 64);
+        assert_eq!(FONT[0].len(), 7);
+        assert_eq!(GLYPH_WIDTH, 5);
+        assert_eq!(GLYPH_HEIGHT, 7);
+        assert_eq!(CELL_WIDTH, 6);
+    }
+
+    #[test]
+    fn bit_four_is_the_leftmost_pixel() {
+        let t = glyph(b'T');
+        assert_eq!(t[0], 0b11111);
+        assert_eq!(t[1], 0b00100);
+        let l = glyph(b'L');
+        assert_eq!(l[0], 0b10000);
+        assert_eq!(l[5], 0b10000);
+        assert_eq!(l[6], 0b11111);
+    }
+
+    #[test]
+    fn lowercase_folds_to_uppercase() {
+        assert_eq!(glyph(b'a'), glyph(b'A'));
+        assert_eq!(glyph(b'z'), glyph(b'Z'));
+    }
+
+    #[test]
+    fn unknown_bytes_render_as_space() {
+        assert_eq!(glyph(0x00), glyph(b' '));
+        assert_eq!(glyph(0x7f), glyph(b' '));
+        assert_eq!(glyph(b'{'), glyph(b' '));
+        assert_eq!(glyph(0xff), glyph(b' '));
+    }
+
+    #[test]
+    fn width_counts_cells_without_trailing_gap() {
+        assert_eq!(text_width("", 1), 0);
+        assert_eq!(text_width("A", 1), 5);
+        assert_eq!(text_width("AB", 1), 11);
+        assert_eq!(text_width("AB", 2), 22);
     }
 }

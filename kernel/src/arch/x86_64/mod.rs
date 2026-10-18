@@ -44,6 +44,15 @@ pub fn halt() {
     unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Serialise prior stores. Used before reading back framebuffer bytes that
+/// this CPU wrote through a possibly write-combining mapping: Intel SDM
+/// Vol 3A states write-combining buffers are flushed by a serialising
+/// instruction such as `sfence` (docs/RESEARCH.md R-011).
+pub fn sfence() {
+    // SAFETY: `sfence` is valid in ring 0 and has no memory operands.
+    unsafe { asm!("sfence", options(nomem, nostack, preserves_flags)) };
+}
+
 pub fn read_cr2() -> u64 {
     let value: u64;
     // SAFETY: CR2 is readable in ring 0.

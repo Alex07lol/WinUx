@@ -15,8 +15,7 @@ extern crate alloc;
 mod arch;
 mod blk;
 mod console;
-mod display;
-mod font;
+mod fbcon;
 mod heap;
 mod limine;
 mod loader;
@@ -37,7 +36,6 @@ use core::sync::atomic::Ordering;
 
 use alloc::string::String;
 
-use display::{BootDisplay, FramesInfo, Status};
 use os_core::fb::{FramebufferGeometry, PixelFormat};
 use os_core::memmap::{self, MemoryRegion, MemoryType};
 
@@ -52,13 +50,10 @@ const BUILD_ID: &str = match option_env!("PROJECT_OS_BUILD_ID") {
 };
 const MAX_REGIONS: usize = 256;
 
-fn fatal(display: Option<&mut BootDisplay>, args: core::fmt::Arguments<'_>) -> ! {
+fn fatal(args: core::fmt::Arguments<'_>) -> ! {
     serial::force_write_str("\r\nPROJECT_OS_FATAL: ");
     serial::force_print(args);
     serial::force_write_str("\r\n");
-    if let Some(display) = display {
-        display.fail(args);
-    }
     arch::halt_forever()
 }
 
@@ -81,29 +76,20 @@ fn paging_name(mode: u64) -> &'static str {
 
 /// Copy the bootloader memory map into kernel-owned storage. Bootloader
 /// responses live in reclaimable memory, so the kernel keeps its own copy.
-fn load_memory_map(display: &mut BootDisplay) -> ([MemoryRegion; MAX_REGIONS], usize) {
+fn load_memory_map() -> ([MemoryRegion; MAX_REGIONS], usize) {
     let mut regions = [MemoryRegion::new(0, 0, MemoryType::Reserved); MAX_REGIONS];
     let request = &limine::get().memmap;
     let Some(response) = request.get() else {
-        fatal(
-            Some(display),
-            format_args!("bootloader did not provide a memory map"),
-        );
+        fatal(format_args!("bootloader did not provide a memory map"));
     };
     if response.entries.is_null() {
-        fatal(
-            Some(display),
-            format_args!("memory map entry array is null"),
-        );
+        fatal(format_args!("memory map entry array is null"));
     }
     if response.entry_count > MAX_REGIONS as u64 {
-        fatal(
-            Some(display),
-            format_args!(
-                "memory map has {} entries, kernel supports at most {}",
-                response.entry_count, MAX_REGIONS
-            ),
-        );
+        fatal(format_args!(
+            "memory map has {} entries, kernel supports at most {}",
+            response.entry_count, MAX_REGIONS
+        ));
     }
 
     let mut count = 0usize;
@@ -226,13 +212,10 @@ pub extern "C" fn kmain() -> ! {
         ),
     }
     if !limine::base_revision_supported() {
-        fatal(
-            None,
-            format_args!(
-                "bootloader does not support Limine base revision {}",
-                os_core::LIMINE_BASE_REVISION
-            ),
-        );
+        fatal(format_args!(
+            "bootloader does not support Limine base revision {}",
+            os_core::LIMINE_BASE_REVISION
+        ));
     }
 
     let (bootloader_name, bootloader_version) = limine::get()
@@ -258,10 +241,7 @@ pub extern "C" fn kmain() -> ! {
 
     let hhdm_offset = match limine::get().hhdm.get() {
         Some(response) => response.offset,
-        None => fatal(
-            None,
-            format_args!("bootloader did not provide the HHDM offset"),
-        ),
+        None => fatal(format_args!("bootloader did not provide the HHDM offset")),
     };
     kprintln!("hhdm: {:#018x}", hhdm_offset);
 
@@ -284,10 +264,7 @@ pub extern "C" fn kmain() -> ! {
     let framebuffer = match framebuffer {
         Some((geometry, address)) => match geometry.validate() {
             Ok(()) => Some((geometry, address)),
-            Err(error) => fatal(
-                None,
-                format_args!("framebuffer geometry rejected: {:?}", error),
-            ),
+            Err(error) => fatal(format_args!("framebuffer geometry rejected: {:?}", error)),
         },
         None => None,
     };
@@ -304,69 +281,29 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("framebuffer: not available; serial-only boot");
     }
 
-    let mut display = BootDisplay::new(framebuffer, BUILD_ID);
-
-    if let Some((geometry, _)) = framebuffer {
-        display.set_row(
-            3,
-            format_args!(
-                "{}x{}x{}",
-                geometry.width, geometry.height, geometry.format.bpp
-            ),
-            Status::Ok,
-        );
-    } else {
-        display.set_row(3, format_args!("not available"), Status::Warn);
+    match fbcon::init(framebuffer) {
+        Some((cols, rows, scale)) => {
+            kprintln!("fbcon: enabled {}x{} cells at scale {}", cols, rows, scale)
+        }
+        None => kprintln!("fbcon: no framebuffer; screen console disabled"),
     }
-    match loaded_revision {
-        Some(revision) => display.set_row(
-            0,
-            format_args!(
-                "{} {} | revision {}",
-                bootloader_name, bootloader_version, revision
-            ),
-            Status::Ok,
-        ),
-        None => display.set_row(
-            0,
-            format_args!("{} | revision unknown", bootloader_name),
-            Status::Ok,
-        ),
-    }
-    display.set_row(1, format_args!("{}", firmware), Status::Ok);
-    display.set_row(2, format_args!("{}", paging), Status::Ok);
 
-    let (regions, region_count) = load_memory_map(&mut display);
+    let (regions, region_count) = load_memory_map();
     if !memmap::is_sorted_by_base(&regions[..region_count]) {
-        fatal(
-            Some(&mut display),
-            format_args!("memory map is not sorted by base address"),
-        );
+        fatal(format_args!("memory map is not sorted by base address"));
     }
     if !memmap::usable_regions_do_not_overlap(&regions[..region_count]) {
-        fatal(
-            Some(&mut display),
-            format_args!("usable memory-map regions overlap"),
-        );
+        fatal(format_args!("usable memory-map regions overlap"));
     }
     let summary = memmap::summarize(regions[..region_count].iter().copied());
     if summary.overflowed {
-        fatal(
-            Some(&mut display),
-            format_args!("memory map address arithmetic overflowed"),
-        );
+        fatal(format_args!("memory map address arithmetic overflowed"));
     }
     if summary.usable_bytes == 0 {
-        fatal(
-            Some(&mut display),
-            format_args!("memory map reports no usable RAM"),
-        );
+        fatal(format_args!("memory map reports no usable RAM"));
     }
     if summary.unaligned_usable_regions != 0 {
-        fatal(
-            Some(&mut display),
-            format_args!("memory map contains unaligned usable regions"),
-        );
+        fatal(format_args!("memory map contains unaligned usable regions"));
     }
     kprintln!(
         "memory map: {} entries, {} MiB usable, {} MiB framebuffer, {} MiB bootloader-reclaimable, highest end {:#x}",
@@ -386,20 +323,9 @@ pub extern "C" fn kmain() -> ! {
             region.length / 1024
         );
     }
-    display.set_row(
-        4,
-        format_args!(
-            "{} regions | {} MiB usable",
-            summary.entries,
-            summary.usable_bytes / (1024 * 1024)
-        ),
-        Status::Ok,
-    );
-    display.set_memory(&summary);
-
     let allocator_stats = match memory::init(&regions[..region_count]) {
         Ok(stats) => stats,
-        Err(error) => fatal(Some(&mut display), format_args!("{}", error)),
+        Err(error) => fatal(format_args!("{}", error)),
     };
     kprintln!(
         "frame allocator: {} free / {} frames ({} MiB managed), largest run {} frames",
@@ -410,14 +336,11 @@ pub extern "C" fn kmain() -> ! {
     );
     match memory::self_test(hhdm_offset) {
         Ok(_) => kprintln!("frame allocator selftest: passed"),
-        Err(error) => fatal(
-            Some(&mut display),
-            format_args!("frame allocator selftest failed: {}", error),
-        ),
+        Err(error) => fatal(format_args!("frame allocator selftest failed: {}", error)),
     }
     let heap_stats = match heap::init(hhdm_offset) {
         Ok(stats) => stats,
-        Err(error) => fatal(Some(&mut display), format_args!("{}", error)),
+        Err(error) => fatal(format_args!("{}", error)),
     };
     kprintln!(
         "kernel heap: {} KiB region, {} KiB free, {} blocks, largest {} B",
@@ -428,14 +351,11 @@ pub extern "C" fn kmain() -> ! {
     );
     match heap::self_test() {
         Ok(_) => kprintln!("kernel heap selftest: passed (box, vec growth, 1 MiB block)"),
-        Err(error) => fatal(
-            Some(&mut display),
-            format_args!("kernel heap selftest failed: {}", error),
-        ),
+        Err(error) => fatal(format_args!("kernel heap selftest failed: {}", error)),
     }
 
     if let Err(error) = vm::init(hhdm_offset) {
-        fatal(Some(&mut display), format_args!("{}", error));
+        fatal(format_args!("{}", error));
     }
     kprintln!(
         "vm: kernel-owned 4-level tables active (CR3 {:#x}), W^X enforced",
@@ -444,7 +364,7 @@ pub extern "C" fn kmain() -> ! {
     kprintln!("vm selftest: passed (map/unmap, translate, W^X, guard refusals, CR3 swap)");
 
     if let Err(error) = vfs::init() {
-        fatal(Some(&mut display), format_args!("{}", error));
+        fatal(format_args!("{}", error));
     }
     match vfs::self_test() {
         Ok((nodes, files)) => kprintln!(
@@ -452,26 +372,8 @@ pub extern "C" fn kmain() -> ! {
             nodes,
             files
         ),
-        Err(error) => fatal(
-            Some(&mut display),
-            format_args!("vfs selftest failed: {}", error),
-        ),
+        Err(error) => fatal(format_args!("vfs selftest failed: {}", error)),
     }
-    display.set_frames(FramesInfo {
-        free_frames: allocator_stats.free_frames as u64,
-        total_frames: allocator_stats.total_frames as u64,
-        largest_free_run: allocator_stats.largest_free_run as u64,
-    });
-    display.set_row(
-        5,
-        format_args!(
-            "{} / {} frames | heap {} KiB",
-            allocator_stats.free_frames,
-            allocator_stats.total_frames,
-            heap_stats.free_bytes / 1024
-        ),
-        Status::Ok,
-    );
 
     arch::x86_64::gdt::init();
     kprintln!("gdt: loaded (kernel code/data, TSS, IST1 double-fault stack)");
@@ -483,13 +385,9 @@ pub extern "C" fn kmain() -> ! {
     // SAFETY: INT3 is handled by the installed vector-3 gate.
     unsafe { asm!("int3", options(nomem, nostack)) };
     if !idt::BREAKPOINT_HANDLED.load(Ordering::SeqCst) {
-        fatal(
-            Some(&mut display),
-            format_args!("int3 self-test did not reach the handler"),
-        );
+        fatal(format_args!("int3 self-test did not reach the handler"));
     }
     kprintln!("exception selftest: passed");
-    display.set_row(6, format_args!("IDT | TSS/IST1 | INT3"), Status::Ok);
 
     pic::remap_and_mask_all();
     pit::init();
@@ -508,21 +406,12 @@ pub extern "C" fn kmain() -> ! {
     kprintln!("console: COM1 receive interrupt enabled (IRQ4)");
 
     if !wait_for_ticks(5) {
-        fatal(
-            Some(&mut display),
-            format_args!(
-                "timer did not deliver 5 interrupts (observed {})",
-                pit::ticks()
-            ),
-        );
+        fatal(format_args!(
+            "timer did not deliver 5 interrupts (observed {})",
+            pit::ticks()
+        ));
     }
     kprintln!("timer: {} ticks observed", pit::ticks());
-    display.set_timer(pit::effective_hz(), pit::ticks());
-    display.set_row(
-        7,
-        format_args!("PIT {} Hz | {} ticks", pit::effective_hz(), pit::ticks()),
-        Status::Ok,
-    );
 
     // Block-device probe. Runs after the PIT is ticking so poll deadlines are
     // real time; machines without the PIIX legacy IDE ports (e.g. q35) simply
@@ -537,7 +426,7 @@ pub extern "C" fn kmain() -> ! {
         .map(|response| response.frequency)
         .filter(|frequency| *frequency > 0);
     if let Err(error) = sched::init(hhdm_offset) {
-        fatal(Some(&mut display), format_args!("{}", error));
+        fatal(format_args!("{}", error));
     }
     match sched::demo(tsc_frequency) {
         Ok(report) => kprintln!(
@@ -550,10 +439,7 @@ pub extern "C" fn kmain() -> ! {
             report.stats.preemptions,
             report.stats.live
         ),
-        Err(error) => fatal(
-            Some(&mut display),
-            format_args!("scheduler selftest failed: {}", error),
-        ),
+        Err(error) => fatal(format_args!("scheduler selftest failed: {}", error)),
     }
     kprintln!("sched selftest: passed (round-robin yield + timer preemption)");
 
@@ -576,13 +462,29 @@ pub extern "C" fn kmain() -> ! {
             }
             report
         }
-        Err(error) => fatal(
-            Some(&mut display),
-            format_args!("user-mode selftest failed: {}", error),
-        ),
+        Err(error) => fatal(format_args!("user-mode selftest failed: {}", error)),
     };
 
-    display.success();
+    match fbcon::selftest() {
+        fbcon::Selftest::Passed { compared, redraws } => kprintln!(
+            "fbcon selftest: passed ({} bytes match after {} redraws)",
+            compared,
+            redraws
+        ),
+        fbcon::Selftest::Skipped => kprintln!("fbcon selftest: skipped (no framebuffer)"),
+        fbcon::Selftest::Failed {
+            compared,
+            mismatched,
+            first_row,
+            first_offset,
+            expected,
+            actual,
+        } => fatal(format_args!(
+            "fbcon selftest failed: {} of {} bytes mismatched, first at row {} offset {} (expected {:#04x}, actual {:#04x})",
+            mismatched, compared, first_row, first_offset, expected, actual
+        )),
+    }
+
     let mut checks =
         String::from("handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user");
     if user_report.elf {
@@ -609,10 +511,7 @@ pub extern "C" fn kmain() -> ! {
     // reaches this code.
     shell::configure(BUILD_ID, tsc_frequency);
     if let Err(error) = sched::spawn("shell", shell_entry) {
-        fatal(
-            Some(&mut display),
-            format_args!("cannot start the shell: {}", error),
-        );
+        fatal(format_args!("cannot start the shell: {}", error));
     }
     // Hand the CPU to the shell thread. It never finishes, so this boot
     // context only runs again if the shell somehow exits; there is no

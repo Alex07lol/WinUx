@@ -100,6 +100,7 @@ pub struct FramebufferGeometry {
 pub enum FbError {
     ZeroWidth,
     ZeroHeight,
+    ZeroScale,
     UnsupportedBpp(u16),
     BadChannelMask,
     PitchTooSmall { pitch: u64, required: u64 },

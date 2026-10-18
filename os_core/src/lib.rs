@@ -14,6 +14,7 @@ extern crate alloc;
 
 pub mod elf;
 pub mod fb;
+pub mod font;
 pub mod frame;
 pub mod heap;
 pub mod memmap;
@@ -21,6 +22,8 @@ pub mod paging;
 pub mod path;
 pub mod pofs;
 pub mod rng;
+pub mod textcon;
+pub mod textrender;
 
 /// Temporary internal project name. Branding is intentionally not part of the
 /// boot milestone.

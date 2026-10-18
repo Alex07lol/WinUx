@@ -4,6 +4,11 @@
 //! automated QEMU/VirtualBox tests can assert on it without a display. The
 //! normal path uses a spin lock; panic/exception paths bypass the lock so a
 //! fault while holding it cannot deadlock the kernel before it reports.
+//!
+//! Every line is also mirrored to the framebuffer log console when one is
+//! active (docs/FRAMEBUFFER_CONSOLE.md): the normal path mirrors blocking, the
+//! panic/exception (`force_*`) paths mirror best-effort so they can never
+//! deadlock on the console lock.
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +91,7 @@ pub fn force_write_str(text: &str) {
         }
         write_byte(byte);
     }
+    crate::fbcon::try_write_bytes(text.as_bytes());
 }
 
 /// Lock-free raw-byte write used by the syscall boundary (the kernel validates
@@ -97,6 +103,7 @@ pub fn force_write_bytes(bytes: &[u8]) {
         }
         write_byte(byte);
     }
+    crate::fbcon::try_write_bytes(bytes);
 }
 
 pub fn force_print(args: fmt::Arguments<'_>) {
@@ -120,6 +127,7 @@ impl Write for SerialWriter {
             }
             write_byte(byte);
         }
+        crate::fbcon::write_bytes(text.as_bytes());
         Ok(())
     }
 }

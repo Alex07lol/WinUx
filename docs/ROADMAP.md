@@ -11,7 +11,7 @@ were run and observed. No dates or completion percentages are implied.
 | 3 | physical/virtual memory, page tables, permissions | **partial (kernel-side VM manager done)** — bitmap frame allocator; kernel-owned 4-level address space with CR3 switch, map/unmap/translate, on-demand tables, W^X enforcement and guard refusals, all self-tested in QEMU/VirtualBox BIOS boots; user address spaces, guard-page and fragmentation stress tests outstanding |
 | 4 | kernel heap, slab/size classes, performance harness | **partial** — fixed 8 MiB first-fit free-list heap with global allocator, IRQ-safe locking, poisoning, double-free detection, `validate()` walk, host tests (14) and in-kernel self-test; growth, slabs per measurement and the heap benchmark harness outstanding |
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
-| 6 | VFS, storage, console/shell, persistence, networking | in progress (stages 1–3 verified) |
+| 6 | VFS, storage, console/shell, persistence, networking | in progress (stages 1–4 verified) |
 | 7 | PE loader and minimal native Windows console compatibility | not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
@@ -139,8 +139,21 @@ code 0`, `user fault isolated: vector=14`, `user: /boot/bad.elf rejected
 full suite is PASS=18 FAIL=0 SKIP=4 with VirtualBox BIOS and the four-boot
 persistence test still green.
 
-Remaining for Phase 6 acceptance: logging beyond COM1; networking is staged
-later in the phase.
+Stage 4 (complete and verified): framebuffer log console
+(`docs/FRAMEBUFFER_CONSOLE.md`, research R-011). The serial log, shell echo and
+shell output are mirrored to the Limine framebuffer through the host-tested
+`os_core::textcon` grid model and `os_core::textrender` compositor (the original
+5x7 font moved to `os_core::font`; unit tests 96 → 128). `kernel/src/fbcon.rs`
+sizes the grid (1280×800 → 106×50 cells at scale 2; 1024×768 → 85×48), repaints
+dirty rows with a cursor underline under an IRQ-safe lock, and runs a full
+readback self-test after the heap exists (`sfence`, re-render, byte-compare).
+The boot dashboard (`display.rs`) is deleted: the log stream is the screen.
+Evidence: `scripts/test_console_qemu.sh` asserts the pinned `fbcon:` lines,
+types `version`, and validates a QEMU monitor screendump
+(`artifacts/console-screendump.ppm`) against the serial geometry; VirtualBox
+BIOS logs the same self-test at 85×48. Full suite PASS=19 FAIL=0 SKIP=4.
+
+Remaining for Phase 6 acceptance: networking (staged last).
 
 ## Phase 7 acceptance (planned)
 

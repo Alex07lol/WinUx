@@ -260,6 +260,7 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
         }
         "clear" => {
             serial::force_write_str("\x1b[2J\x1b[H");
+            crate::fbcon::clear();
         }
         _ => crate::kprintln!("unknown command: {} (try 'help')", command),
     }

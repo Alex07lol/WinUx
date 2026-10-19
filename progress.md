@@ -53,6 +53,21 @@ remaining Phase 7-adjacent scope (a broader API surface, imports from real
 system DLLs, ordinals, forwarders, delay imports, SEH/unwind, TLS, CLR,
 PE32) is explicitly outside the phase and not started; there is still no
 Windows application compatibility.
+**Phase 8 stage 1** — a native registry-like configuration store — is
+implemented and verified: a host-tested `os_core::config` codec (`POCF`
+version 1: 8-byte header, ≤64 entries, path-shaped ASCII keys ≤96 bytes,
+printable values ≤128 bytes, blob ≤7984 bytes) serialises the store into the
+ordinary VFS file `/etc/config`, so the checkpoint format, slots, CRCs and
+fallback rule are untouched (`docs/CONFIG.md`, ADR-0022). Boot decodes the
+file when the checkpoint carries it and otherwise seeds `System/Name`,
+`Display/Theme`, `Net/Mode` in memory; the first shell mutation writes the
+file and the existing command-boundary flush persists it. The shell gains
+`config [get|set|del|list]`, the boot self-test logs
+`config selftest: passed (...)` and the marker gains `,config` after `,vfs`.
+The persistence harness now also proves theme survival across reboots, theme
+rollback when the newest slot is corrupt, and defaults after a fresh format.
+This is not a Windows registry: no `advapi32`/`HKEY_*` API, no hives, no
+typed values (limits: `docs/CONFIG.md` §8).
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
@@ -84,6 +99,10 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   edit (with this progress update) is pushed after `68b3cc9`, same
   commit-then-record pattern as `f3b17a3`, `5467bde`, `25606ad`, `b8a2910`
   and `68b3cc9`.
+  The Phase 8 stage-1 commit is `e7ecdc4` (`phase8: native configuration store
+  (pocf codec, /etc/config on the checkpoint, config shell builtin)`), 14
+  files changed; it is pushed (`82bc098..e7ecdc4`) together with its progress
+  follow-up (this commit).
   Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
@@ -508,6 +527,44 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   machine mid-program; the wait is now bounded by PIT ticks only
   (`sched::demo()`/`user::demo()` signatures lost the parameter). Both are
   recorded in R-015 and ADR-0021.
+- Phase 8 stage 1 — host-tested codec (`os_core/src/config.rs`, module added
+  to `lib.rs`): `POCF` version 1 with `MAGIC`/`VERSION`/`HEADER_BYTES`
+  constants, caps (`MAX_ENTRIES=64`, `MAX_KEY_BYTES=96`, `MAX_VALUE_BYTES=128`,
+  `MAX_BLOB_BYTES=7984`, component ≤32 reuse of `path::MAX_COMPONENT`),
+  key/value validation (`key_is_valid`, `value_is_valid`), sorted `Config`
+  (`get`/`set`/`remove`/`contains`/`list(prefix)`), canonical key-sorted
+  `encode`, validating `decode` (magic/version/truncation/trailing/count/key/
+  value/duplicate/blob-cap rows with distinct `label()` strings) and 17 unit
+  tests (validation tables, caps incl. blob boundary, sorted insert/overwrite/
+  remove, prefix listing, canonical encode, round trips, empty store,
+  unsorted-input acceptance, every decode rejection, stable labels).
+- Phase 8 stage 1 — kernel store (`kernel/src/config.rs`, new):
+  `IrqSpinLock<Option<Config>>`, `init()` loads `/etc/config` when present or
+  seeds `System/Name=PROJECT_OS`, `Display/Theme=classic`, `Net/Mode=static`
+  in memory (no boot-time write), `save()` encodes and writes the file through
+  the VFS (dirty bit drives the existing flush), `self_test()` round-trips a
+  temporary `SelfCheck/Value` entry and error paths without touching the file,
+  plus `get`/`set`/`remove`/`list`/`status` helpers for the shell. `main.rs`
+  wires `mod config`, `config::init()` + `config::self_test()` after
+  `persist::init()` (verdict line `config selftest: passed (...)`) and pushes
+  `,config` onto the checks string directly after `,vfs`.
+- Phase 8 stage 1 — shell surface (`kernel/src/shell.rs`): the `config`
+  builtin with `get`/`set`/`del`/`list` (list takes an optional path prefix
+  and prints `{n} entries in config:` / `{n} entries matching {p}:` plus
+  `  {key} = {value}` lines), `set`/`del` call `config::save()`, error paths
+  print through the existing `error: {}` wrapper (`error: no such key`,
+  `error: bad key`), usage lines pinned in the spec, one new `help` line.
+- Phase 8 stage 1 — harnesses: `scripts/test_shell_qemu.py` grows from 17 to
+  25 commands (the eight config commands incl. the `bad//key` rejection);
+  `scripts/test_persistence_qemu.py` gains `MARKER_SUFFIX =
+  vfs,config,blk,persist` and the configuration assertions in all four boots
+  (boot 1 `config set` → A seq=2; boot 2 loads `light`, then `dark` → B
+  seq=5; boot 3 corrupts B, falls back to A seq=4 with the theme rolled back
+  to `light` and `/tmp/notes/a.txt` present; boot 4 defaults `classic` after
+  the fresh format). No bring-up defect was found in this stage; two host-test
+  iterations during development (an initial 6-byte header assumption corrected
+  to the 8-byte header, and a cap-boundary assertion refined so it tests the
+  actual invariant) were fixed before any artifact was recorded.
 
 ## Exact commands and results
 
@@ -545,6 +602,10 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
 | `scripts/make_iso.sh` (Phase 7 stage 3) | PASS: ISO built (kernel + three ELF modules + **seven** PE modules), BIOS+UEFI catalog entries verified |
 | `scripts/test_pe_qemu.sh` (Phase 7 stage 3) | PASS: `pe: 7 modules present`; `pe: pebasics.exe loaded at 0x400000 (entry 0x401000, 5 sections, 1 relocation applied)`; the full stage-3 `win32:` block (`SetLastError(42)`, `GetLastError() -> 42`, `WriteFile(1, 28 bytes) -> 1`, still `-> 42`, `WriteFile(0) -> 0 (invalid handle)` + `-> 6`, `WriteFile(1, 28 bytes, overlapped) -> 0 (invalid parameter)` + `-> 87`, IDs `1`/`1`, `GetTickCount` pair, `GetCommandLineA() -> "/boot/pebasics.exe"`, `SetLastError(0)` → `-> 0`, second write `-> 1`, `ExitThread(0)`); `user: /boot/pebadfn2.exe rejected (unknown import function)`; `win32 program selftest: passed (WriteFile, GetLastError/SetLastError, ExitThread, GetCurrentProcessId/GetCurrentThreadId, GetTickCount, GetCommandLineA verified through kernel32.dll imports)`; marker unchanged; exit 33 |
 | `scripts/test_all.sh` (Phase 7 stage 3, final) | PASS: 22 PASS, 0 FAIL, 4 SKIP; format and lint green after the rustfmt pass; the first stage-3 run exposed the persistence driver's bare-`invalid` search (FAIL, boot 1), which was scoped to the `persist: slot` diagnostics before the final run |
+| `cargo test -p os_core` (Phase 8 stage 1) | PASS: 269 passed, 0 failed (adds 17 configuration-store codec tests: key/value validation tables and length caps, sorted insert/overwrite/remove, prefix listing, entry-count and blob caps, canonical encode and round trips, empty store, unsorted-input acceptance, every decode rejection, stable labels) |
+| `scripts/test_shell_qemu.sh` (Phase 8 stage 1) | PASS: 25-command session (the eight config commands incl. `config: 3 entries (/etc/config, …)`, list/`error: no such key`/`error: bad key`), 0 overruns, 10022 bytes received |
+| `scripts/test_persistence_qemu.sh` (Phase 8 stage 1) | PASS: 4 boots — boot 1 `write` → B seq=1 and `config set Display/Theme light` → A seq=2; boot 2 loads A seq=2 with `light`, `mkdir` → B seq=3, `write /tmp/notes/a.txt` → A seq=4, `config set Display/Theme dark` → B seq=5; boot 3 corrupts B → `loaded slot A seq=4` with theme `light` (rollback) and `alpha`; boot 4 both invalid → fresh format, `classic` defaults |
+| `scripts/test_all.sh` (Phase 8 stage 1, final) | PASS: 22 PASS, 0 FAIL, 4 SKIP (skipped is not passed); unit suite 269 passed; format/lint green in the same run; marker `checks=...,sched,user,elf,pe,win32,vfs,config`, disk boots add `,blk,persist,net` |
 | QEMU BIOS boot matrix, 256 MiB / 512 MiB / 1 GiB | PASS at each size: marker `checks=...,sched,user,elf,vfs`, exit 33; q35's default e1000e is deliberately unclaimed, so these boots log `net: inactive (no supported e1000 NIC)` and `net selftest: skipped (no NIC)` |
 | VirtualBox BIOS (`scripts/test_virtualbox.sh`) | PASS with ELF-module ring-3 checks, `fbcon: enabled 85x48 cells at scale 2` / `3133440 bytes match after 1088 redraws`, and the 82540EM NIC observed: `net: e1000 at 00:03.0`, MAC `08:00:27:c4:5d:0a`, loopback `unsupported`, `net selftest: no gateway reply (arp timeout)` — non-fatal, marker without `,net` (`vbox-serial.log`); isolated VM created and deleted |
 | `scripts/test_boot_qemu.sh --firmware uefi` | SKIP: no `OVMF_FD` / OVMF firmware |
@@ -745,6 +806,39 @@ valid checkpoint, formatted slot A seq=0`, `cat /tmp/hello.txt` →
 `error: no such file or directory`. Driver summary: `persistence: 4 boots, all
 phases passed`.
 
+Configuration store (Phase 8 stage 1; `artifacts/qemu-shell-session.log` and
+`artifacts/qemu-persist-boot{1..4}.log` for the persistence sequence):
+
+```text
+config selftest: passed (3 entries, 75 bytes; get/set/remove/list/encode/decode/error paths)
+PROJECT_OS_BOOT_SUCCESS:0.1.0-82bc098b checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs,config
+project-os> config
+config: 3 entries (/etc/config, 75 bytes)
+project-os> config set Display/Theme light
+config set: ok
+project-os> config list
+3 entries in config:
+  Display/Theme = light
+  Net/Mode = static
+  System/Name = PROJECT_OS
+project-os> config del Display/Theme
+config del: ok
+project-os> config get Display/Theme
+error: no such key
+project-os> config set bad//key x
+error: bad key
+```
+
+Persistence sequence with the store: boot 1 saves `hello.txt` (B seq=1) and
+then `config set Display/Theme light` (A seq=2); boot 2 loads A seq=2, reads
+`Display/Theme = light`, saves B seq=3 (`mkdir`), A seq=4 (`write
+/tmp/notes/a.txt`) and B seq=5 (`config set Display/Theme dark`); boot 3
+(in slot B's payload zeroed by the driver) falls back to `persist: loaded
+slot A seq=4`, reads `Display/Theme = light` — the `dark` value existed only
+in the corrupt slot — and `/tmp/notes/a.txt` → `alpha`; boot 4 formats fresh
+and reads `Display/Theme = classic` (defaults reseeded) with
+`/tmp/hello.txt` gone.
+
 Framebuffer console (`artifacts/qemu-console-session.log`, interactive ISO,
 512 MiB; QEMU monitor screendump kept as `artifacts/console-screendump.ppm`):
 
@@ -814,20 +908,20 @@ build from HEAD would carry a new ID.)
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 1,294,448 bytes (Phase 7 stage 3) |
-| Kernel SHA-256 | `f737c6c9a966c670f91341e3310191a5b563d93e1360e0889d7a19dafb374c48` |
+| Kernel ELF | `artifacts/kernel.elf`, 1,739,896 bytes (Phase 8 stage 1) |
+| Kernel SHA-256 | `8de3faa87c3113dbbc474d5efcd438187143ac5fc281f3e6b2eec669ad8ab608` |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
 | PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1`; `artifacts/pebasics.exe` (Phase 7 stage 3: 5 sections, 1 relocation, nine imports `kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile`), 4096 bytes, SHA-256 `4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`; `artifacts/pebadfn2.exe` (`GetTickCount` → `Sleep` pattern patch), 4096 bytes, SHA-256 `9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d` (pehello/pebad hash-stable from clean rebuilds; the other add-ons rebuild deterministically from their patches) |
 | ISO | `artifacts/project-os.iso` |
-| ISO size | 7,331,840 bytes |
-| ISO SHA-256 | `1e5cdddd389f0c61238094c1a03899e1b1c493fa83320ce1a02b44a7f659f987` |
+| ISO size | 7,776,256 bytes |
+| ISO SHA-256 | `cded5276dae6e9c8495618f5206cd02c0daf39a0451d6dd99b035cf27e105699` |
 | Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline; rebuilt by each session harness) |
-| Interactive ISO SHA-256 | `54011dced27b2a26e7c8a7e7dd805805ffceac20528202078be00ee0ad40cff0` (rebuilt during the final stage-3 `test_all.sh` run) |
+| Interactive ISO SHA-256 | `4db4877a82c5893fd83dd61d7abb4e148ed9bc8127c3bf71a935bb61cceeee4c` (rebuilt during the final stage-1 Phase 8 `test_all.sh` run; the shell and persistence runs each rebuild it, so each harness log names its own build) |
 | Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `002f45ab44049304dbf7f8605b58a597791caba5c6837ec7e4311c4ea73c0c40`; checker PASS (rebuilt in the stage-5 suite run; the boot log now includes the `net:` lines) |
 | Framebuffer session log | `artifacts/qemu-console-session.log`, SHA-256 `501334a8fde73879a109602782a68a7591c8c571c2ca3e09f119ff8ad6c296e3` |
 | Net session log | `artifacts/qemu-net-session.log`, 4,494 bytes, SHA-256 `940b29fbdd4477e325164e2df7615ef690947de1ca4dff7e6a5cda624ed3eb44`; `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
-| Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the 4-boot test: fresh format, slot A seq 0), SHA-256 `cb97111ff33d7e456e5ea82d9352ed3281e93c882fb02a02bd1947fc8f4857de` |
+| Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the stage-1 Phase 8 4-boot test: fresh format, slot A seq 0, defaults reseeded), SHA-256 `05d2d3ad26aa59c8140d1195e6e8423e19206895c6ed4dbe7c0aff0c0c245d22` |
 | ISO boot entries | BIOS platform 0x00 (4 sectors), UEFI platform 0xEF (6144 sectors), both no-emulation, verified by `scripts/verify_iso.py` |
 | Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot; stage-3 log 8177 bytes, SHA-256 `d0e172bce65d01cafe5c8cd5074976138edad6d822a233ea6e064539fb0b9e2a`), `artifacts/qemu-net-session.log` (e1000 network session) |
 | VirtualBox result | `artifacts/vbox-test.log`: VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed; with the 82540EM NAT NIC the kernel detected the NIC and reported `net: loopback selftest: unsupported` + `net selftest: no gateway reply (arp timeout)` — non-fatal, no VirtualBox networking claim |
@@ -835,8 +929,8 @@ build from HEAD would carry a new ID.)
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
 The kernel and fixture builds are deterministic for identical sources, flags
-and build ID. The checksums above are from the final Phase 7 stage 3
-`scripts/test_all.sh` run (22 PASS / 0 FAIL / 4 SKIP, unit suite 252 passed).
+and build ID. The checksums above are from the final Phase 8 stage-1
+`scripts/test_all.sh` run (22 PASS / 0 FAIL / 4 SKIP, unit suite 269 passed).
 The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
@@ -879,6 +973,12 @@ This is a host model, not a kernel or Linux comparison.
   documented `WriteFile` error mapping, unchanged marker) and research R-015
   (MS console/thread/time API contracts; PASSED with the observed stage-3
   log, the fixture hashes and the two bring-up defects recorded).
+  The Phase 8 stage-1 configuration store is governed by `docs/CONFIG.md`
+  (the contract) and ADR-0022 (one ordinary VFS file `/etc/config` plus a
+  host-tested `POCF` codec, no checkpoint format change, defaults seeded in
+  memory with a lazy first-mutation save, `,config` after `,vfs`); no new
+  research entry was needed because the format is internal and makes no
+  external protocol claim.
   ADR-0006's framing still holds: serial is authoritative
   for tests, the framebuffer is a display mirror, not a gate.
 - [docs/RESEARCH.md](docs/RESEARCH.md): primary sources, findings, confidence and
@@ -940,6 +1040,19 @@ This is a host model, not a kernel or Linux comparison.
   `wait_all_finished` TSC budget) were fixed before the PASS and are
   recorded in R-015/ADR-0021; the persistence driver's bare-`invalid` boot-1
   check was scoped to `persist: slot` diagnostics (test-side fix).
+- Phase 8 stage-1 limits (spec: `docs/CONFIG.md` §1/§8, ADR-0022): the store
+  is a native kernel facility, not a Windows registry — no `advapi32`/
+  `HKEY_*` API, no hives, no typed (DWORD/binary/multi-string) values, no
+  ACLs or per-user hives, no transactions or change notifications, and keys
+  are case-sensitive byte strings. Hard caps: 64 entries, 96-byte keys
+  (components ≤32 bytes, `[A-Za-z0-9_.-]` plus `/`), 128-byte
+  printable-ASCII values, 7984 serialized bytes; violations are rejected with
+  a distinct label, never truncated. Durability is exactly the checkpoint's:
+  reboots survive, newest-slot corruption rolls the store back with the tree,
+  and a fresh format reseeds the defaults. `rm /etc/config` means factory
+  settings on the next boot; the boot self-test never writes the file. No
+  bring-up defect occurred in this stage (two host-test iterations during
+  development were fixed before any artifact was recorded).
 - Phase 6 stage-5 limits (spec/ADR: `docs/NETWORK.md` §10, ADR-0018): one
   polled e1000 on bus 0 with static `10.0.2.15/24`; no DHCP/DNS/TCP/sockets,
   no interrupt/MSI receive or background RX (packets are processed only while
@@ -1044,15 +1157,20 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 7 stage 3 is complete: the Win32 program-basics surface (eleven-name
-allowlist, five-argument `WriteFile` stub, per-thread last-error,
-loader-owned command line), fixture pipeline and harnesses are implemented
-and verified (22 PASS / 0 FAIL / 4 SKIP; stage-3 Win32 boot log in
-`artifacts/qemu-serial-pe.log`); the stage commit `8045d2b` and progress
-commit `68b3cc9` are pushed to `orgin/main`, and Phase 7 acceptance is
-marked complete in `docs/ROADMAP.md` (2026-10-19, user-reviewed). Candidate
-work, none of it started: a wider Win32/NT surface (console input, `ReadFile`, more process/thread functions, imports from more than one
-synthetic DLL), the remaining Phase 2–4 scope gaps (APIC timer/IOAPIC/SMP,
+Phase 8 stage 1 is complete: the native configuration store (`POCF` codec,
+`/etc/config` carried by the existing checkpoint, `config` shell builtin) is
+implemented and verified (22 PASS / 0 FAIL / 4 SKIP; unit suite 269;
+`docs/CONFIG.md`, ADR-0022); the stage commit `e7ecdc4` and this progress
+commit are pushed to `orgin/main`. Single best next action: **Phase 8
+stage 2 — a scoped Win32 surface on the proven machinery, starting with
+console input.** The strongest candidate is `ReadFile` on the standard input
+handle with a cmdline-gated fixture (the cmdline-gated pattern already exists
+for the console fixtures), because it adds a new call shape (buffer fill +
+out-pointer byte count + EOF semantics) without new storage
+(`docs/WIN32_CONSOLE.md` §9 records the open design questions). Candidate
+work beyond that, none of it started: a Win32-visible read-only view of the
+configuration store, more process/thread functions, imports from more than
+one synthetic DLL, the remaining Phase 2–4 scope gaps (APIC timer/IOAPIC/SMP,
 recoverable exceptions, user address-space hardening, heap growth), and
 Phase 9 (minimal PCI/driver framework — which also unblocks AHCI — plus a
 virtual GPU target).

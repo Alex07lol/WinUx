@@ -113,6 +113,37 @@ hives, ACLs, transactions, redirection, enumeration, write APIs, default
 values, other roots, typed values beyond REG_SZ or `W`/Unicode variants; four
 concurrent handles and always-NUL-terminated values are our documented
 contract, not vendor-verified (`docs/WIN32_REGISTRY.md` §13).
+**Phase 8 stage 4** — a Win32 registry write surface — is implemented and
+verified: the two-DLL allowlist grows from fifteen to eighteen names and
+services 18–20 (`RegCreateKeyExA` with the first nine-argument stub, its
+seventh–ninth arguments forwarded through `r12`–`r14` and the fixed stub
+stride grown 24 → 48 bytes; `RegSetValueExA` through the existing six-argument
+shape; `RegDeleteValueA` through the four-argument shape) mutate the same
+`/etc/config` store the shell `config` builtin uses and persist through the
+existing `config::save()`. Created keys report `REG_CREATED_NEW_KEY` (1) when
+the prefix had no children before the call and `REG_OPENED_EXISTING_KEY` (2)
+whenever children existed (a key whose last value is deleted ceases to exist);
+writes validate joined store paths (87) while reads keep their stage-3
+simply-miss behavior; REG_SZ only, NUL-terminated, capped by the store, with
+the documented error values (2/6/8/87) and the first nine-argument stub
+(`Args9`). A genuine `peregw.exe` fixture (two DLLs, seven imports,
+distinct exit codes 1–18) ships only on
+`artifacts/project-os-registry-write.iso`
+(`make_iso.sh --registry-write-fixture`); the default and other variant ISOs
+boot to the unchanged markers and serial contract (the fixture's absence
+prints explicit skip verdicts). The harness
+(`scripts/test_registry_write_qemu.sh`) boots that ISO and asserts the full
+session (create dispositions `created`/`opened existing`/`created`, REG_SZ
+sets and updates with read-back, 87/6/2 error lines, delete-then-query → 2,
+slot reuse, `Persisted` write, 39-byte summary, exit 33); the boot phase also
+proves persistence by saving `/etc/config`, reading it back through the VFS
+and decoding it with `os_core::config::Config::decode`, then restoring the
+defaults. The full regression stayed green (25 PASS / 0 FAIL / 4 SKIP).
+Limits: no hives, ACLs, access checks, transactions, enumeration, key
+deletion (`RegDeleteKey`), typed values beyond REG_SZ, default/null values or
+namespace rules; four concurrent handles and the 64-entry store remain our
+documented contracts, not vendor-verified (`docs/WIN32_REGISTRY_WRITE.md`
+§14, ADR-0025, research R-018).
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
@@ -163,6 +194,12 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   with this progress follow-up (this commit), same commit-then-record pattern
   as `f3b17a3`, `5467bde`, `25606ad`, `b8a2910`, `68b3cc9`, `e7ecdc4`,
   `58f98e4` and `b1b8542`.
+  The Phase 8 stage-4 commit is `30a7f09` (`phase8: win32 registry write
+  surface (advapi32.dll RegCreateKeyExA/RegSetValueExA/RegDeleteValueA
+  persisting through the config store, eighteen-name allowlist, nine-argument
+  stub, peregw fixture and harness)`), 21 files changed; it is pushed
+  (`fe3c278..30a7f09`) together with this progress follow-up (this commit),
+  same commit-then-record pattern as the earlier stages.
   Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
@@ -718,6 +755,63 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   contract explicitly, and §7's key-existence rule is children-only. No
   kernel defect was found; the registry session passed on the first kernel
   build.
+- Phase 8 stage 4 — registry write API (`kernel/src/registry.rs`): `KeyError`
+  extended to `{InvalidHandle, NotFound, TooManyKeys, BadArgument, NoSpace}`,
+  a `joined_entry` helper validating `prefix/name` against the store path
+  rules, `write_error` mapping store failures (`BadArgument` → 87, `Full` →
+  8), `lookup_value` refactored over the new helper, `create(parent,
+  subkey) -> (u64, bool)` (disposition from the children count before the
+  call; empty subkey returns a new slot handle and always `opened existing`),
+  `set_value(parent, name, value)` and `delete_value(parent, name)`; every
+  mutation runs under `config::with`, then `config::save()` is called after
+  the lock is released.
+- Phase 8 stage 4 — syscall surface (`kernel/src/syscall.rs`): services 18–20
+  (`SYS_REG_CREATE_KEY_EX`, `SYS_REG_SET_VALUE_EX`, `SYS_REG_DELETE_VALUE`),
+  `WIN32_REG_{CREATE_KEY,SET_VALUE,DELETE_VALUE}_CALLS` counters,
+  `ERROR_NOT_ENOUGH_MEMORY = 8`, `REG_CREATED_NEW_KEY = 1`,
+  `REG_OPENED_EXISTING_KEY = 2`, `MAX_REG_VALUE = MAX_VALUE_BYTES + 1 = 129`,
+  `reg_key_error_code`, `reg_error_label` gains "not enough memory",
+  handlers `reg_create_key_ex` (Args9: `r13` = `phkResult`, `r14` =
+  `lpdwDisposition`, `samDesired`/`lpSecurityAttributes`/`lpClass` ignored),
+  `reg_set_value_ex` and `reg_delete_value`, the shared `read_user_reg_value`
+  (span validated per page, byte-capped, final NUL required, payload through
+  `os_core::config::value_is_valid`) and `reg_*_fail` helpers that set the
+  thread `last_error`.
+- Phase 8 stage 4 — loader (`kernel/src/pe_loader.rs`): `StubShape::Args9`
+  (after the Args6 loads, `r12`/`r13`/`r14` from `[rsp+0x38]`/`[rsp+0x40]`/
+  `[rsp+0x48]`; `isr_common` already saves those registers), `STUB_STRIDE`
+  24 → 48 with the existing compile-time assert, `WIN32_SERVICES` grows to
+  eighteen with the three new `advapi32.dll` entries.
+- Phase 8 stage 4 — fixture (`userland/pe/peregw`, workspace member added):
+  two `raw-dylib` DLLs and seven imports, the §12 eighteen-step sequence
+  (create → set/update → repeat create → error paths → delete → slot reuse →
+  `Persisted` write → close → 39-byte summary) with distinct exit codes 1–18;
+  summary line `win32: registry write surface verified` (39 bytes) then
+  `ExitThread(0)`.
+- Phase 8 stage 4 — pipeline and harnesses: `scripts/build_user_pe.sh`
+  builds and checker-verifies `peregw.exe` (ten artifacts; the pre-existing
+  nine hashes unchanged); `scripts/make_iso.sh` gains
+  `--registry-write-fixture` (four-way mutual exclusion, output
+  `artifacts/project-os-registry-write.iso`, module injection with grep
+  guard); new `scripts/test_registry_write_qemu.py`/`.sh` (pinned
+  create/set/delete/query lines, counted `RegCloseKey(4097) -> 0` twice, the
+  `\r\r\n` size-query terminator, `win32 registry write selftest: passed`,
+  marker, exit 33); `scripts/test_all.sh` gains the `registry-write` step
+  after `registry`; `user.rs` gains `PEREGW_PATH`/`thread_peregw`, the write
+  phase block (counter deltas create +3, set +8, delete +3, query +3, close
+  +3, `WriteFile` +1, writes +1, bytes +39, exit 0, no faults) and the
+  persistence proof: `Session/Current/Persisted` is saved through the store,
+  `/etc/config` is read back through the VFS, decoded with
+  `os_core::config::Config::decode` and asserted, then the default entries
+  are restored before teardown.
+- Phase 8 stage 4 — bring-up defect (fixture-side, fixed before the PASS):
+  the first harness run failed because the fixture repeated the create
+  *before* the first write; under the lazy children-only model a key with no
+  values yet honestly reports `created`, not `opened existing`. The fix
+  swapped fixture steps 2 and 3 (write `Flag` before the repeat create) and
+  `docs/WIN32_REGISTRY_WRITE.md` §12 records the ordering rule; the rerun
+  matched every pinned line. No kernel defect was found; the session passed
+  on the fixed fixture with the same kernel build.
 
 ## Exact commands and results
 
@@ -1166,39 +1260,97 @@ after `scripts/make_iso.sh` the rerun passed with `0.1.0-b1b8542c` and the
 registry skip verdicts present. No kernel defect was found; the registry
 session passed on the first kernel build.
 
+Phase 8 stage 4 (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025, research R-018;
+build id `0.1.0-fe3c278e`, derived from the then-current commit `fe3c278`):
+
+```sh
+scripts/format.sh                             # PASS (one rustfmt fix in syscall.rs)
+scripts/lint.sh                               # PASS
+scripts/test_unit.sh                          # PASS (269/269)
+scripts/build.sh                              # PASS (kernel.elf 1,866,152 bytes)
+scripts/build_user_pe.sh                      # PASS (10 artifacts)
+scripts/make_iso.sh --registry-write-fixture  # PASS -> project-os-registry-write.iso
+scripts/test_registry_write_qemu.sh           # FAIL (fixture order), fixed -> PASS
+scripts/test_all.sh                           # PASS: 25 PASS, 0 FAIL, 4 SKIP
+```
+
+The first harness run failed because the fixture repeated the create before
+the first write and the lazy children-only model therefore reported
+`created`; the fixture swapped steps 2 and 3 (write `Flag`, then repeat the
+create) and the spec recorded the rule. The fixed run's transcript
+(`artifacts/qemu-registry-write-session.log`, 10,407 bytes, SHA-256
+`4c03490bed58031e65eea434a5ba4b0cb2698d49919fb1726af68535c7a16077`,
+exit-33 run, build id `0.1.0-fe3c278e`):
+
+```text
+pe: peregw.exe loaded at 0x400000 (entry 0x401000, 5 sections, 1 relocation applied)
+win32: RegCreateKeyExA(0x80000002, "Session/Current") -> 0 (handle 4096, created)
+win32: RegSetValueExA(4096, "Flag") -> 0 (REG_SZ, 7 bytes)
+win32: RegCreateKeyExA(0x80000002, "Session/Current") -> 0 (handle 4097, opened existing)
+win32: RegCloseKey(4097) -> 0
+win32: RegQueryValueExA(4096, "Flag") -> 0 (REG_SZ, 8 bytes) "enabled"
+win32: RegSetValueExA(4096, "Flag") -> 0 (REG_SZ, 2 bytes)
+win32: RegQueryValueExA(4096, "Flag") -> 0 (REG_SZ, 3 bytes)
+win32: RegSetValueExA(4096, "Number") -> 87 (invalid parameter)
+win32: RegSetValueExA(4096, "Flag") -> 87 (invalid parameter)
+win32: RegSetValueExA(1, "Flag") -> 6 (invalid handle)
+win32: RegSetValueExA(4096, "Bad Name") -> 87 (invalid parameter)
+win32: RegSetValueExA(4096, "") -> 87 (invalid parameter)
+win32: RegDeleteValueA(4096, "Missing") -> 2 (file not found)
+win32: RegDeleteValueA(1, "Flag") -> 6 (invalid handle)
+win32: RegDeleteValueA(4096, "Flag") -> 0
+win32: RegQueryValueExA(4096, "Flag") -> 2 (file not found)
+win32: RegCreateKeyExA(0x80000002, "Session/Current") -> 0 (handle 4097, created)
+win32: RegSetValueExA(4097, "Persisted") -> 0 (REG_SZ, 3 bytes)
+win32: RegCloseKey(4096) -> 0
+win32: RegCloseKey(4097) -> 0
+win32: registry write surface verified
+win32 registry write selftest: passed (advapi32.dll RegCreateKeyExA/RegSetValueExA/RegDeleteValueA over the config store; create/open dispositions, REG_SZ sets and updates, deletes, error values 2/6/87, persistence through /etc/config verified)
+user: ring-3 program exited (code 0), 8 write(s), 282 bytes, 1 isolated fault(s), 0 rejected syscall(s)
+```
+
+The build id of this run is `0.1.0-fe3c278e`; the serial/timer regressions,
+the `pe`/`input`/`registry` harnesses and the full `test_all.sh` matrix ran
+inside the recorded `test_all.sh` pass (25 PASS / 0 FAIL / 4 SKIP; unit
+suite 269). No kernel defect was found; the write session passed on the
+fixed fixture with the same kernel build.
+
 ## Artifact
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 1,817,664 bytes (Phase 8 stage 3) |
-| Kernel SHA-256 | `6c26d6cce01f4457405554071b550542a7bd3e49e52c7755922ba01368f706bf` (deterministic for identical sources/flags; this build was made once from the stage-3 sources and recorded) |
+| Kernel ELF | `artifacts/kernel.elf`, 1,866,152 bytes (Phase 8 stage 4) |
+| Kernel SHA-256 | `dd468feec137d5e6fea0a8031aa28106e64cc2cd9f6fd16a709e2e44be38ac01` (deterministic for identical sources/flags; this build was made once from the stage-4 sources and recorded) |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
-| PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1`; `artifacts/pebasics.exe` (Phase 7 stage 3: 5 sections, 1 relocation, nine imports `kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile`), 4096 bytes, SHA-256 `4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`; `artifacts/pebadfn2.exe` (`GetTickCount` → `Sleep` pattern patch), 4096 bytes, SHA-256 `9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d`; `artifacts/peinput.exe` (Phase 8 stage 2: 5 sections, 1 relocation, five imports `kernel32.dll:ExitThread,GetLastError,GetStdHandle,ReadFile,WriteFile`), 4096 bytes, SHA-256 `a2ab21aa4ea7e282c79e2ed1b437c72cee0a21e7b706ba4d0b007a46d5167de0`; `artifacts/pereg.exe` (Phase 8 stage 3: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegOpenKeyExA,RegQueryValueExA;kernel32.dll:ExitThread,WriteFile`), 5120 bytes, SHA-256 `0ca37e2e762035bc98729b102d3a1d53340214e67365eba91daa72866fd3b3d4` (pehello/pebad hash-stable from clean rebuilds; the existing eight artifacts' hashes were unchanged by the stage-3 rebuild; `pereg.exe` was built once and recorded) |
+| PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1`; `artifacts/pebasics.exe` (Phase 7 stage 3: 5 sections, 1 relocation, nine imports `kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile`), 4096 bytes, SHA-256 `4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`; `artifacts/pebadfn2.exe` (`GetTickCount` → `Sleep` pattern patch), 4096 bytes, SHA-256 `9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d`; `artifacts/peinput.exe` (Phase 8 stage 2: 5 sections, 1 relocation, five imports `kernel32.dll:ExitThread,GetLastError,GetStdHandle,ReadFile,WriteFile`), 4096 bytes, SHA-256 `a2ab21aa4ea7e282c79e2ed1b437c72cee0a21e7b706ba4d0b007a46d5167de0`; `artifacts/pereg.exe` (Phase 8 stage 3: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegOpenKeyExA,RegQueryValueExA;kernel32.dll:ExitThread,WriteFile`), 5120 bytes, SHA-256 `0ca37e2e762035bc98729b102d3a1d53340214e67365eba91daa72866fd3b3d4` (pehello/pebad hash-stable from clean rebuilds; the existing eight artifacts' hashes were unchanged by the stage-3 rebuild; `pereg.exe` was built once and recorded); `artifacts/peregw.exe` (Phase 8 stage 4: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegCreateKeyExA,RegDeleteValueA,RegQueryValueExA,RegSetValueExA;kernel32.dll:ExitThread,WriteFile`), 5632 bytes, SHA-256 `3b00b91a8677ce733f62af242809abe146005c853bb23e99d0c0d00135d5df01` (the nine pre-existing artifacts' hashes were unchanged by the stage-4 rebuild) |
 | ISO | `artifacts/project-os.iso` (default: seven PE modules) |
-| ISO size | 7,854,080 bytes |
-| ISO SHA-256 | `62cf2f0cd707fe4f0a5f448dd1fd33f2b716587aafc652e8b6c39cffc865bb36` (rebuilt in the final stage-3 `test_all.sh` run; an earlier manual rebuild of the same sources produced `bb8f8d3d…` — `mkisofs` timestamps) |
+| ISO size | 7,903,232 bytes |
+| ISO SHA-256 | `87608e6d5c2362bfd23da30cd553a2c2f82b368a24b5b7bedb5f79e10de16c87` (rebuilt in the final stage-4 `test_all.sh` run; `mkisofs` timestamps make byte-for-byte reproducibility impossible) |
 | Registry ISO | `artifacts/project-os-registry.iso` (`make_iso.sh --registry-fixture`: kernel + three ELF modules + eight PE modules incl. `pereg.exe`, `debug_exit` kept) |
-| Registry ISO size / SHA-256 | 7,860,224 bytes / `1f93a4566e707602b54b7b65478fd87bf05ecc37ecb6b8b5ecaf873c7434d451` (built by the stage-3 registry harness, then rebuilt identically-checked in the final `test_all.sh` run) |
+| Registry ISO size / SHA-256 | 7,909,376 bytes / `d6d909a6c499f58d534cbc5a62b8b8365020dd83215c0abfaedb13246efcdf22` (rebuilt in the final stage-4 `test_all.sh` run; the stage-4 kernel grows the image) |
+| Registry-write ISO | `artifacts/project-os-registry-write.iso` (`make_iso.sh --registry-write-fixture`: kernel + three ELF modules + eight PE modules incl. `peregw.exe`, `debug_exit` kept) |
+| Registry-write ISO size / SHA-256 | 7,909,376 bytes / `527757b0529e5a52159090382201bdfe4b37f3661cb6dc6c930690b2e414f1aa` (built by the stage-4 registry-write harness inside the final `test_all.sh` run) |
 | Input ISO | `artifacts/project-os-input.iso` (`make_iso.sh --input-fixture`: kernel + three ELF modules + eight PE modules incl. `peinput.exe`, `debug_exit` kept; built by `scripts/test_input_qemu.sh` with `--no-build`) |
-| Input ISO size / SHA-256 | 7,858,176 bytes / `cdb62ac4771177e9a64ac703cb3b87477adf66ffc4902dde077c0d2909fc0da8` (rebuilt in the final stage-3 `test_all.sh` run) |
+| Input ISO size / SHA-256 | 7,907,328 bytes / `d988d81f5a03bcbb55705f551ece3bb15b604536dfed6df10fbb3308b69e47fa` (rebuilt in the final stage-4 `test_all.sh` run) |
 | Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline; rebuilt by each session harness) |
-| Interactive ISO size / SHA-256 | 7,854,080 bytes / `4d64f3697d77de0f98f5e992addf5f2017150656ab8ef225553b1748da07c545` (rebuilt during the final stage-3 `test_all.sh` run; the shell and persistence runs each rebuild it, so each harness log names its own build) |
-| Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `ff7c79d67fa3622b1e61cc2d20541a11ca5dd0c22b51be063af3cc15613b69fa`; checker PASS (rebuilt in the final stage-3 `test_all.sh` run) |
-| Framebuffer session log | `artifacts/qemu-console-session.log`, 8,774 bytes, SHA-256 `19740a0bb2e004ad745b569c913330c2de521a8fcadb8ebcf94c08623eddf61b` (rebuilt in the final stage-3 `test_all.sh` run) |
-| Net session log | `artifacts/qemu-net-session.log`, 7,961 bytes, SHA-256 `dddf23559988497477b728e319c6ffbc6b5c5c10d207fac23f82c0371c3b0d05` (rebuilt in the final stage-3 `test_all.sh` run); `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
+| Interactive ISO size / SHA-256 | 7,903,232 bytes / `25d394736521e16563ae6ab24fabb5876a7f55e0c591d2e7f47cb9d0ae33d993` (rebuilt during the final stage-4 `test_all.sh` run; the shell and persistence runs each rebuild it, so each harness log names its own build) |
+| Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `07b98cd5ab99065048fa6e607465ba3ce3ad0c848aab1c500a52beab28041bed`; checker PASS (rebuilt in the final stage-4 `test_all.sh` run) |
+| Framebuffer session log | `artifacts/qemu-console-session.log`, 8,932 bytes, SHA-256 `293b6853ef9c1e547376d74f8d48322f3af2cd7b3b6dbcbbd81232d7fc0ea665` (rebuilt in the final stage-4 `test_all.sh` run) |
+| Net session log | `artifacts/qemu-net-session.log`, 8,196 bytes, SHA-256 `be1b9445a8712ac96129781084c076f15146d84111402faac4c1ceb9917d7f78` (rebuilt in the final stage-4 `test_all.sh` run); `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
 | Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the stage-2 Phase 8 4-boot regression: fresh format, slot A seq 0, defaults reseeded — byte-identical to the stage-1 final state), SHA-256 `05d2d3ad26aa59c8140d1195e6e8423e19206895c6ed4dbe7c0aff0c0c245d22` |
-| Input session log | `artifacts/qemu-input-session.log`, 9,305 bytes, SHA-256 `88b5802c6584f9e261af7f03220caa842496b896576b0c84564808caff52398e` (paced TCP serial transcript, exit-33 run); `artifacts/qemu-input.log`, 192 bytes, SHA-256 `c3cf8658736a2018f13cd14af39fbf84da48c680eac5e0eb62242226d3bb2ce4` (only QEMU's `wait=on` connection-info line) |
-| Registry session log | `artifacts/qemu-registry-session.log`, 10,420 bytes, SHA-256 `021807014f814d557227c3774d7231a3d47386ec33b023f843b72d736a8e5945` (paced TCP serial transcript, exit-33 run); `artifacts/qemu-registry.log`, 192 bytes, SHA-256 `c5b349ddedeaec734b352301e2fb289dcbd7e118691781a65affbb389d35c7f1` (only QEMU's `wait=on` connection-info line) |
+| Input session log | `artifacts/qemu-input-session.log`, 9,463 bytes, SHA-256 `c00321a4b992330917c045f8179a46d651a3549195c48ddd28c0e2ea5678250b` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-4 `test_all.sh` run); `artifacts/qemu-input.log`, 192 bytes, SHA-256 `a9eed819f1f42c84f2b77080b139b3a6ec7c3646a36488bf3b071e467c1c8127` (only QEMU's `wait=on` connection-info line) |
+| Registry session log | `artifacts/qemu-registry-session.log`, 10,578 bytes, SHA-256 `bed88828899f67035a4057585a6ff6873b939600c7ba319e688e1eeddd8f2dea` (rebuild in the final stage-4 `test_all.sh` run); `artifacts/qemu-registry.log`, 192 bytes, SHA-256 `0bad30e9fa07e4386a3cd8701a650d59d897ad908e0e9be0a00b9e164c53ef30` (only QEMU's `wait=on` connection-info line) |
+| Registry-write session log | `artifacts/qemu-registry-write-session.log`, 10,407 bytes, SHA-256 `4c03490bed58031e65eea434a5ba4b0cb2698d49919fb1726af68535c7a16077` (paced TCP serial transcript, exit-33 run); `artifacts/qemu-registry-write.log`, 192 bytes, SHA-256 `84de33eb93aa7f275002f0f0ee660531a9634341b1f4b34bf9251480a8907fed` (only QEMU's `wait=on` connection-info line) |
 | ISO boot entries | BIOS platform 0x00 (4 sectors), UEFI platform 0xEF (6144 sectors), both no-emulation, verified by `scripts/verify_iso.py` |
-| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot; stage-3 regression log 8,547 bytes, SHA-256 `fdad4e4ffb0b1a24e3f573fde10ef81810c5f2d0c44f9e5f97d72bce3e840086`), `artifacts/qemu-input-session.log` (Win32 console-input session), `artifacts/qemu-registry-session.log` (Win32 registry session), `artifacts/qemu-net-session.log` (e1000 network session) |
+| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session, rebuilt in the final stage-4 `test_all.sh` run), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot; stage-4 regression log 8,707 bytes, SHA-256 `f88f06a9270e73229cb30de7492616010814a0143835cb80f72ffa2ee29eac1d`), `artifacts/qemu-input-session.log` (Win32 console-input session), `artifacts/qemu-registry-session.log` (Win32 registry session), `artifacts/qemu-registry-write-session.log` (Win32 registry-write session), `artifacts/qemu-net-session.log` (e1000 network session) |
 | VirtualBox result | `artifacts/vbox-test.log`: VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed; with the 82540EM NAT NIC the kernel detected the NIC and reported `net: loopback selftest: unsupported` + `net selftest: no gateway reply (arp timeout)` — non-fatal, no VirtualBox networking claim |
 
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
 The kernel and fixture builds are deterministic for identical sources, flags
-and build ID. The checksums above are from the final Phase 8 stage-3
-`scripts/test_all.sh` run (24 PASS / 0 FAIL / 4 SKIP, unit suite 269 passed).
+and build ID. The checksums above are from the final Phase 8 stage-4
+`scripts/test_all.sh` run (25 PASS / 0 FAIL / 4 SKIP, unit suite 269 passed).
 The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
@@ -1264,6 +1416,16 @@ This is a host model, not a kernel or Linux comparison.
   marker change) and research R-017 (MS registry/`RegQueryValueEx` primary
   sources; PASSED with the observed session log and the harness expectation
   correction).
+  The Phase 8 stage-4 Win32 registry write surface is governed by
+  `docs/WIN32_REGISTRY_WRITE.md` (the contract), ADR-0025 (services 18–20
+  behind the first nine-argument stub form via `r10`–`r14`, lazy
+  children-only key creation with `created`/`opened existing` dispositions,
+  write-path validation that joins and checks the whole key path, REG_SZ-only
+  sets with a NUL-terminated 129-byte cap, persistence through the config
+  store's existing save path, dedicated `--registry-write-fixture` ISO, no
+  marker change) and research R-018 (MS registry write-API primary sources;
+  PASSED with the observed session log, the fixture-order bring-up defect
+  and the `/etc/config` persistence proof).
   ADR-0006's framing still holds: serial is authoritative
   for tests, the framebuffer is a display mirror, not a gate.
 - [docs/RESEARCH.md](docs/RESEARCH.md): primary sources, findings, confidence and
@@ -1284,9 +1446,10 @@ This is a host model, not a kernel or Linux comparison.
   verified; a catalog entry is not a boot test.
 - No PCI driver model, no general Win32/API compatibility and no GPU
   acceleration. The PE32+ path is Phase 7 stages 1–3 plus Phase 8 stages
-  2–3: it runs filesystem-less fixtures and resolves imports against a
-  fifteen-name two-DLL (`kernel32.dll` + `advapi32.dll`) allowlist; see the
-  stage-1/stage-2/stage-3 and Phase 8 stage-2/stage-3 limits bullets below.
+  2–4: it runs filesystem-less fixtures and resolves imports against an
+  eighteen-name two-DLL (`kernel32.dll` + `advapi32.dll`) allowlist; see the
+  stage-1/stage-2/stage-3 and Phase 8 stage-2/stage-3/stage-4 limits bullets
+  below.
   Networking exists as stage 5 (one polled e1000 with static addressing);
   there is no general on-disk filesystem: persistence is the
   whole-tree checkpoint image (stage 2) described above.
@@ -1355,7 +1518,9 @@ This is a host model, not a kernel or Linux comparison.
   window instead of hanging. No kernel defect was found; two harness
   bring-up defects (serial LF display expectation, marker-prefix race) were
   fixed before the PASS.
-- Phase 8 stage-3 limits (spec: `docs/WIN32_REGISTRY.md` §13, ADR-0024):
+- Phase 8 stage-3 limits (spec: `docs/WIN32_REGISTRY.md` §13, ADR-0024;
+  historical — stage 4 supersedes the read-only scope and the fifteen-name
+  count):
   fifteen allowlisted names across two DLLs (`kernel32.dll` +
   `advapi32.dll`); the surface is read-only (`RegOpenKeyExA`,
   `RegQueryValueExA`, `RegCloseKey` only — no create/set/delete/enumeration),
@@ -1371,6 +1536,25 @@ This is a host model, not a kernel or Linux comparison.
   vendor-verified. No kernel defect was found; one harness expectation (the
   `\r\r\n` size-query terminator) and one stale-ISO rerun (the first `pe`
   regression) were fixed before the PASS.
+- Phase 8 stage-4 limits (spec: `docs/WIN32_REGISTRY_WRITE.md` §14,
+  ADR-0025): eighteen allowlisted names across the same two DLLs; writes are
+  `RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA` over a four-slot
+  `HKLM` table, REG_SZ values only, `samDesired` ignored. Keys are lazy and
+  children-only: they are created on the first successful write, and a key
+  whose last value was deleted reports `created` again rather than being
+  removed — there are no empty key objects. Write-path validation joins and
+  checks the whole path (bad names/data → 87, invalid handle → 6, missing
+  value → 2, store-full → 8) unlike the stage-3 read miss rule (2/87).
+  Values cap at the store's 128 bytes + NUL (`MAX_REG_VALUE` 129). No
+  `RegDeleteKey`, enumeration, `RegQueryInfoKey`, `RegFlushKey` (every
+  successful write saves), no hives/ACLs/transactions, no typed values
+  beyond REG_SZ, no `W`/Unicode variants, no default/unnamed values, no other
+  roots, no access rights checked (`KEY_SET_VALUE` is not honored), and no
+  concurrency guarantees beyond the store's lock. NULL `lpSubKey` (create)
+  and NULL `lpValueName`/`lpData` acceptance/rejection are project contracts
+  (spec §7–§12), not vendor-verified. No kernel defect was found; one
+  fixture-order bring-up defect (repeat create before the first write)
+  was fixed in the fixture before the PASS.
 - Phase 6 stage-5 limits (spec/ADR: `docs/NETWORK.md` §10, ADR-0018): one
   polled e1000 on bus 0 with static `10.0.2.15/24`; no DHCP/DNS/TCP/sockets,
   no interrupt/MSI receive or background RX (packets are processed only while
@@ -1426,9 +1610,10 @@ This is a host model, not a kernel or Linux comparison.
   self-test's diagnostic fields (row, offset, expected, actual) made the
   failures analyzable.
 - User-mode limits (Phase 6 stage 3, extended by Phase 7 stages 1–3 and
-  Phase 8 stages 2–3): programs are our own ELF64 `ET_EXEC` modules or PE32+
-  images loaded from Limine — the PE path resolves only the fifteen
-  stage-2/stage-3/Phase-8-stage-2/stage-3 `kernel32.dll`+`advapi32.dll`
+  Phase 8 stages 2–4): programs are our own ELF64 `ET_EXEC` modules or PE32+
+  images loaded from Limine — the PE path resolves only the eighteen
+  stage-2/stage-3/Phase-8-stage-2/stage-3/stage-4
+  `kernel32.dll`+`advapi32.dll`
   names (see those limits above), and neither path has PIE/dynamic linking,
   PT_INTERP or ASLR, and there is no filesystem-backed exec; the code window
   is fixed at
@@ -1437,7 +1622,8 @@ This is a host model, not a kernel or Linux comparison.
   user thread, so concurrent user threads are not supported); there is no
   fork/exec/wait, no guard page above the user stack, and the syscalls that
   write into user memory are `ReadFile` (line-mode console input) and the
-  registry surface (`RegOpenKeyExA`/`RegQueryValueExA` output pointers, all
+  registry surface (`RegOpenKeyExA`/`RegQueryValueExA`/`RegCreateKeyExA`
+  output pointers plus the `RegSetValueExA` value pointer, all
   validated); the syscall gate is `int 0x80` with a 4 KiB
   write cap, console-fd-only write and console-input-fd-only read. Skip paths
   print explicit skipped verdicts when modules are absent (not a pass).
@@ -1478,23 +1664,27 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 8 stage 1 (configuration store), stage 2 (Win32 console input) and
-stage 3 (Win32 registry read surface) are complete: the store rides the
-existing checkpoint with a host-tested `POCF` codec (`docs/CONFIG.md`,
-ADR-0022); service 14 `ReadFile` gives a PE32+ program a blocking, echoing
-line-mode read from the serial console with documented error mapping
-(`docs/WIN32_INPUT.md`, ADR-0023, R-016); services 15–17 expose a read-only
-`HKLM` view over the store through a second allowlisted DLL
-(`docs/WIN32_REGISTRY.md`, ADR-0024, R-017).
-Verified: 24 PASS / 0 FAIL / 4 SKIP; unit suite 269; stage-3 artifacts
-recorded above. The stage-3 commit and this progress commit will be pushed
-to `orgin/main` with the usual commit-then-record pattern. Single best next
-action: **choose and implement Phase 8 stage 4 — the next scoped Win32
-surface on the proven machinery.** Strongest candidates:
-(1) a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/
-`RegDeleteValueA` over the config store, persisted through the existing VFS
-dirty path, extending the handle table with access rights);
-(2) more process/thread functions (e.g. a wait/sleep pair or
+Phase 8 stage 1 (configuration store), stage 2 (Win32 console input),
+stage 3 (Win32 registry read surface) and stage 4 (Win32 registry write
+surface) are complete: the store rides the existing checkpoint with a
+host-tested `POCF` codec (`docs/CONFIG.md`, ADR-0022); service 14 `ReadFile`
+gives a PE32+ program a blocking, echoing line-mode read from the serial
+console with documented error mapping (`docs/WIN32_INPUT.md`, ADR-0023,
+R-016); services 15–17 expose a read-only `HKLM` view over the store through
+a second allowlisted DLL (`docs/WIN32_REGISTRY.md`, ADR-0024, R-017); and
+services 18–20 add `RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA` with
+lazy children-only keys, `created`/`opened existing` dispositions and
+persistence through the config store's save path
+(`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025, R-018).
+Verified: 25 PASS / 0 FAIL / 4 SKIP; unit suite 269; stage-4 artifacts
+recorded above (kernel `dd468fee…`, `peregw.exe` `3b00b91a…`, registry-write
+session `4c03490b…`). The stage-4 commit `30a7f09` and this progress commit
+will be pushed to `orgin/main` with the usual commit-then-record pattern.
+Single best next action: **choose and implement Phase 8 stage 5 — the next
+scoped Win32 surface on the proven machinery.** Strongest candidates:
+(1) continuing the registry arc with key deletion/enumeration
+(`RegDeleteKey`, `RegEnumKeyExA`/`RegEnumValueA`) over the same store and
+handle table; (2) more process/thread functions (e.g. a wait/sleep pair or
 `QueryPerformanceCounter`) extending the Phase 7 stage-3 program basics;
 (3) a third allowlisted DLL (`user32.dll`-shaped or similar) to prove the
 loader resolves a third DLL name while the runtime stays honest about what

@@ -880,6 +880,132 @@ contract choices our own tests define (four slots → `ERROR_TOO_MANY_OPEN_FILES
 `REG_OPTION_OPEN_LINK` → 87, unnamed/default values → 2) held exactly. No
 statement about a real Windows registry beyond the fetched ones is claimed.
 
+## R-018 — Registry write surface: `RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA` over the config store
+
+**Question.** What are the documented contracts of the three mutating
+`advapi32.dll` registry functions — argument shapes and order, reserved and
+ignorable parameters, disposition semantics, value-size and null-termination
+rules — and can the Phase 8 config store back a registry-shaped write
+surface for genuine PE32+ importers without over-claiming Windows registry
+behavior? (Stage 3's R-017 covers the read trio; this stage adds writes.)
+
+**Sources.**
+- Microsoft Learn `RegCreateKeyExA` (fetched 2026-10-19, ms.date
+  2018-12-05): nine arguments `(hKey, lpSubKey, Reserved, lpClass,
+  dwOptions, samDesired, lpSecurityAttributes, phkResult, lpdwDisposition)`;
+  exported by `Advapi32.dll`; "If the key already exists, the function opens
+  it"; "If lpSubKey is a pointer to an empty string, phkResult receives a new
+  handle to the key specified by hKey"; "This parameter cannot be NULL";
+  "Reserved ... must be zero"; `lpClass` "can be NULL"
+  and "This parameter may be ignored" and "can be NULL"; `dwOptions`:
+  `REG_OPTION_BACKUP_RESTORE` (0x00000004), `REG_OPTION_CREATE_LINK`
+  (0x00000002), `REG_OPTION_NON_VOLATILE` (0x00000000), `REG_OPTION_VOLATILE`
+  (0x00000001); `samDesired` "is checked against the security descriptor of
+  the registry key, not the access mask specified when the handle was
+  obtained"; "If this parameter is NULL, the key will not be inherited";
+  `phkResult` "receives a handle to the opened or created key"; "If the
+  function fails, the handle is zero"; `lpdwDisposition` "can be NULL" and
+  receives `REG_CREATED_NEW_KEY` (0x00000001) or
+  `REG_OPENED_EXISTING_KEY` (0x00000002); remarks: "The key that the
+  RegCreateKeyEx function creates has no values; value names are added to the
+  key using the RegSetValueEx function"; "An application cannot create a key
+  that is a direct child of HKEY_USERS or HKEY_LOCAL_MACHINE."
+- Microsoft Learn `RegSetValueExA` (fetched 2026-10-19, ms.date 2018-12-05):
+  six arguments `(hKey, lpValueName, Reserved, dwType, lpData, cbData)`;
+  "If this parameter is NULL or an empty string, "", the function retrieves
+  the type and data for the key's unnamed or default value"; "Reserved ...
+  must be zero"; "For string-based types, such as REG_SZ, the string must be
+  null-terminated"; `lpData` "can be NULL if cbData is zero" (a null value);
+  "If data is of type REG_SZ ... then cbData must include the size of the
+  terminating null character".
+- Microsoft Learn `RegDeleteValueA` (fetched 2026-10-19, ms.date
+  2018-12-05): two arguments `(hKey, lpValueName)`; "If this parameter is
+  NULL or an empty string, "", the function removes the unnamed or default
+  value"; "Value names are not case sensitive"; the page states failure
+  returns a nonzero error code but does not enumerate a missing-value code.
+- WinError numeric values: `ERROR_SUCCESS` 0, `ERROR_FILE_NOT_FOUND` 2,
+  `ERROR_TOO_MANY_OPEN_FILES` 4, `ERROR_INVALID_HANDLE` 6,
+  `ERROR_NOT_ENOUGH_MEMORY` 8, `ERROR_INVALID_PARAMETER` 87 from the
+  R-014/R-015/R-017 source set (8 additionally confirmed on the fetched
+  `RegSetValueExA`/`RegCreateKeyExA` error tables as
+  `ERROR_NOT_ENOUGH_MEMORY`).
+
+**Claim.** The config store can back a registry-shaped write surface:
+`RegCreateKeyExA` maps its nine arguments through the first nine-argument
+stub (`r10`–`r14` forwarded by the entry stub; `isr_common` already saves
+them); `reserved != 0` and `dwOptions != 0` → 87; NULL `lpSubKey` is treated
+as empty (a documented deviation: the fetched page says the parameter
+"cannot be NULL"; we keep stage 3's NULL-is-empty rule and state it), a
+non-empty subkey must join to a valid store path (87 otherwise) and exists
+iff the store has children under that prefix (an empty subkey instead
+returns a new slot handle to the same key per the fetched statement — a
+newer handle, unlike stage 3's `RegOpenKeyExA` refresh — and reports
+`REG_OPENED_EXISTING_KEY`);
+`phkResult` is validated and zeroed on failure (project contract; the
+fetched page says only "If the function fails, the handle is zero");
+`lpdwDisposition` is optional and receives 1 (no children before the call)
+or 2 (children existed); `lpClass` and `lpSecurityAttributes` are ignored
+and never dereferenced (the fetched page says `lpClass` may be ignored);
+`samDesired` is ignored because creation access is documented as checked
+against the key's security descriptor, which we do not have; the fetched
+direct-HKLM-child prohibition is not enforced (no namespace policy).
+`RegSetValueExA` maps through the existing `Args6` shape: NULL/empty name
+(default value) → 87 because default values are not modeled; `reserved != 0`
+→ 87; only `REG_SZ` (1) is accepted; NULL `lpData` → 87 (null values not
+modeled); `cbData` must be 1..=129 with a terminating NUL and a
+printable-ASCII payload ≤128 bytes (the store's documented cap); the joined
+entry is written and `config::save()` persists it. `RegDeleteValueA` maps
+through `Args4`: NULL/empty name → 87; missing value → 2 (our contract,
+consistent with the fetched `RegQueryValueExA` missing-value statement; the
+`RegDeleteValueA` page does not enumerate a code — confidence medium, noted);
+case-insensitive matching per the fetched "value names are not case
+sensitive". Keys are children-only: a created key with no values leaves no
+trace and a key whose last value is deleted ceases to exist (deviation from
+the fetched "creates ... no values" state, which POCF cannot represent; it
+is stated, not hidden). Store-full/save failures map to 8
+(`ERROR_NOT_ENOUGH_MEMORY`). Deviations we state: `samDesired` ignored,
+default values rejected, null values rejected, other predefined roots → 2,
+typed values beyond REG_SZ rejected, no namespace rules, no empty keys, no
+`RegDeleteKey`. Confidence: high for argument shapes, reserved/ignore rules,
+disposition values, null-termination/cbData rules and error codes; medium
+for the missing-value delete code (2) and the resource-exhaustion mapping
+(8), which our own contracts define.
+
+**Experiment.** PASSED (QEMU 11.1.0, 2026-10-19). `scripts/test_registry_write_qemu.sh`
+booted `artifacts/project-os-registry-write.iso` and `peregw.exe` exercised the
+surface through genuine `advapi32.dll` raw-dylib imports: first create of
+`Session/Current` → handle 4096 `created`; `RegSetValueExA` `Flag` set (then
+read back `enabled`), updated to `on`, size query 3 bytes; `REG_DWORD` type
+→ 87; NULL data → 87; bad handle → 6; invalid joined name → 87; NULL/empty
+value name → 87; `RegDeleteValueA` missing → 2, bad handle → 6, success → 0
+with a follow-up query now → 2 (key vanished with its last value);
+re-create → 4097 `created` (no children anymore, slot reused); write of
+`Persisted` = `yes`; both handles closed; summary written (39 bytes); exit 0.
+The phase counter assertions (create +3, set +8, delete +3, query +3, close
++3, `WriteFile` +1, console writes +1 / 39 bytes, no user faults) and the
+`user.rs` persist/read-back/decode/restore assertions passed. The first
+fixture order (repeat create before the first write) correctly reported
+`created` under the children-only model and was fixed by reordering the
+fixture; the re-run matched every pinned line. Transcript:
+`artifacts/qemu-registry-write-session.log` (10,407 bytes, sha256
+`4c03490bed58031e65eea434a5ba4b0cb2698d49919fb1726af68535c7a16077`);
+`scripts/test_all.sh` reported `PASS=25 FAIL=0 SKIP=4` at build id
+`0.1.0-fe3c278e`.
+
+**Conclusion.** All fetched statements the transcript exercises were
+reproduced: the nine-argument create shape (seventh–ninth arguments through
+`r12`–`r14`), the disposition pair (1 with no children, 2 once a value
+existed, 1 again after the last value was deleted), the children-only
+namespace, REG_SZ set/update semantics, the missing-value delete → 2
+(confidence medium, our contract), bad-handle → 6 and invalid-argument → 87
+paths, and persistence through the same `/etc/config` codec the checkpoint
+carries. The contract choices our own tests define (NULL subkey = empty key,
+zeroed `*phkResult` on failure, default/null values rejected, `samDesired`
+and namespace rules ignored, store-full/save failure → 8) held exactly as
+written. Create paths not exercised by the fixture (nonzero `Reserved`/
+`dwOptions`) rest on the fetched statements only. No statement about a real
+Windows registry beyond the fetched ones is claimed.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

@@ -1,15 +1,19 @@
-//! Win32 registry-shaped read-only view over the config store (Phase 8,
-//! stage 3).
+//! Win32 registry-shaped view over the config store (Phase 8, stages 3–4).
 //!
 //! `HKLM` is the only backed root; a "key" is a store path prefix with
-//! children, a "value" is one store entry read as REG_SZ. Handles are four
+//! children, a "value" is one store entry mapped to REG_SZ. Handles are four
 //! synthetic slot values (`0x1000 + slot`); `user.rs` resets the table after
 //! every user program's teardown, so handles die with the program. Lookups
 //! are ASCII case-insensitive, matching the documented Windows key-name rule,
-//! while the store itself stays byte-exact (POCF). The full contract is
-//! `docs/WIN32_REGISTRY.md`; primary sources are in R-017.
+//! while the store itself stays byte-exact (POCF). Stage 4 adds mutations:
+//! `create` (lazy — keys exist only while entries live under them),
+//! `set_value` and `delete_value`, both persisted through `config::save()`.
+//! The full contracts are `docs/WIN32_REGISTRY.md` and
+//! `docs/WIN32_REGISTRY_WRITE.md`; primary sources are R-017/R-018.
 
 use alloc::string::String;
+
+use os_core::config::key_is_valid;
 
 use crate::config;
 use crate::sync::IrqSpinLock;
@@ -38,6 +42,10 @@ pub enum KeyError {
     NotFound,
     /// All [`MAX_KEYS`] slots are in use.
     TooManyKeys,
+    /// A path, value name or value the store could never accept.
+    BadArgument,
+    /// The store or its serialised file could not take the write.
+    NoSpace,
 }
 
 static KEYS: IrqSpinLock<[Option<String>; MAX_KEYS]> = IrqSpinLock::new([None, None, None, None]);
@@ -76,17 +84,32 @@ fn prefix_has_children(prefix: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// The store key for the value `name` under `prefix` (or `name` alone at the
+/// root).
+fn joined_entry(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        return String::from(name);
+    }
+    let mut joined = String::from(prefix);
+    joined.push('/');
+    joined.push_str(name);
+    joined
+}
+
+/// Map a store mutation failure onto the registry error surface.
+fn write_error(error: os_core::config::ConfigError) -> KeyError {
+    use os_core::config::ConfigError;
+    match error {
+        ConfigError::BadKey | ConfigError::BadValue => KeyError::BadArgument,
+        ConfigError::NoSuchKey => KeyError::NotFound,
+        _ => KeyError::NoSpace,
+    }
+}
+
 /// The value of the entry at `prefix + "/" + name` (or `name` alone for the
 /// root), case-insensitively, as REG_SZ data.
 fn lookup_value(prefix: &str, name: &str) -> Option<String> {
-    let joined = if prefix.is_empty() {
-        String::from(name)
-    } else {
-        let mut joined = String::from(prefix);
-        joined.push('/');
-        joined.push_str(name);
-        joined
-    };
+    let joined = joined_entry(prefix, name);
     config::with(|config| {
         config
             .list(None)
@@ -137,6 +160,71 @@ pub fn value(hkey: u64, name: &str) -> Result<String, KeyError> {
     }
     let prefix = prefix_of(hkey)?;
     lookup_value(&prefix, name).ok_or(KeyError::NotFound)
+}
+
+/// `RegCreateKeyExA` backend. Lazy: a key exists only while entries live
+/// under it, so nothing is written (and nothing persists) here. The returned
+/// flag is the `REG_CREATED_NEW_KEY` disposition (`true`) versus
+/// `REG_OPENED_EXISTING_KEY` (`false`): a non-empty subkey is "new" when the
+/// prefix has no children; an empty subkey opens the parent itself on a new
+/// handle and always reports "existing".
+pub fn create(parent: u64, subkey: &str) -> Result<(u64, bool), KeyError> {
+    let prefix = prefix_of(parent)?;
+    let target = if subkey.is_empty() {
+        prefix
+    } else if prefix.is_empty() {
+        String::from(subkey)
+    } else {
+        let mut joined = prefix;
+        joined.push('/');
+        joined.push_str(subkey);
+        joined
+    };
+    if !subkey.is_empty() && !key_is_valid(&target) {
+        return Err(KeyError::BadArgument);
+    }
+    let created = !subkey.is_empty() && !prefix_has_children(&target);
+    let mut keys = KEYS.lock();
+    match keys.iter().position(Option::is_none) {
+        Some(slot) => {
+            keys[slot] = Some(target);
+            Ok((HANDLE_BASE + slot as u64, created))
+        }
+        None => Err(KeyError::TooManyKeys),
+    }
+}
+
+/// `RegSetValueExA` backend: write the (already-validated) REG_SZ payload at
+/// `prefix + "/" + name` and persist the store into `/etc/config`.
+pub fn set_value(parent: u64, name: &str, value: &str) -> Result<(), KeyError> {
+    if name.is_empty() {
+        return Err(KeyError::BadArgument);
+    }
+    let prefix = prefix_of(parent)?;
+    let joined = joined_entry(&prefix, name);
+    if !key_is_valid(&joined) {
+        return Err(KeyError::BadArgument);
+    }
+    let stored = config::with(|store| store.set(&joined, value)).map_err(|_| KeyError::NoSpace)?;
+    stored.map_err(write_error)?;
+    config::save().map_err(|_| KeyError::NoSpace)
+}
+
+/// `RegDeleteValueA` backend: remove the entry at `prefix + "/" + name` and
+/// persist the store. A missing entry is `NotFound`; when the last entry
+/// under a prefix is removed the key ceases to exist (children-only rule).
+pub fn delete_value(parent: u64, name: &str) -> Result<(), KeyError> {
+    if name.is_empty() {
+        return Err(KeyError::BadArgument);
+    }
+    let prefix = prefix_of(parent)?;
+    let joined = joined_entry(&prefix, name);
+    if !key_is_valid(&joined) {
+        return Err(KeyError::BadArgument);
+    }
+    let removed = config::with(|store| store.remove(&joined)).map_err(|_| KeyError::NoSpace)?;
+    removed.map_err(write_error)?;
+    config::save().map_err(|_| KeyError::NoSpace)
 }
 
 /// `RegCloseKey` backend. `HKLM` closes as a no-op (predefined handles are

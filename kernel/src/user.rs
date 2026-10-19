@@ -43,6 +43,14 @@
 //!   exhaustion/reuse and double close. It exists only on the dedicated
 //!   registry ISO (`make_iso.sh --registry-fixture`); without the module the
 //!   phase is skipped with an explicit line.
+//! * `peregw.exe` (Phase 8, stage 4) imports `RegCreateKeyExA` (the first
+//!   nine-argument stub), `RegSetValueExA` and `RegDeleteValueA` from
+//!   `advapi32.dll` and exercises the registry write surface over the config
+//!   store: create/open dispositions, REG_SZ sets and updates, deletes,
+//!   documented error values and persistence through `/etc/config`. It
+//!   exists only on the dedicated registry-write ISO
+//!   (`make_iso.sh --registry-write-fixture`); without the module the phase
+//!   is skipped with an explicit line.
 //!
 //! Each program runs one at a time on its own scheduler thread. The thread
 //! publishes its address space and load plan into a static slot; after the
@@ -57,6 +65,7 @@ use os_core::frame::PhysFrame;
 use os_core::paging::{PAGE_SIZE, USER_DATA};
 
 use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR, set_tss_rsp0};
+use crate::config;
 use crate::kprintln;
 use crate::limine;
 use crate::loader;
@@ -67,6 +76,7 @@ use crate::sched;
 use crate::serial;
 use crate::sync::IrqSpinLock;
 use crate::syscall;
+use crate::vfs;
 use crate::vm::{self, AddressSpace};
 
 const HELLO_PATH: &str = "/boot/hello.elf";
@@ -81,6 +91,7 @@ const PEBASICS_PATH: &str = "/boot/pebasics.exe";
 const PEBADFN2_PATH: &str = "/boot/pebadfn2.exe";
 const PEINPUT_PATH: &str = "/boot/peinput.exe";
 const PEREG_PATH: &str = "/boot/pereg.exe";
+const PEREGW_PATH: &str = "/boot/peregw.exe";
 
 /// Single user stack page, at the stage-5b placement just above the code
 /// window (`loader::CODE_END` == `STACK_VA`).
@@ -337,6 +348,10 @@ fn thread_peinput() {
 
 fn thread_pereg() {
     run_pe(PEREG_PATH);
+}
+
+fn thread_peregw() {
+    run_pe(PEREGW_PATH);
 }
 
 fn unmap_and_free(space: &mut AddressSpace, virtual_address: u64) -> Result<(), &'static str> {
@@ -792,6 +807,91 @@ pub fn demo() -> Result<DemoReport, &'static str> {
             PEREG_PATH
         );
         kprintln!("win32 registry selftest: skipped (no registry fixture present)");
+    }
+
+    // Phase 8, stage 4: the Win32 registry write surface. `peregw.exe` is
+    // only present on the dedicated registry-write ISO, so a missing module
+    // skips the phase like the stages above and every earlier contract stays
+    // unchanged.
+    if limine::module_by_path(PEREGW_PATH).is_some() {
+        let create_before_rw = syscall::WIN32_REG_CREATE_KEY_CALLS.load(Ordering::SeqCst);
+        let set_before_rw = syscall::WIN32_REG_SET_VALUE_CALLS.load(Ordering::SeqCst);
+        let delete_before_rw = syscall::WIN32_REG_DELETE_VALUE_CALLS.load(Ordering::SeqCst);
+        let query_before_rw = syscall::WIN32_REG_QUERY_VALUE_CALLS.load(Ordering::SeqCst);
+        let close_before_rw = syscall::WIN32_REG_CLOSE_KEY_CALLS.load(Ordering::SeqCst);
+        let writefile_before_rw = syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst);
+        let writes_before_rw = syscall::WRITE_CALLS.load(Ordering::SeqCst);
+        let bytes_before_rw = syscall::BYTES_WRITTEN.load(Ordering::SeqCst);
+        let faults_before_rw = syscall::USER_FAULTS.load(Ordering::SeqCst);
+
+        sched::spawn("user-win32-registry-write", thread_peregw)?;
+        sched::wait_all_finished(300)?;
+        vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
+        cleanup_slot()?;
+        if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
+            return Err("peregw.exe did not exit with code 0");
+        }
+        if syscall::WIN32_REG_CREATE_KEY_CALLS.load(Ordering::SeqCst) != create_before_rw + 3 {
+            return Err("peregw.exe did not call RegCreateKeyExA exactly three times");
+        }
+        if syscall::WIN32_REG_SET_VALUE_CALLS.load(Ordering::SeqCst) != set_before_rw + 8 {
+            return Err("peregw.exe did not call RegSetValueExA exactly eight times");
+        }
+        if syscall::WIN32_REG_DELETE_VALUE_CALLS.load(Ordering::SeqCst) != delete_before_rw + 3 {
+            return Err("peregw.exe did not call RegDeleteValueA exactly three times");
+        }
+        if syscall::WIN32_REG_QUERY_VALUE_CALLS.load(Ordering::SeqCst) != query_before_rw + 3 {
+            return Err("peregw.exe did not call RegQueryValueExA exactly three times");
+        }
+        if syscall::WIN32_REG_CLOSE_KEY_CALLS.load(Ordering::SeqCst) != close_before_rw + 3 {
+            return Err("peregw.exe did not call RegCloseKey exactly three times");
+        }
+        if syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst) != writefile_before_rw + 1 {
+            return Err("peregw.exe did not call WriteFile exactly once");
+        }
+        if syscall::WRITE_CALLS.load(Ordering::SeqCst) != writes_before_rw + 1 {
+            return Err("peregw.exe did not perform exactly one console write");
+        }
+        if syscall::BYTES_WRITTEN.load(Ordering::SeqCst) != bytes_before_rw + 39 {
+            return Err("peregw.exe did not write exactly 39 bytes");
+        }
+        if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_before_rw {
+            return Err("peregw.exe produced a user fault");
+        }
+
+        // The fixture's mutation must still be in the store, must survive a
+        // save/read-back/decode round trip through `/etc/config`, and is then
+        // removed so the store returns to the three seeded defaults. The
+        // file itself stays written with the defaults (no disk flush happens
+        // without shell activity; documented stage-4 behavior).
+        const PERSISTED: &str = "Session/Current/Persisted";
+        match config::get(PERSISTED) {
+            Ok(Some(value)) if value == "yes" => {}
+            _ => return Err("peregw.exe did not persist the registry value"),
+        }
+        config::save()?;
+        let read = vfs::with(|vfs| vfs.read_file(config::CONFIG_PATH).map(|data| data.to_vec()))
+            .map_err(|_| "reading /etc/config failed")?;
+        let blob = read.map_err(|_| "reading /etc/config failed")?;
+        let decoded = os_core::config::Config::decode(&blob)
+            .map_err(|_| "the persisted /etc/config did not decode")?;
+        if decoded.get(PERSISTED) != Some("yes") {
+            return Err("the persisted /etc/config lost the registry value");
+        }
+        config::remove(PERSISTED)?;
+        config::save()?;
+        if !matches!(config::get(PERSISTED), Ok(None)) {
+            return Err("restoring the store after the registry write failed");
+        }
+        kprintln!(
+            "win32 registry write selftest: passed (advapi32.dll RegCreateKeyExA/RegSetValueExA/RegDeleteValueA over the config store; create/open dispositions, REG_SZ sets and updates, deletes, error values 2/6/87, persistence through /etc/config verified)"
+        );
+    } else {
+        kprintln!(
+            "user: Win32 registry write self-test skipped (`{}` module missing)",
+            PEREGW_PATH
+        );
+        kprintln!("win32 registry write selftest: skipped (no registry write fixture present)");
     }
 
     sched::set_preemption(false);

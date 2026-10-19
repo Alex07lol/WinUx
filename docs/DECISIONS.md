@@ -1160,3 +1160,107 @@ beyond REG_SZ, default values, per-user namespaces, `W`/Unicode variants or
 remote registry; four concurrent key handles is a stage limit. Those limits
 must be restated whenever this stage is cited.
 
+## ADR-0025 – A registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`) persisting through the config store (Phase 8, stage 4)
+
+**Context.** Stage 3 proved the second-DLL import machinery with a read-only
+registry view (`RegOpenKeyExA`, `RegQueryValueExA`, `RegCloseKey`, services
+15–17). The natural next capability is mutation: a program that can read
+configuration but never store it cannot be a consumer of the store. The full
+contract (argument order, pinned serial lines, fixture sequence, call deltas)
+lives in `docs/WIN32_REGISTRY_WRITE.md`; primary sources are in R-018.
+
+**Decision.**
+
+- **Write services that persist through the existing store and file.**
+  `RegSetValueExA` and `RegDeleteValueA` mutate the same POCF store the shell
+  `config` builtin uses and call the existing `config::save()` so the VFS
+  `/etc/config` blob the checkpoint carries reflects them. Rejected: a
+  separate registry file (would fork persistence), keeping writes
+  in-memory only (breaks the checkpoint story), deferred persistence (the
+  fixture's exit assertions would not prove it).
+- **`RegCreateKeyExA` with the real nine-argument signature and a new
+  `Args9` stub.** The seventh, eighth and ninth arguments are forwarded
+  through `r12`–`r14`, which `isr_common` already saves, so the entry stub
+  is untouched; the fixed stub stride grows 24 → 48 bytes with the existing
+  compile-time assertion. Rejected: truncating the signature (would
+  mis-read `phkResult`/`lpdwDisposition`), passing the tail through memory
+  (an ABI split), allocating a variable-length stub (breaks the fixed
+  stride invariant the loader tests prove).
+- **Lazy keys: the stage-3 children-only namespace with dispositions.**
+  `REG_CREATED_NEW_KEY` (1) when the prefix had no entries before the call,
+  `REG_OPENED_EXISTING_KEY` (2) otherwise; empty subkey refreshes the same
+  key; a key whose last value is deleted ceases to exist. Rejected: real
+  empty-key objects (POCF has no way to represent them without a format
+  change; the fetched "creates has no values" state is therefore a stated
+  deviation), and synthesising keys in RAM only (duplicates the store).
+- **Validate what you create.** Subkey/value names that join to an invalid
+  store path return 87 on writes, while stage-3 reads keep their
+  simply-miss-and-return-2 behavior. Rejected: making reads validate too
+  (changes a verified stage-3 contract for no gain).
+- **Reserved/ignored parameters pinned to the fetched statements.**
+  `Reserved != 0` → 87 for both write services; `dwOptions != 0` → 87 on
+  create; `lpClass`/`lpSecurityAttributes` ignored and never dereferenced;
+  `samDesired` ignored (creation access is documented as checked against
+  the key's security descriptor, not the handle's mask); the fetched
+  direct-HKLM-child prohibition is not enforced. Rejected: dereferencing
+  `lpSecurityAttributes` to reject non-NULL (would invent semantics), and
+  silently accepting nonzero `Reserved`/`dwOptions` (contradicts the docs).
+- **REG_SZ only, NUL-terminated, capped by the store.** `dwType != 1` → 87;
+  NULL data → 87 (null values not modeled); `cbData` 1..=129 with a final
+  NUL and a printable-ASCII payload ≤128 bytes; default values (NULL/empty
+  name) → 87 rather than silent redirection. Rejected: modelling default
+  values or null values in this stage (new store surface, no consumer),
+  and accepting non-NUL-terminated strings (contradicts the fetched rule
+  and the store's byte semantics).
+- **Error mapping stays categorical.** 6 invalid handle, 2 missing
+  value/unbacked root, 4 slot exhaustion, 87 argument errors, 8 for
+  store-full/save failures (`ERROR_NOT_ENOUGH_MEMORY`); a missing value on
+  delete is 2 (our contract, consistent with the fetched query statement;
+  the delete page does not enumerate a code — R-018 records the confidence).
+  Rejected: 1018/other codes with no fetched basis.
+- **The fixture is isolated in a dedicated ISO variant.**
+  `peregw.exe` is copied only by `make_iso.sh --registry-write-fixture`
+  (`artifacts/project-os-registry-write.iso`, mutually exclusive with the
+  other three variants); default and other variant ISOs, module lists,
+  pinned serial lines and markers stay byte-identical, so every earlier
+  harness remains a regression test.
+- **No new marker token.** The write surface belongs to the existing
+  `win32` check. The boot phase additionally verifies persist/read-back/
+  restore of `Session/Current/Persisted` and documents that this variant
+  leaves `/etc/config` written with defaults (no disk flush without shell
+  activity).
+
+**Alternatives considered.** `RegDeleteKey`/`RegDeleteTree` first (new key
+removal semantics without a consumer); `REGDWORD` end to end (needs a typed
+value model the store does not have); user32.dll-shaped GUI names before a
+window manager exists (would misrepresent capability); a host-side test of
+the write logic (the kernel logic is thin; the real risk is the `Args9`
+import/stub path, which only a PE image exercises).
+
+**Evidence.** `scripts/test_registry_write_qemu.sh` → `PASS: Win32 registry
+write surface verified`; `artifacts/qemu-registry-write-session.log` (10,407 B,
+sha256 `4c03490bed58031e65eea434a5ba4b0cb2698d49919fb1726af68535c7a16077`)
+asserts every pinned line plus the counted duplicate (`RegCloseKey(4097) -> 0`
+twice — after the second create and in the teardown close pair). `peregw.exe`
+(5,632 B, sha256 `3b00b91a8677ce733f62af242809abe146005c853bb23e99d0c0d00135d5df01`,
+imports `advapi32.dll:RegCloseKey,RegCreateKeyExA,RegDeleteValueA,RegQueryValueExA,RegSetValueExA;kernel32.dll:ExitThread,WriteFile`)
+exited 0 with exactly 3/8/3 create/set/delete calls, one 39-byte summary write
+and no user faults; the boot phase verified the persisted store by save,
+read-back, `Config::decode` and restore. One defect found while bringing the
+fixture up (repeat create before the first write correctly reported `created`)
+was fixed by reordering the fixture steps. The default ISO (no `peregw.exe`)
+prints both registry skip lines; `scripts/test_pe_qemu.sh`,
+`scripts/test_input_qemu.sh` and `scripts/test_registry_qemu.sh` stayed PASS;
+`scripts/test_all.sh` reported `PASS=25 FAIL=0 SKIP=4` at build id
+`0.1.0-fe3c278e` (kernel.elf 1,866,152 B, sha256
+`dd468feec137d5e6fea0a8031aa28106e64cc2cd9f6fd16a709e2e44be38ac01`).
+
+**Consequences.** PROJECT_OS has a genuine ring-3 write path into the config
+store through allowlisted `advapi32.dll` services, the first nine-argument
+service and a persisted configuration mutation. It is not a Windows
+registry: no hives, ACLs, access checks, transactions, enumeration, key
+deletion, typed values beyond REG_SZ, default values, empty keys, per-user
+namespaces, `W`/Unicode variants or remote registry; four concurrent key
+handles and a 64-entry store are stage limits. Those limits must be
+restated whenever this stage is cited.
+

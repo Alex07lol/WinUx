@@ -49,6 +49,7 @@ run virtualbox "$ROOT_DIR/scripts/test_virtualbox.sh" "$ISO_PATH" --timeout 90
 run shell "$ROOT_DIR/scripts/test_shell_qemu.sh"
 run input "$ROOT_DIR/scripts/test_input_qemu.sh"
 run registry "$ROOT_DIR/scripts/test_registry_qemu.sh"
+run registry-write "$ROOT_DIR/scripts/test_registry_write_qemu.sh"
 run fbcon "$ROOT_DIR/scripts/test_console_qemu.sh"
 run net "$ROOT_DIR/scripts/test_net_qemu.sh"
 run persistence "$ROOT_DIR/scripts/test_persistence_qemu.sh"

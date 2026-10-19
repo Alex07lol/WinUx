@@ -1,0 +1,11 @@
+[package]
+name = "peregw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PROJECT_OS PE32+ Win32 registry-write fixture (raw-dylib RegCreateKeyExA/RegSetValueExA/RegDeleteValueA over the config store)"
+
+[[bin]]
+name = "peregw"
+path = "src/main.rs"

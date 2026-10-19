@@ -10,10 +10,10 @@
 //! fifteen function names). [`map`] then allocates, zero-fills, maps and
 //! base-relocates each section page into a fresh user address space and, when
 //! the image has imports, maps one stub page of `int 0x80` trampolines
-//! (4-, 5- and 6-argument shapes; the fifth integer argument is forwarded
-//! through `r10` and the sixth through `r11`) and patches the IAT through the
-//! HHDM, rolling the whole mapping back on any failure. The same page carries
-//! the loader-written command-line string that `GetCommandLineA` returns. The
+//! (4- to 9-argument shapes; the fifth to ninth integer arguments are
+//! forwarded through `r10`–`r14`) and patches the IAT through the HHDM,
+//! rolling the whole mapping back on any failure. The same page carries the
+//! loader-written command-line string that `GetCommandLineA` returns. The
 //! stack is owned by `user.rs`.
 //!
 //! With the ELF loader this shares the fixed 1 MiB window at `0x400000`: one
@@ -39,16 +39,16 @@ pub const MAX_RELOCATIONS: usize = 256;
 
 /// The DLLs this stage resolves imports against, byte-exact. Since Phase 8
 /// stage 3 the allowlist spans two DLLs: console/program services come from
-/// `kernel32.dll`, the read-only registry surface from `advapi32.dll`.
+/// `kernel32.dll`, the registry surface from `advapi32.dll`.
 const WIN32_DLLS: [&[u8]; 2] = [b"kernel32.dll", b"advapi32.dll"];
 
 /// Fixed import stub page: outside the code window (`loader::CODE_END`) and
 /// disjoint from the user stack page at `0x50_0000`.
 pub const WIN32_STUB_VA: u64 = 0x51_0000;
 
-/// One 24-byte stub per unique import (an `Args6` stub needs 18 bytes);
+/// One 48-byte stub per unique import (an `Args9` stub needs 23 bytes);
 /// unused bytes are `int3`.
-const STUB_STRIDE: u64 = 24;
+const STUB_STRIDE: u64 = 48;
 const STUB_UNUSED: u8 = 0xCC;
 
 /// Command-line string for `GetCommandLineA`: a fixed 256-byte tail region
@@ -99,19 +99,22 @@ impl Reject {
 }
 
 /// How many integer arguments an import's stub must forward. `Args4` covers
-/// zero to four arguments: the services ignore unused registers. `Args6`
-/// forwards the sixth argument (at `[rsp+0x30]` on entry) through `r11`.
+/// zero to four arguments: the services ignore unused registers. `Args5` and
+/// `Args6` add the fifth (`[rsp+0x28]` → `r10`) and sixth (`[rsp+0x30]` →
+/// `r11`) arguments; `Args9` additionally forwards the seventh, eighth and
+/// ninth (`[rsp+0x38]`/`[rsp+0x40]`/`[rsp+0x48]` → `r12`/`r13`/`r14`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StubShape {
     Args4,
     Args5,
     Args6,
+    Args9,
 }
 
 /// The fixed Win32 service table of this stage: DLL and function name
 /// (byte-exact) to `int 0x80` service number and stub shape. This single
 /// table backs both the import policy and the stub bytes.
-const WIN32_SERVICES: [(&[u8], &[u8], u32, StubShape); 15] = [
+const WIN32_SERVICES: [(&[u8], &[u8], u32, StubShape); 18] = [
     (
         b"kernel32.dll",
         b"GetStdHandle",
@@ -200,6 +203,24 @@ const WIN32_SERVICES: [(&[u8], &[u8], u32, StubShape); 15] = [
         b"advapi32.dll",
         b"RegCloseKey",
         syscall::SYS_REG_CLOSE_KEY as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegCreateKeyExA",
+        syscall::SYS_REG_CREATE_KEY_EX as u32,
+        StubShape::Args9,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegSetValueExA",
+        syscall::SYS_REG_SET_VALUE_EX as u32,
+        StubShape::Args6,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegDeleteValueA",
+        syscall::SYS_REG_DELETE_VALUE as u32,
         StubShape::Args4,
     ),
 ];
@@ -493,17 +514,28 @@ pub fn map(
         unsafe { core::ptr::write_bytes(window, STUB_UNUSED, PAGE_SIZE as usize) };
         for index in 0..stub_count {
             let service = stub_services[index];
+            let shape = stub_shapes[index];
             let mut stub = [STUB_UNUSED; STUB_STRIDE as usize];
             let mut cursor = 0usize;
-            if stub_shapes[index] == StubShape::Args5 || stub_shapes[index] == StubShape::Args6 {
+            if shape == StubShape::Args5 || shape == StubShape::Args6 || shape == StubShape::Args9 {
                 // mov r10, [rsp+0x28]: the fifth integer argument at
                 // function entry (32-byte shadow space + return address).
                 stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x54, 0x24, 0x28]);
                 cursor += 5;
             }
-            if stub_shapes[index] == StubShape::Args6 {
+            if shape == StubShape::Args6 || shape == StubShape::Args9 {
                 // mov r11, [rsp+0x30]: the sixth integer argument.
                 stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x5C, 0x24, 0x30]);
+                cursor += 5;
+            }
+            if shape == StubShape::Args9 {
+                // mov r12, [rsp+0x38]; mov r13, [rsp+0x40];
+                // mov r14, [rsp+0x48]: the seventh to ninth arguments.
+                stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x64, 0x24, 0x38]);
+                cursor += 5;
+                stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x6C, 0x24, 0x40]);
+                cursor += 5;
+                stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x74, 0x24, 0x48]);
                 cursor += 5;
             }
             stub[cursor] = 0xB8; // mov eax, imm32

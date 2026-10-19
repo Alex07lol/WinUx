@@ -7,6 +7,7 @@ BUILD=1
 INTERACTIVE=0
 INPUT_FIXTURE=0
 REGISTRY_FIXTURE=0
+REGISTRY_WRITE_FIXTURE=0
 for argument in "$@"; do
     case "$argument" in
         --no-build) BUILD=0 ;;
@@ -26,13 +27,18 @@ for argument in "$@"; do
             # ISO keeps debug_exit: the fixture runs without harness input.
             REGISTRY_FIXTURE=1
             ;;
+        --registry-write-fixture)
+            # Add the registry write-surface fixture module (`peregw.exe`).
+            # The ISO keeps debug_exit: the fixture runs without harness input.
+            REGISTRY_WRITE_FIXTURE=1
+            ;;
         *)
-            die "unknown argument: $argument (use --no-build, --interactive, --input-fixture and/or --registry-fixture)"
+            die "unknown argument: $argument (use --no-build, --interactive, --input-fixture, --registry-fixture and/or --registry-write-fixture)"
             ;;
     esac
 done
-if [ $((INTERACTIVE + INPUT_FIXTURE + REGISTRY_FIXTURE)) -gt 1 ]; then
-    die "--interactive, --input-fixture and --registry-fixture are separate ISO variants; pick one"
+if [ $((INTERACTIVE + INPUT_FIXTURE + REGISTRY_FIXTURE + REGISTRY_WRITE_FIXTURE)) -gt 1 ]; then
+    die "--interactive, --input-fixture, --registry-fixture and --registry-write-fixture are separate ISO variants; pick one"
 fi
 
 OUT_ISO="$ISO_PATH"
@@ -42,6 +48,8 @@ elif [ "$INPUT_FIXTURE" -eq 1 ]; then
     OUT_ISO="$ROOT_DIR/artifacts/project-os-input.iso"
 elif [ "$REGISTRY_FIXTURE" -eq 1 ]; then
     OUT_ISO="$ROOT_DIR/artifacts/project-os-registry.iso"
+elif [ "$REGISTRY_WRITE_FIXTURE" -eq 1 ]; then
+    OUT_ISO="$ROOT_DIR/artifacts/project-os-registry-write.iso"
 fi
 
 have mkisofs || die "mkisofs not found (scoop install cdrtools / apt install genisoimage or xorriso)"
@@ -67,7 +75,7 @@ for name in hello fault bad; do
     USER_ELFS="$USER_ELFS $artifact"
 done
 
-# PE32+ fixtures (Phase 7, stages 1-3; Phase 8 stages 2-3) are modules too;
+# PE32+ fixtures (Phase 7, stages 1-3; Phase 8 stages 2-4) are modules too;
 # build on demand and never produce an ISO that references a missing .exe
 # module. The console-input and registry fixtures are opt-in so the default
 # ISO's module counts and serial assertions stay exactly as stages 1-3
@@ -78,6 +86,9 @@ if [ "$INPUT_FIXTURE" -eq 1 ]; then
 fi
 if [ "$REGISTRY_FIXTURE" -eq 1 ]; then
     PE_NAMES="$PE_NAMES pereg"
+fi
+if [ "$REGISTRY_WRITE_FIXTURE" -eq 1 ]; then
+    PE_NAMES="$PE_NAMES peregw"
 fi
 USER_PES=""
 for name in $PE_NAMES; do
@@ -125,6 +136,11 @@ if [ "$REGISTRY_FIXTURE" -eq 1 ]; then
     grep -q 'module_path: boot():/boot/pereg.exe' "$STAGE/limine.conf" ||
         die "failed to add the pereg.exe module to limine.conf"
 fi
+if [ "$REGISTRY_WRITE_FIXTURE" -eq 1 ]; then
+    sed -i 's|    module_path: boot():/boot/pebadfn2.exe|    module_path: boot():/boot/pebadfn2.exe\n    module_path: boot():/boot/peregw.exe|' "$STAGE/limine.conf"
+    grep -q 'module_path: boot():/boot/peregw.exe' "$STAGE/limine.conf" ||
+        die "failed to add the peregw.exe module to limine.conf"
+fi
 cp "$ROOT_DIR/boot/limine/limine-bios.sys" "$STAGE/"
 cp "$ROOT_DIR/boot/limine/limine-bios-cd.bin" "$STAGE/"
 cp "$ROOT_DIR/boot/limine/limine-uefi-cd.bin" "$STAGE/"
@@ -154,6 +170,8 @@ elif [ "$INPUT_FIXTURE" -eq 1 ]; then
     VARIANT_NOTE=" (console-input fixture build)"
 elif [ "$REGISTRY_FIXTURE" -eq 1 ]; then
     VARIANT_NOTE=" (registry fixture build)"
+elif [ "$REGISTRY_WRITE_FIXTURE" -eq 1 ]; then
+    VARIANT_NOTE=" (registry write fixture build)"
 fi
 log "creating ISO with BIOS + UEFI El Torito entries${VARIANT_NOTE}"
 # cdrtools mkisofs spells the EFI platform id numerically (0xef = 239); it does

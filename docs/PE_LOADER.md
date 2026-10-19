@@ -27,7 +27,11 @@ Deliberately **not** in this stage:
   import-directory parsing and IAT resolution for three allowlisted
   `kernel32.dll` names — `docs/WIN32_CONSOLE.md`, ADR-0020; stage 3 grows the
   same allowlist to eleven names, adds the five-argument stub form and the
-  stub-page command-line tail — `docs/WIN32_PROGRAM.md`, ADR-0021);
+  stub-page command-line tail — `docs/WIN32_PROGRAM.md`, ADR-0021; Phase 8
+  stages 2–4 later grow it to the two-DLL eighteen-name surface with
+  4-/5-/6-/9-argument stubs — `docs/WIN32_INPUT.md`,
+  `docs/WIN32_REGISTRY.md`, `docs/WIN32_REGISTRY_WRITE.md`,
+  ADR-0023/0024/0025);
 - no Win32 API services yet (that is stage 2 of Phase 7: a named console
   fixture set against our own API surface);
 - no exception directory (`.pdata`) processing, no SEH, no unwind — the
@@ -350,22 +354,30 @@ pub fn map(space: &mut AddressSpace, module: &limine::File, image: &Inspection)
   applied relocations cannot occur (rejected in `inspect` except when
   relocations exist precisely to be applied).
 - Import policy (`docs/WIN32_CONSOLE.md` §5; `docs/WIN32_PROGRAM.md` §5, stage
-  3): `inspect` rejects any import whose DLL name is not exactly
-  `kernel32.dll` (`UnknownImportDll`) or whose function name is not in the
-  fixed service table (`UnknownImportFunction`) — three entries in stage 2,
-  eleven in stage 3 — and any IAT slot that is not an 8-byte, in-page
+  3; `docs/WIN32_REGISTRY.md` §4, `docs/WIN32_REGISTRY_WRITE.md` §4): `inspect`
+  rejects any import whose DLL name is not exactly `kernel32.dll` or
+  `advapi32.dll` (`UnknownImportDll`, two-DLL allowlist since Phase 8
+  stage 3) or whose function name is not in the fixed service table
+  (`UnknownImportFunction`) — three entries at Phase 7 stage 2, eleven at
+  Phase 7 stage 3, eighteen across two DLLs at Phase 8 stage 4 — and any IAT
+  slot that is not an 8-byte, in-page
   location inside a readable section of the window (`ImportTarget`). No
   allocation happens before these checks, so the negative fixtures are
   rejected cleanly.
 - `map` resolves imports after relocations: one stub per unique function name
-  (first-occurrence order) is written as 16-byte records into a single
+  (first-occurrence order) is written as fixed-stride records into a single
   read+execute page mapped at `WIN32_STUB_VA = 0x51_0000`, and every IAT slot
-  is patched to the stub address. The 4-argument stub form is
+  is patched to the stub address. The stride started at 16 bytes and grew to
+  24 with `Args6` (Phase 8 stage 3) and 48 with `Args9` (stage 4), all
+  `int3`-padded to the stride. The 4-argument stub form is
   `mov eax, imm32; int 0x80; ret; nop*5`; the 5-argument form (stage 3, for
   `WriteFile`) is `mov r10, [rsp+0x28]; mov eax, imm32; int 0x80; ret`
   (`rsp+0x28` = return address + shadow space, the documented position of the
   first stack argument; `InterruptFrame` already captures `r10`), 13 bytes
-  with 3 padding bytes instead of 8. `map` also writes the NUL-terminated
+  with 3 padding bytes instead of 8. `Args6` adds `mov r11, [rsp+0x30]`
+  (sixth argument); `Args9` additionally loads `r12`–`r14` from
+  `[rsp+0x38]`/`[rsp+0x40]`/`[rsp+0x48]` (`isr_common` already saves them).
+  `map` also writes the NUL-terminated
   module path at `COMMAND_LINE_VA = WIN32_STUB_VA + 0xF00` (capacity 0x100;
   explicit terminator because the frame is `int3`-filled) and fails with
   `Reject::CommandLineTooLong` beyond 255 path bytes. The IAT lives in
@@ -480,10 +492,11 @@ serial log, full `test_all.sh` run, VirtualBox re-run.
 
 May **not** claim (stage 1 scope): any Windows API compatibility, general
 import resolution/DLL loading of real system DLLs (stages 2–3 and Phase 8
-stages 2–3 resolve only the fifteen-name `kernel32.dll`+`advapi32.dll`
-allowlist with 4-/5-/6-argument stubs, see
+stages 2–4 resolve only the eighteen-name `kernel32.dll`+`advapi32.dll`
+allowlist with 4-/5-/6-/9-argument stubs, see
 `docs/WIN32_CONSOLE.md` §9, `docs/WIN32_PROGRAM.md` §9,
-`docs/WIN32_INPUT.md` and `docs/WIN32_REGISTRY.md` §13), PE32 (32-bit),
+`docs/WIN32_INPUT.md`, `docs/WIN32_REGISTRY.md` §13 and
+`docs/WIN32_REGISTRY_WRITE.md` §14), PE32 (32-bit),
 SEH/unwind, TLS, CLR, resources,
 dynamic code, ASLR, filesystem-backed exec, or running third-party Windows
 binaries. Limits to restate: fixed 1 MiB code window at `0x400000`, one 4 KiB
@@ -507,7 +520,10 @@ time, modules from the bootloader only, QEMU/VirtualBox only.
   later added the three-name console surface (`docs/WIN32_CONSOLE.md`,
   ADR-0020) and updated the roadmap again; stage 3 grew the surface to eleven
   names with the five-argument stub form and the command-line tail
-  (`docs/WIN32_PROGRAM.md`, ADR-0021).
+  (`docs/WIN32_PROGRAM.md`, ADR-0021); Phase 8 stages 2–4 then added the
+  console-input and registry read/write surfaces with the 6- and 9-argument
+  stubs (`docs/WIN32_INPUT.md`, `docs/WIN32_REGISTRY.md`,
+  `docs/WIN32_REGISTRY_WRITE.md`, ADR-0023/0024/0025).
 - `progress.md`: milestone entry, exact commands, artifact table with sizes
   and SHA-256s (`pehello.exe`, `pebad.exe`, `kernel.elf`, ISOs), serial
   excerpts, defects, next action.

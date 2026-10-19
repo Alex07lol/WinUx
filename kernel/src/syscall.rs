@@ -50,6 +50,17 @@
 //!   `ERROR_MORE_DATA`).
 //! * `17 RegCloseKey(rcx = hKey)` → `0`/`6`; native `advapi32!RegCloseKey`
 //!   over the four-slot key-handle table.
+//! * `18 RegCreateKeyExA(rcx = hKey, rdx = subkey, r8 = reserved,
+//!   r9 = class, r10 = options, r11 = samDesired, r12 = security attrs,
+//!   r13 = result, r14 = disposition)` → `0`/WinError; native
+//!   `advapi32!RegCreateKeyExA` (first nine-argument service,
+//!   `docs/WIN32_REGISTRY_WRITE.md`).
+//! * `19 RegSetValueExA(rcx = hKey, rdx = value name, r8 = reserved,
+//!   r9 = type, r10 = data, r11 = size)` → `0`/WinError; native
+//!   `advapi32!RegSetValueExA` (REG_SZ writes persisted through
+//!   `config::save()`).
+//! * `20 RegDeleteValueA(rcx = hKey, rdx = value name)` → `0`/WinError;
+//!   native `advapi32!RegDeleteValueA`.
 //!
 //! Every user pointer is validated against the live page tables before the
 //! kernel reads it (mapped, user-accessible, canonical, bounded span). A
@@ -88,6 +99,9 @@ pub const SYS_READFILE: u64 = 14;
 pub const SYS_REG_OPEN_KEY_EX: u64 = 15;
 pub const SYS_REG_QUERY_VALUE_EX: u64 = 16;
 pub const SYS_REG_CLOSE_KEY: u64 = 17;
+pub const SYS_REG_CREATE_KEY_EX: u64 = 18;
+pub const SYS_REG_SET_VALUE_EX: u64 = 19;
+pub const SYS_REG_DELETE_VALUE: u64 = 20;
 
 /// Maximum accepted console write, small enough to bound the kernel copy.
 pub const MAX_WRITE: u64 = 4096;
@@ -110,12 +124,21 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 /// WinError.h `ERROR_TOO_MANY_OPEN_FILES`.
 const ERROR_TOO_MANY_OPEN_FILES: u32 = 4;
+/// WinError.h `ERROR_NOT_ENOUGH_MEMORY`; the store's resource-exhaustion code.
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 /// WinError.h `ERROR_MORE_DATA`.
 const ERROR_MORE_DATA: u32 = 234;
-/// Registry value type `REG_SZ`; every value in this stage has this type.
+/// Registry value type `REG_SZ`; the only value type this stage supports.
 const REG_SZ: u32 = 1;
+/// `RegCreateKeyExA` disposition: the key did not exist and was created.
+const REG_CREATED_NEW_KEY: u32 = 1;
+/// `RegCreateKeyExA` disposition: the key existed and was opened.
+const REG_OPENED_EXISTING_KEY: u32 = 2;
 /// Maximum registry subkey or value-name length including the NUL.
 const MAX_REG_NAME: usize = 128;
+/// Maximum accepted `RegSetValueExA` `cbData`: a store value (128 bytes) plus
+/// the terminating NUL.
+const MAX_REG_VALUE: u64 = os_core::config::MAX_VALUE_BYTES as u64 + 1;
 
 /// Highest address the kernel accepts from user space (canonical user half:
 /// PML4 entries 0..256).
@@ -158,6 +181,12 @@ pub static WIN32_REG_OPEN_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static WIN32_REG_QUERY_VALUE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// `SYS_REG_CLOSE_KEY` calls (successful and failing alike).
 pub static WIN32_REG_CLOSE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_CREATE_KEY_EX` calls (successful and failing alike).
+pub static WIN32_REG_CREATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_SET_VALUE_EX` calls (successful and failing alike).
+pub static WIN32_REG_SET_VALUE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_DELETE_VALUE` calls (successful and failing alike).
+pub static WIN32_REG_DELETE_VALUE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Faults taken from CPL3 and isolated (thread killed, kernel alive).
 pub static USER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Repeated `int 0x80` calls made with an invalid pointer or bad service.
@@ -188,6 +217,9 @@ pub fn dispatch(frame: &mut InterruptFrame) {
         SYS_REG_OPEN_KEY_EX => reg_open_key_ex(frame),
         SYS_REG_QUERY_VALUE_EX => reg_query_value_ex(frame),
         SYS_REG_CLOSE_KEY => reg_close_key(frame),
+        SYS_REG_CREATE_KEY_EX => reg_create_key_ex(frame),
+        SYS_REG_SET_VALUE_EX => reg_set_value_ex(frame),
+        SYS_REG_DELETE_VALUE => reg_delete_value(frame),
         _ => {
             REJECTED_SYSCALLS.fetch_add(1, Ordering::SeqCst);
             serial::force_print(format_args!(
@@ -473,7 +505,19 @@ fn reg_error_label(code: u32) -> &'static str {
         ERROR_FILE_NOT_FOUND => "file not found",
         ERROR_TOO_MANY_OPEN_FILES => "too many open keys",
         ERROR_INVALID_HANDLE => "invalid handle",
+        ERROR_NOT_ENOUGH_MEMORY => "not enough memory",
         _ => "invalid parameter",
+    }
+}
+
+/// The WinError value for a failed registry operation.
+fn reg_key_error_code(error: registry::KeyError) -> u32 {
+    match error {
+        registry::KeyError::InvalidHandle => ERROR_INVALID_HANDLE,
+        registry::KeyError::NotFound => ERROR_FILE_NOT_FOUND,
+        registry::KeyError::TooManyKeys => ERROR_TOO_MANY_OPEN_FILES,
+        registry::KeyError::BadArgument => ERROR_INVALID_PARAMETER,
+        registry::KeyError::NoSpace => ERROR_NOT_ENOUGH_MEMORY,
     }
 }
 
@@ -525,12 +569,7 @@ fn reg_open_key_ex(frame: &mut InterruptFrame) {
             frame.rax = 0;
         }
         Err(error) => {
-            let code = match error {
-                registry::KeyError::InvalidHandle => ERROR_INVALID_HANDLE,
-                registry::KeyError::NotFound => ERROR_FILE_NOT_FOUND,
-                registry::KeyError::TooManyKeys => ERROR_TOO_MANY_OPEN_FILES,
-            };
-            reg_open_key_fail(frame, hkey, &subkey, code);
+            reg_open_key_fail(frame, hkey, &subkey, reg_key_error_code(error));
         }
     }
 }
@@ -694,6 +733,268 @@ fn reg_close_key(frame: &mut InterruptFrame) {
             frame.rax = u64::from(ERROR_INVALID_HANDLE);
         }
     }
+}
+
+/// `18 RegCreateKeyExA`: native `advapi32!RegCreateKeyExA` over the config
+/// store. The ninth argument rides in `r14` (the first nine-argument
+/// service). `*phkResult` is zeroed before any work; `*lpdwDisposition` is
+/// optional (NULL allowed) and filled on success. Documented argument errors
+/// return the WinError value and set the thread's last-error without killing
+/// it; unmapped pointers kill.
+fn reg_create_key_ex(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    let subkey_pointer = frame.rdx;
+    let reserved = frame.r8;
+    // r9 (`lpClass`) and r12 (`lpSecurityAttributes`) may be ignored.
+    let options = frame.r10;
+    // r11 (`samDesired`) is ignored: access is checked against the key's
+    // security descriptor, which this stage does not have.
+    let result_pointer = frame.r13;
+    let disposition_pointer = frame.r14;
+    WIN32_REG_CREATE_KEY_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    let Some(cell) = validated_out_pointer_u64(
+        frame,
+        result_pointer,
+        "RegCreateKeyExA out-pointer is not mapped",
+    ) else {
+        return;
+    };
+    // SAFETY: the out-pointer was validated as a mapped user page with 8
+    // bytes available; the store goes through the HHDM.
+    unsafe { core::ptr::write_volatile(cell, 0) };
+
+    let subkey = match read_user_string(frame, subkey_pointer) {
+        Ok(subkey) => subkey,
+        Err(()) => {
+            reg_create_key_fail(frame, hkey, "<invalid>", ERROR_INVALID_PARAMETER);
+            return;
+        }
+    };
+
+    if reserved != 0 || options != 0 {
+        reg_create_key_fail(frame, hkey, &subkey, ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    match registry::create(hkey, &subkey) {
+        Ok((handle, created)) => {
+            if disposition_pointer != 0 {
+                let Some(disposition_cell) = validated_out_pointer(
+                    frame,
+                    disposition_pointer,
+                    "RegCreateKeyExA disposition pointer is not mapped",
+                ) else {
+                    return;
+                };
+                // SAFETY: the disposition pointer was validated as a mapped
+                // user page with 4 bytes available; the store goes through
+                // the HHDM.
+                unsafe {
+                    core::ptr::write_volatile(
+                        disposition_cell,
+                        if created {
+                            REG_CREATED_NEW_KEY
+                        } else {
+                            REG_OPENED_EXISTING_KEY
+                        },
+                    )
+                };
+            }
+            // SAFETY: the out-pointer was validated earlier in this call.
+            unsafe { core::ptr::write_volatile(cell, handle) };
+            serial::force_print(format_args!(
+                "win32: RegCreateKeyExA({:#x}, \"{}\") -> 0 (handle {}, {})\r\n",
+                hkey,
+                subkey,
+                RegHandle(handle),
+                if created {
+                    "created"
+                } else {
+                    "opened existing"
+                }
+            ));
+            frame.rax = 0;
+        }
+        Err(error) => {
+            reg_create_key_fail(frame, hkey, &subkey, reg_key_error_code(error));
+        }
+    }
+}
+
+fn reg_create_key_fail(frame: &mut InterruptFrame, hkey: u64, subkey: &str, code: u32) {
+    sched::set_current_last_error(code);
+    serial::force_print(format_args!(
+        "win32: RegCreateKeyExA({:#x}, \"{}\") -> {} ({})\r\n",
+        hkey,
+        subkey,
+        code,
+        reg_error_label(code)
+    ));
+    frame.rax = u64::from(code);
+}
+
+/// `19 RegSetValueExA`: native `advapi32!RegSetValueExA` over the config
+/// store. REG_SZ only; `cbData` includes the terminating NUL; the payload is
+/// validated against the store's data rules, written and persisted through
+/// `config::save()`.
+fn reg_set_value_ex(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    let name_pointer = frame.rdx;
+    let reserved = frame.r8;
+    let value_type = frame.r9 as u32;
+    let data_pointer = frame.r10;
+    let size = frame.r11;
+    WIN32_REG_SET_VALUE_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    let name = match read_user_string(frame, name_pointer) {
+        Ok(name) => name,
+        Err(()) => {
+            reg_set_value_fail(frame, hkey, "<invalid>", ERROR_INVALID_PARAMETER);
+            return;
+        }
+    };
+    if name.is_empty() {
+        // The unnamed/default value is not modeled.
+        reg_set_value_fail(frame, hkey, "", ERROR_INVALID_PARAMETER);
+        return;
+    }
+    if reserved != 0 || value_type != REG_SZ || data_pointer == 0 {
+        reg_set_value_fail(frame, hkey, &name, ERROR_INVALID_PARAMETER);
+        return;
+    }
+    if !(1..=MAX_REG_VALUE).contains(&size) {
+        reg_set_value_fail(frame, hkey, &name, ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    let payload = match read_user_reg_value(frame, data_pointer, size) {
+        Ok(payload) => payload,
+        Err(()) => {
+            reg_set_value_fail(frame, hkey, &name, ERROR_INVALID_PARAMETER);
+            return;
+        }
+    };
+
+    match registry::set_value(hkey, &name, &payload) {
+        Ok(()) => {
+            serial::force_print(format_args!(
+                "win32: RegSetValueExA({}, \"{}\") -> 0 (REG_SZ, {} bytes)\r\n",
+                RegHandle(hkey),
+                name,
+                payload.len()
+            ));
+            frame.rax = 0;
+        }
+        Err(error) => {
+            reg_set_value_fail(frame, hkey, &name, reg_key_error_code(error));
+        }
+    }
+}
+
+fn reg_set_value_fail(frame: &mut InterruptFrame, hkey: u64, name: &str, code: u32) {
+    sched::set_current_last_error(code);
+    serial::force_print(format_args!(
+        "win32: RegSetValueExA({}, \"{}\") -> {} ({})\r\n",
+        RegHandle(hkey),
+        name,
+        code,
+        reg_error_label(code)
+    ));
+    frame.rax = u64::from(code);
+}
+
+/// `20 RegDeleteValueA`: native `advapi32!RegDeleteValueA` over the config
+/// store. Removing the last entry under a prefix makes the key itself cease
+/// to exist (children-only rule); the removal is persisted.
+fn reg_delete_value(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    let name_pointer = frame.rdx;
+    WIN32_REG_DELETE_VALUE_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    let name = match read_user_string(frame, name_pointer) {
+        Ok(name) => name,
+        Err(()) => {
+            reg_delete_value_fail(frame, hkey, "<invalid>", ERROR_INVALID_PARAMETER);
+            return;
+        }
+    };
+    if name.is_empty() {
+        // The unnamed/default value is not modeled.
+        reg_delete_value_fail(frame, hkey, "", ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    match registry::delete_value(hkey, &name) {
+        Ok(()) => {
+            serial::force_print(format_args!(
+                "win32: RegDeleteValueA({}, \"{}\") -> 0\r\n",
+                RegHandle(hkey),
+                name
+            ));
+            frame.rax = 0;
+        }
+        Err(error) => {
+            reg_delete_value_fail(frame, hkey, &name, reg_key_error_code(error));
+        }
+    }
+}
+
+fn reg_delete_value_fail(frame: &mut InterruptFrame, hkey: u64, name: &str, code: u32) {
+    sched::set_current_last_error(code);
+    serial::force_print(format_args!(
+        "win32: RegDeleteValueA({}, \"{}\") -> {} ({})\r\n",
+        RegHandle(hkey),
+        name,
+        code,
+        reg_error_label(code)
+    ));
+    frame.rax = u64::from(code);
+}
+
+/// Read exactly `size` bytes of REG_SZ data from user memory: the span must
+/// be mapped user-accessible, the last byte must be NUL, and the payload
+/// must satisfy the store's value rules. Unmapped pages kill; violations are
+/// `Err(())`.
+fn read_user_reg_value(frame: &InterruptFrame, pointer: u64, size: u64) -> Result<String, ()> {
+    let Some(end) = pointer.checked_add(size) else {
+        kill(frame, "registry value overflows the address space");
+        return Err(());
+    };
+    if pointer < 0x1000 || end > USER_LIMIT {
+        kill(frame, "registry value is outside the user address space");
+        return Err(());
+    }
+    let Some(hhdm) = vm::hhdm_offset() else {
+        kill(frame, "HHDM offset is unknown");
+        return Err(());
+    };
+    let mut bytes = Vec::with_capacity(size as usize);
+    for offset in 0..size {
+        let address = pointer + offset;
+        let physical = match vm::translate_live(address) {
+            Some((physical, flags)) if flags & os_core::paging::USER != 0 => physical,
+            _ => {
+                kill(frame, "registry value is not mapped for user access");
+                return Err(());
+            }
+        };
+        let Some(cell) = hhdm.checked_add(physical) else {
+            kill(frame, "registry value HHDM overflow");
+            return Err(());
+        };
+        // SAFETY: the page is mapped user-accessible in the live address
+        // space; the kernel reads it through the HHDM.
+        bytes.push(unsafe { core::ptr::read_volatile(cell as *const u8) });
+    }
+    if bytes.last() != Some(&0) {
+        return Err(());
+    }
+    let payload = core::str::from_utf8(&bytes[..bytes.len() - 1]).map_err(|_| ())?;
+    if !os_core::config::value_is_valid(payload) {
+        return Err(());
+    }
+    Ok(String::from(payload))
 }
 
 /// Read a NUL-terminated user string (at most [`MAX_REG_NAME`] bytes

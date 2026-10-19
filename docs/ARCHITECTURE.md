@@ -90,10 +90,11 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/vfs.rs` | in-memory arena VFS, boot self-test, dirty tracking, export/replace for checkpoints | working |
 | `kernel/src/blk.rs` | ATA PIO block device (PIIX primary master, LBA28, polled) | working (QEMU `-machine pc`) |
 | `kernel/src/persist.rs` | double-buffered checkpoint slots, CRC-verified load/save | working |
+| `kernel/src/config.rs` | registry-like configuration store: `/etc/config` load or in-memory defaults, lazy save via the VFS dirty bit, boot self-test | working (ADR-0022) |
 | `kernel/src/pci.rs` | PCI config mechanism #1: bus-0 scan for the e1000 NIC, BAR0 sizing, command-register enable | working (e1000 only) |
 | `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, polled, counters | working (QEMU/VirtualBox) |
 | `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch, `ping`, `udpecho`, status | working (static config) |
-| `kernel/src/shell.rs` | serial shell builtins over kernel services | working (serial only) |
+| `kernel/src/shell.rs` | serial shell builtins over kernel services, incl. `config get/set/del/list` | working (serial only) |
 | `kernel/src/arch/x86_64/gdt.rs` | GDT (kernel + user segments), TSS, IST1 double-fault stack | working |
 | `kernel/src/arch/x86_64/idt.rs` | exception gates, IRQ0, IRQ4, `int 0x80` gate, frame dispatcher | working |
 | `kernel/src/arch/x86_64/pic.rs` | 8259 remap/mask, per-line unmask, EOI | working |
@@ -111,6 +112,7 @@ writable, which the segment permissions above guarantee.
 | `os_core::heap` | free-list heap model used by the kernel heap | host-tested |
 | `os_core::path` | VFS path validation and component splitting | host-tested |
 | `os_core::pofs` | checkpoint header/payload encode, decode, CRC32 | host-tested |
+| `os_core::config` | `POCF` configuration codec: key/value validation, caps, canonical encode, validating decode | host-tested |
 | `os_core::elf` | ELF64 `ET_EXEC` parser: headers, segments, W^X and overlap policy | host-tested |
 | `os_core::pe` | PE32+ parser: headers, sections, import directory (ILT/IAT/names), data-directory policy, DIR64 relocations | host-tested |
 | `os_core::pci` | config-address construction, BAR decode and sizing | host-tested |

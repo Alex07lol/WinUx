@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Four-boot durability test for the PROJECT_OS checkpoint VFS.
 
-Boot 1 writes a file to a fresh disk image; boot 2 proves it survived a
-reboot and writes more; boot 3 corrupts the newest slot's payload and proves
-the kernel falls back to the older checkpoint; boot 4 corrupts both slots and
-proves a fresh format. Runs `-machine pc` because the ATA PIO driver needs
-the PIIX legacy ports (see docs/RESEARCH.md R-009).
+Boot 1 writes a file and one configuration value to a fresh disk image; boot
+2 proves both survived a reboot and writes a second generation (including a
+second configuration value); boot 3 corrupts the newest slot's payload and
+proves the kernel falls back to the older checkpoint, which rolls the second
+configuration value back while keeping the files it contained; boot 4
+corrupts both slots and proves a fresh format (files and configuration gone,
+defaults reseeded). Runs `-machine pc` because the ATA PIO driver needs the
+PIIX legacy ports (see docs/RESEARCH.md R-009).
 
 Usage: test_persistence_qemu.py <qemu.exe> <iso> <disk-image> <qemu-log>
 
@@ -31,7 +34,7 @@ SLOT_A_OFFSET = 16 * SECTOR
 SLOT_B_OFFSET = SLOT_A_OFFSET + SLOT_BYTES
 DISK_BYTES = 8 * 1024 * 1024
 
-MARKER_SUFFIX = b"vfs,blk,persist"
+MARKER_SUFFIX = b"vfs,config,blk,persist"
 
 
 def make_fresh_disk(path):
@@ -158,37 +161,47 @@ def main():
         ("persist", [b"active slot A seq 0"]),
         ("write /tmp/hello.txt hello world", [b"write: ok", b"persist: saved slot B seq=1"]),
         ("cat /tmp/hello.txt", [b"hello world"]),
+        ("config get Display/Theme", [b"Display/Theme = classic"]),
+        (
+            "config set Display/Theme light",
+            [b"config set: ok", b"persist: saved slot A seq=2"],
+        ),
     ]:
         status = run_command(session, 1, line, tokens)
         if status:
             return status
-    print("boot 1: fresh format, wrote /tmp/hello.txt, saved slot B seq=1")
+    print("boot 1: fresh format, wrote /tmp/hello.txt (B seq=1), set theme (A seq=2)")
     session.finish(0)
 
     # ---- Boot 2: the file survived; write a second generation ------------
     session, status = begin_boot(qemu, iso, disk, qemu_log, 2)
     if session is None:
         return status
-    status = check_tokens(session, 2, [b"persist: loaded slot B seq=1"], "boot log")
+    status = check_tokens(session, 2, [b"persist: loaded slot A seq=2"], "boot log")
     if status:
         return status
     for line, tokens in [
+        ("config get Display/Theme", [b"Display/Theme = light"]),
         ("cat /tmp/hello.txt", [b"hello world"]),
-        ("mkdir /tmp/notes", [b"persist: saved slot A seq=2"]),
-        ("write /tmp/notes/a.txt alpha", [b"persist: saved slot B seq=3"]),
+        ("mkdir /tmp/notes", [b"persist: saved slot B seq=3"]),
+        ("write /tmp/notes/a.txt alpha", [b"persist: saved slot A seq=4"]),
         ("cat /tmp/notes/a.txt", [b"alpha"]),
+        (
+            "config set Display/Theme dark",
+            [b"config set: ok", b"persist: saved slot B seq=5"],
+        ),
     ]:
         status = run_command(session, 2, line, tokens)
         if status:
             return status
-    print("boot 2: checkpoint survived reboot; tree now saved as A seq=2 / B seq=3")
+    print("boot 2: checkpoint and theme survived; tree now saved as A seq=4 / B seq=5")
     session.finish(0)
 
     # ---- Boot 3: corrupt the newest slot; the older one must win ---------
     seq_a = slot_seq(disk, SLOT_A_OFFSET)
     seq_b = slot_seq(disk, SLOT_B_OFFSET)
-    if (seq_a, seq_b) != (2, 3):
-        return fail("expected slot seqs A=2 B=3, found A=%r B=%r" % (seq_a, seq_b), b"")
+    if (seq_a, seq_b) != (4, 5):
+        return fail("expected slot seqs A=4 B=5, found A=%r B=%r" % (seq_a, seq_b), b"")
     corrupt_slot_payload(disk, SLOT_B_OFFSET)
 
     session, status = begin_boot(qemu, iso, disk, qemu_log, 3)
@@ -199,20 +212,23 @@ def main():
         3,
         [
             b"persist: slot B invalid (payload crc mismatch)",
-            b"persist: loaded slot A seq=2",
+            b"persist: loaded slot A seq=4",
         ],
         "boot log",
     )
     if status:
         return status
     for line, tokens in [
+        # The dark theme lived only in the corrupt slot: fallback rolls it back.
+        ("config get Display/Theme", [b"Display/Theme = light"]),
         ("cat /tmp/hello.txt", [b"hello world"]),
-        ("cat /tmp/notes/a.txt", [b"no such file or directory"]),
+        # The file was already in slot A seq=4, so it survives the fallback.
+        ("cat /tmp/notes/a.txt", [b"alpha"]),
     ]:
         status = run_command(session, 3, line, tokens)
         if status:
             return status
-    print("boot 3: corrupted slot B rejected by CRC, fell back to slot A seq=2")
+    print("boot 3: corrupted slot B rejected by CRC; fell back to slot A seq=4 (theme rollback)")
     session.finish(0)
 
     # ---- Boot 4: corrupt both slots; fresh format -------------------------
@@ -234,10 +250,14 @@ def main():
     )
     if status:
         return status
-    status = run_command(session, 4, "cat /tmp/hello.txt", [b"no such file or directory"])
-    if status:
-        return status
-    print("boot 4: both slots rejected, fresh format, old file gone")
+    for line, tokens in [
+        ("cat /tmp/hello.txt", [b"no such file or directory"]),
+        ("config get Display/Theme", [b"Display/Theme = classic"]),
+    ]:
+        status = run_command(session, 4, line, tokens)
+        if status:
+            return status
+    print("boot 4: both slots rejected, fresh format; file gone, config defaults reseeded")
     session.finish(0)
 
     print("persistence: 4 boots, all phases passed")

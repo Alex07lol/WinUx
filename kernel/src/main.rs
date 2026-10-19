@@ -14,6 +14,7 @@ extern crate alloc;
 
 mod arch;
 mod blk;
+mod config;
 mod console;
 mod e1000;
 mod fbcon;
@@ -453,6 +454,20 @@ pub extern "C" fn kmain() -> ! {
     blk::init();
     // Load the best checkpoint or format slot A; inactive without a disk.
     persist::init();
+    // Registry-like configuration store: `/etc/config` when the checkpoint has
+    // it, otherwise defaults seeded in memory (the file is written lazily by
+    // the first shell mutation, so an idle boot never touches the disk).
+    if let Err(error) = config::init() {
+        fatal(format_args!("config store failed: {}", error));
+    }
+    match config::self_test() {
+        Ok((entries, bytes)) => kprintln!(
+            "config selftest: passed ({} entries, {} bytes; get/set/remove/list/encode/decode/error paths)",
+            entries,
+            bytes
+        ),
+        Err(error) => fatal(format_args!("config selftest failed: {}", error)),
+    }
 
     let tsc_frequency = limine::get()
         .tsc_frequency
@@ -556,6 +571,7 @@ pub extern "C" fn kmain() -> ! {
         checks.push_str(",win32");
     }
     checks.push_str(",vfs");
+    checks.push_str(",config");
     if blk::info().is_some() {
         checks.push_str(",blk");
     }

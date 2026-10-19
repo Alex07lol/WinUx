@@ -103,7 +103,10 @@ Running a console program is not GUI, Direct3D or driver compatibility.
 - PE32+ parsing/loading exists, but not exports, real DLL loading, SEH/TLS,
   PE32 or imports beyond the eleven-name allowlist.
 - No Win32/COM/DXGI/Direct3D runtime.
-- No registry-like configuration store.
+- No Windows registry API: a native registry-like key/value store now exists
+  in the kernel (`docs/CONFIG.md`, `os_core::config`, ADR-0022), but there is
+  no `advapi32`/`HKEY_*` surface, no hives and no typed (DWORD/binary/
+  multi-string) values.
 - No audio, printing or installers (networking is a single polled e1000 with
   static addressing, Phase 6).
 - No Windows kernel-driver environment.

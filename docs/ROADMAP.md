@@ -13,7 +13,7 @@ were run and observed. No dates or completion percentages are implied.
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
-| 8 | larger Win32/desktop, registry-like config, GUI/text/input | not started |
+| 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stage 1: native configuration store, 2026-10-19)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change; larger Win32 surface, GUI/text/input and the compatibility matrix not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
@@ -230,6 +230,28 @@ syscall gate, four rejection mutants (`pebad`, `pebadimp`, `pebadfn`,
 `scripts/test_pe_qemu.sh` (`artifacts/qemu-serial-pe.log`; 22 PASS / 0 FAIL /
 4 SKIP in the final `test_all.sh` run). Evidence: R-013/R-014/R-015,
 ADR-0019/0020/0021, `progress.md`. No general compatibility claim.
+
+## Phase 8 stage 1 (2026-10-19): native configuration store
+
+Implemented and verified: a registry-like key/value store serialised by the
+host-tested `os_core::config` codec (`POCF` version 1: 8-byte header, ≤64
+entries, path-shaped ASCII keys ≤96 bytes, printable values ≤128 bytes, blob
+≤7984 bytes) into the ordinary VFS file `/etc/config`, so the checkpoint
+format, slots, CRCs and fallback rule of Phase 6 are untouched
+(`docs/CONFIG.md`, ADR-0022). Boot decodes the file when the checkpoint
+carries it and otherwise seeds `System/Name`, `Display/Theme`, `Net/Mode` in
+memory; the first `config set`/`config del` writes the file and the shell
+boundary flush persists it exactly like file contents. The shell gains
+`config [get|set|del|list]`, the boot self-test adds the pinned
+`config selftest: passed (...)` line, and the marker gains `,config` after
+`,vfs`. Evidence: `scripts/test_shell_qemu.sh` PASS (25 commands incl. the
+store surface and the `error: bad key` path), `scripts/test_persistence_qemu.sh`
+PASS (four boots: theme survives reboot, `dark` saved only to the corrupted
+slot rolls back to `light` on fallback while `/tmp/notes/a.txt` survives,
+fresh format reseeds defaults), `scripts/test_all.sh` PASS=22 FAIL=0 SKIP=4
+(269 host unit tests). Limits: no Windows registry API, no typed values, no
+ACLs/multi-user separation, no transactions or notifications
+(`docs/CONFIG.md` §1/§8). No compatibility claim is made.
 
 ## Phase 8 acceptance (planned)
 

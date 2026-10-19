@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+pub mod config;
 pub mod elf;
 pub mod fb;
 pub mod font;

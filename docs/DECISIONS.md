@@ -866,3 +866,114 @@ constants, overlapped I/O does not exist, unmapped buffers kill the thread,
 and the allowlist still rejects every unknown import — all divergences are
 documented in `docs/WIN32_PROGRAM.md` §9 rather than hidden.
 
+## ADR-0022 – Registry-like configuration store as one ordinary VFS file with a host-tested codec (Phase 8, stage 1)
+
+**Context.** Phase 8 needs a persistent, registry-like configuration store.
+The checkpoint persistence (Phase 6, stage 2) already carries a whole VFS tree
+in two CRC-verified double-buffered slots with fallback; any second on-disk
+store would duplicate that machinery and create two consistency domains. The
+full contract (format, caps, shell surface, script changes) lives in
+`docs/CONFIG.md`.
+
+**Decision.**
+
+- **The store is one ordinary VFS file, `/etc/config`.** Its contents are
+  produced by a new host-tested codec (`os_core::config`, `POCF` version 1)
+  and ride the existing checkpoint save/load/fallback paths with **no format,
+  header, slot or CRC change**. Rejected alternatives: a v2 checkpoint payload
+  with a dedicated config section (format migration, CRC and decoder churn for
+  one file's worth of benefit); a separate reserved disk region (a second
+  store to version, verify and corrupt-test); VFS directories as keys with
+  values in file contents (64-node cap makes a fat registry impossible,
+  listing/overwrite semantics get clumsy, and the on-disk byte layout would
+  still need a spec).
+- **Format caps are enforced in the codec, never by truncation.** `POCF`
+  version 1: 8-byte header (`POCF`, version 1, entry count), then per-entry
+  `key_len u16 | value_len u16 | key | value`; ≤64 entries, keys ≤96 bytes of
+  `/`-separated `[A-Za-z0-9_.-]` components (each 1–32 bytes), values ≤128
+  printable ASCII bytes, whole blob ≤7984 bytes so it always fits the
+  8192-byte VFS file cap. Encode is canonical (key-sorted, so byte-identical
+  for identical content); decode accepts any order but rejects duplicates,
+  truncation, trailing bytes, bad entries, bad counts and oversized blobs with
+  distinct labels. Rejected alternatives: a `FileTooBig`-only failure path
+  (loses the failure reason at the shell), unlimited values (would let a
+  single `config set` fail at the VFS layer after mutating kernel state).
+- **Defaults are seeded in memory; the file is written lazily by the first
+  mutation.** Boot with no `/etc/config` installs `System/Name=PROJECT_OS`,
+  `Display/Theme=classic`, `Net/Mode=static` and does **not** dirty the VFS,
+  so an idle boot leaves the checkpoint byte-identical and the persistence
+  test's save sequence is exactly the mutations the script performs. Rejected
+  alternatives: writing defaults at first boot (silently changes the disk in
+  a boot the tests use to prove no writes happen; also shifts the four-boot
+  seq expectations), no defaults (an empty registry is a worse first-run
+  experience and makes the shell test assert nothing).
+- **`rm /etc/config` is allowed and means "factory settings".** The next boot
+  reseeds defaults in memory; the file reappears on the next mutation.
+  Special-casing the path as read-only would add a VFS rule for one name.
+- **The boot self-test mutates only memory.** It sets/gets/lists/removes a
+  temporary `SelfCheck/Value` entry, checks invalid-key rejection and an
+  encode/decode round trip, then asserts the entry count is restored. No
+  file write, no dirty bit: a failed self-test is boot-fatal
+  (`PROJECT_OS_FATAL`), and a passed one can never alter what is persisted.
+- **The marker gains `,config` directly after `,vfs`; disk boots read
+  `...,vfs,config,blk,persist`.** Appending after `,vfs` keeps the existing
+  `elf`/`pe`/`win32` substring assertions byte-valid and puts the
+  always-present components together, with the conditional disk components in
+  their existing order.
+- **No Win32 access path in this stage.** There is no `advapi32`, no `Reg*`
+  service, no hive semantics and no typed values; the store is a native
+  kernel facility with a shell surface. A later stage may expose a scoped
+  subset, but nothing in this decision claims registry compatibility.
+
+**Alternatives considered.** Implementing the Windows registry API directly
+(no NT object/handle model exists to hang `HKEY_*` on, and typed values would
+double the format for no current consumer); an append-only log format (CRC
+and fallback already give all-or-nothing atomicity at the tree level;
+per-entry journals add compaction work); case-insensitive keys (no consumer
+needs it and byte-exact comparisons keep the codec auditable).
+
+**Evidence.** PASSED (2026-10-19, QEMU 11.1.0, build `0.1.0-82bc098b`).
+`scripts/test_unit.sh`: 269/269 (17 new `os_core::config` tests: key/value
+validation tables, length caps, sorted insert/overwrite/remove, prefix
+listing, entry-count and blob caps, canonical encode, round trips, empty
+store, unsorted-input acceptance, header/truncation/trailing/bad-entry/
+duplicate rejections, stable labels). `scripts/test_shell_qemu.sh` PASS with
+25 commands (the eight new ones: `config` → `3 entries (/etc/config, ...)`,
+`config get`, `config set`, `config get` after set, `config list` → 3
+entries, `config del`, missing key → `error: no such key`, `config set
+bad//key x` → `error: bad key`). `scripts/test_persistence_qemu.sh` PASS
+(4 boots): boot 1 `write /tmp/hello.txt` → `saved slot B seq=1`,
+`config set Display/Theme light` → `saved slot A seq=2`; boot 2 loads A
+seq=2 with theme `light`, `mkdir` → B seq=3, `write /tmp/notes/a.txt` →
+A seq=4, `config set Display/Theme dark` → B seq=5; boot 3 with slot B's
+payload zeroed → `persist: slot B invalid (payload crc mismatch)`,
+`persist: loaded slot A seq=4`, theme reads `light` (dark rolled back with
+the corrupt slot) and `/tmp/notes/a.txt` reads `alpha`; boot 4 both slots
+corrupt → fresh format, `/tmp/hello.txt` gone, theme `classic` (defaults
+reseeded). Boot logs: `config selftest: passed (3 entries, 75 bytes;
+get/set/remove/list/encode/decode/error paths)` (73 bytes in the boot-3 log
+because `light` is two bytes shorter than `classic`, an incidental
+confirmation of the loaded value). Marker
+`PROJECT_OS_BOOT_SUCCESS:0.1.0-82bc098b checks=...,sched,user,elf,pe,win32,vfs,config`
+(disk boot adds `,blk,persist,net`). Full `scripts/test_all.sh`:
+`PASS=22 FAIL=0 SKIP=4`. Artifacts: `kernel.elf` 1739896 bytes SHA-256
+`8de3faa87c3113dbbc474d5efcd438187143ac5fc281f3e6b2eec669ad8ab608`,
+`project-os.iso` 7776256 bytes SHA-256
+`cded5276dae6e9c8495618f5206cd02c0daf39a0451d6dd99b035cf27e105699`,
+`persist-disk.img` after the four boots SHA-256
+`05d2d3ad26aa59c8140d1195e6e8423e19206895c6ed4dbe7c0aff0c0c245d22`.
+Two host-test iterations during development (an initial 6-byte header
+assumption corrected to 8 bytes, and a cap-boundary assertion refined); none
+of it reached the final artifact. No device-level bring-up defect occurred
+in this stage.
+
+**Consequences.** PROJECT_OS now has a persisted hierarchical configuration
+store with defined limits, clean error labels and a shell surface, at the
+cost of one file inside the existing checkpoint. The store is not a Windows
+registry: no `advapi32`/`HKEY_*` API, no hives, no typed values, no ACLs or
+per-user separation, no transactions or change notifications. Because it is
+an ordinary file, its durability is exactly the checkpoint's: it survives
+reboots, rolls back when the newest slot is corrupt, and resets to defaults
+after a fresh format. A future format change must bump `VERSION` and update
+`docs/CONFIG.md` §2 before any parser change.
+

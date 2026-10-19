@@ -243,8 +243,17 @@ byte-identical wording written at stage 2 applies to the `vfs`-onward suffix
 pinned by `test_persistence_qemu.sh`, not to the full no-disk line. Disk boot:
 
 ```text
-PROJECT_OS_BOOT_SUCCESS:<id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,vfs,blk,persist
+PROJECT_OS_BOOT_SUCCESS:<id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs,config,blk,persist
 ```
+
+Amendment (Phase 8 stage 1, ADR-0022): the configuration store is a single
+ordinary VFS file `/etc/config` (`docs/CONFIG.md`, `os_core::config`), so it
+needs no change to the format described above; the marker gains `,config`
+directly after `,vfs` and configuration contents persist and roll back exactly
+like any other file. The `test_persistence_qemu.sh` sequence now pins that
+rollback case (the `dark` theme saved only to the corrupted slot is rolled
+back to `light` on fallback), while the file written before the fallback
+target still survives.
 
 ## 7. Test plan
 
@@ -266,7 +275,8 @@ lines appear before the marker.
 
 1. Fresh 8 MiB zeroed image (both slots empty). Boot 1: assert `blk: found` +
    `16384 sectors`, `persist: no valid checkpoint, formatted slot A seq=0`,
-   **no** `invalid` line in the preamble, marker ends `vfs,blk,persist`;
+   **no** `invalid` line in the preamble, marker ends `vfs,config,blk,persist`
+   (the `,config` component joined after Phase 8 stage 1);
    builtins `blk` and `persist` report the device and `active slot A seq 0`;
    `write /tmp/hello.txt hello world` → `persist: saved slot B seq=1`;
    `cat /tmp/hello.txt` → `hello world`; kill QEMU.
@@ -287,7 +297,13 @@ lines appear before the marker.
 Exit: 0 = pass, 1 = assertion failure (phase printed), 2 = SKIP (missing
 QEMU/python/ISO). The shared session/pacing logic is extracted into
 `scripts/qemu_serial.py`; `scripts/test_shell_qemu.py` keeps its CLI and
-17-command output byte-for-byte, proving the refactor by rerun.
+its command-list output byte-for-byte (17 commands at the time of the
+refactor; 25 after Phase 8 stage 1), proving the refactor by rerun.
+
+The four-boot sequence itself grew by the configuration assertions described
+in the amendment above (boot 1 `config set` → A seq=2, boot 2 `config set` →
+B seq=5 on top of the existing `mkdir`/`write` saves, boot 3 fallback and
+theme rollback, boot 4 defaults reseeded).
 
 **Full pipeline:** `scripts/test_all.sh` gains a `persistence` step after
 `shell`; a skipped step is never a pass. Budget: four boots ≈ 40–60 s in

@@ -34,7 +34,7 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/bootstrap.sh` | required tools and Rust targets (incl. `x86_64-pc-windows-msvc` and `rust-lld`) exist | PASS |
 | `scripts/format.sh` | `rustfmt --check` clean (kernel workspace, userland, `userland/pe`) | PASS |
 | `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland, `userland/pe` | PASS |
-| `scripts/test_unit.sh` | 252 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors, PE32+ parser incl. all rejection vectors, relocation walk and import directory (descriptors, ILT/IAT fallback, names, ordinals, caps), PCI config/BAR math, Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (252/252) |
+| `scripts/test_unit.sh` | 269 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), configuration store codec (POCF incl. all rejection vectors), ELF64 parser incl. all rejection vectors, PE32+ parser incl. all rejection vectors, relocation walk and import directory (descriptors, ILT/IAT fallback, names, ordinals, caps), PCI config/BAR math, Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (269/269) |
 | `scripts/build.sh` | kernel builds; ELF entry and Limine requests verified | PASS |
 | `scripts/build_user.sh` | userland workspace builds; `hello`/`fault` pass the header checker; `bad.elf` fails with `bad magic` | PASS |
 | `scripts/build_user_pe.sh` | `userland/pe` builds via rust-lld; `pehello.exe`/`peconsole.exe`/`pebasics.exe` pass `check_user_pe.py` (imports included); `pebad.exe` fails with `bad signature`; the `pebadimp`/`pebadfn`/`pebadfn2` mutants patch a unique byte pattern each and stay structurally valid | PASS |
@@ -45,9 +45,9 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_pe_qemu.sh` | PE32+/Win32 self-test (stages 1–3): 7 modules present, pehello load line (4 sections, 1 relocation) + greeting + relocation verified, `pebad.exe` rejected (`bad signature`), peconsole load line (5 sections, 1 relocation), the seven `win32:` console lines, `pebadimp.exe` rejected (`unknown import dll`), `pebadfn.exe` rejected (`unknown import function`), `win32 selftest: passed`, pebasics load line (5 sections, 1 relocation), the full `win32:` program-basics block (incl. `WriteFile(0) -> 0 (invalid handle)`, `WriteFile(1, 28 bytes, overlapped) -> 0 (invalid parameter)`, `GetCommandLineA() -> "/boot/pebasics.exe"`), `pebadfn2.exe` rejected (`unknown import function`), `win32 program selftest: passed`, `pe`+`win32` markers | PASS |
 | `scripts/test_memory.sh` | allocator host tests + in-VM allocator self-test | PASS (both) |
 | `scripts/test_vfs.sh` | host path tests + in-VM VFS self-test | PASS (both) |
-| `scripts/test_shell_qemu.sh` | scripted interactive shell session over a paced TCP serial chardev | PASS (17 commands) |
+| `scripts/test_shell_qemu.sh` | scripted interactive shell session over a paced TCP serial chardev | PASS (25 commands) |
 | `scripts/test_console_qemu.sh` | framebuffer console: pinned `fbcon:` lines, selftest, shell output mirror and a validated QEMU screendump | PASS (106x50 at scale 2; screendump matches) |
-| `scripts/test_persistence_qemu.sh` | four-boot durability on a raw 8 MiB disk (format/save, reboot load, CRC fallback, fresh format) | PASS (4 boots) |
+| `scripts/test_persistence_qemu.sh` | four-boot durability on a raw 8 MiB disk (format/save, reboot load, CRC fallback incl. configuration rollback, fresh format with defaults reseeded) | PASS (4 boots) |
 | `scripts/test_net_qemu.sh` | e1000 end-to-end on q35 with a pinned `model=e1000` slirp NIC: pinned `net:` lines, `,net` marker, `net` counters, `ping 10.0.2.2 -c 3` (3/3), host-forwarded 19-byte UDP echo round trip | PASS (reproduced twice) |
 | `scripts/test_graphics_host.sh` | framebuffer geometry/colour tests | PASS |
 | `scripts/test_virtualbox.sh` | VirtualBox BIOS boot with an Intel 82540EM NAT NIC attached; kernel detects the NIC (`net: e1000 at 00:03.0`), loopback `unsupported`, gateway ARP unanswered — non-fatal | PASS (7.2.20; marker + 5 ticks) |
@@ -74,17 +74,19 @@ qemu-system-x86_64 \
 The kernel prints a unique marker only after all checks:
 
 ```text
-PROJECT_OS_BOOT_SUCCESS:<build-id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs
+PROJECT_OS_BOOT_SUCCESS:<build-id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs,config
 ```
 
 The `,elf` component is inserted between `user` and `vfs` only when the ELF64
 module self-test ran (ADR-0017), `,pe` after `,elf` only when the PE32+
 self-test ran (ADR-0019), and `,win32` after `,pe` only when the native Win32
-console self-test ran (ADR-0020). Correction note: stage 2 described the
+console self-test ran (ADR-0020). `,config` is appended directly after `,vfs`
+when the configuration-store self-test ran (ADR-0022); it is unconditional on
+the current boot path. Correction note: stage 2 described the
 no-disk marker as byte-identical to stage 1; the segment between `user` and
 `vfs` now carries `elf` (and, with PE modules present, `pe`, and with the
 Win32 fixtures `win32`), so the byte-identical
-wording applies to the `vfs`-onward suffix (`vfs,blk,persist`) that the
+wording applies to the `vfs`-onward suffix (`vfs,config,blk,persist`) that the
 persistence test pins, not to the full line.
 
 Failure conditions:
@@ -152,8 +154,13 @@ and the kernel idles, so the same ISO can be booted manually.
     command line `/boot/pebasics.exe`, and `ExitThread(0)` ending the thread;
     exactly two additional writes, 59 bytes, no new user faults
     (`docs/WIN32_PROGRAM.md` §7).
-17. VFS self-test: create/read/append/overwrite/remove/list and the error paths.
-18. Framebuffer console self-test: the whole grid plus cursor is re-rendered in
+17. Configuration-store self-test: `/etc/config` decoded when the checkpoint
+    carries it (otherwise defaults seeded in memory); a temporary
+    `SelfCheck/Value` entry set/get/list/remove round trip, invalid-key
+    rejection, and an encode/decode round trip. The self-test never writes the
+    file, so an idle boot leaves the checkpoint byte-identical.
+18. VFS self-test: create/read/append/overwrite/remove/list and the error paths.
+19. Framebuffer console self-test: the whole grid plus cursor is re-rendered in
     host-testable code, `sfence` is executed, and the framebuffer bytes are read
     back and compared scanline by scanline; any mismatch is a `PROJECT_OS_FATAL`.
     The console also logs its activation line (`fbcon: enabled ...` or the
@@ -161,11 +168,13 @@ and the kernel idles, so the same ISO can be booted manually.
 
 After the timer is verified, the kernel probes the PIIX primary master
 (`blk`), then loads the best checkpoint slot or formats a fresh disk
-(`persist`). Both steps are conditional: without a disk the kernel logs
+(`persist`), then loads or seeds the configuration store (`config`). The
+disk steps are conditional: without a disk the kernel logs
 `blk: no ATA device on primary channel` / `persist: inactive (no ATA disk)`
-and the marker is `checks=...,user,elf,pe,win32,vfs` (the `win32` component
-requires the Win32 fixtures; without them it is `...user,elf,pe,vfs`). With a
-usable disk the marker gains `,blk,persist`.
+and the marker is `checks=...,user,elf,pe,win32,vfs,config` (the `win32`
+component requires the Win32 fixtures; without them it is
+`...user,elf,pe,vfs,config`). With a usable disk the marker gains
+`,blk,persist`.
 
 ## Interactive shell test details
 
@@ -182,7 +191,7 @@ qemu-system-x86_64 -machine q35 -m 512M -smp 1 \
 ```
 
 The Python driver connects to the TCP chardev, waits for the shell banner,
-then types 17 commands at 2 ms per byte (a UART-realistic rate) and asserts
+then types 25 commands at 2 ms per byte (a UART-realistic rate) and asserts
 each response, the returning prompt, the boot marker, and `console`'s
 `0 overruns`. The transcript is written to
 `artifacts/qemu-shell-session.log`.
@@ -244,17 +253,37 @@ Four boots against one image, each transcript kept
 (`artifacts/qemu-persist-boot{1..4}.log`):
 
 1. fresh disk → `formatted slot A seq=0`; `write /tmp/hello.txt hello world` →
-   `saved slot B seq=1`;
-2. reboot → `loaded slot B seq=1`, file readable, `mkdir` → A seq2 and
-   `write /tmp/notes/a.txt` → B seq3;
+   `saved slot B seq=1`; `config get Display/Theme` → `classic` (defaults,
+   nothing written); `config set Display/Theme light` → `saved slot A seq=2`;
+2. reboot → `loaded slot A seq=2`, theme reads `light`, file readable,
+   `mkdir /tmp/notes` → B seq3, `write /tmp/notes/a.txt` → A seq4, then
+   `config set Display/Theme dark` → `saved slot B seq=5`;
 3. the driver corrupts the newest slot's first payload sector (header intact,
    zeroed range) → `slot B invalid (payload crc mismatch)`, fallback to A
-   seq2, and the file saved after A seq2 is gone;
+   seq4: theme rolls back to `light` (the `dark` value existed only in the
+   corrupt slot) while `/tmp/notes/a.txt` survives (it was already in A seq4);
 4. both payloads corrupted → both slots reported invalid, fresh format, old
-   file gone.
+   file gone, theme back to `classic` (defaults reseeded).
 
 The corruption step is byte-level on the image file, not another guest write,
 so it cannot be fooled by the guest's own consistency.
+
+## Configuration store details
+
+`docs/CONFIG.md` is the contract; ADR-0022 records the decision. The store is
+serialised by `os_core::config` (`POCF` version 1: 8-byte header plus
+key/value entries; ≤64 entries, keys ≤96 bytes in `/`-separated
+`[A-Za-z0-9_.-]` components of ≤32 bytes, values ≤128 printable ASCII bytes,
+blob ≤7984 bytes) into the ordinary VFS file `/etc/config`, so the checkpoint
+format is untouched and the store rides the existing slot rotation, CRC check
+and fallback rule. Boot reads the file when present and otherwise seeds
+`System/Name=PROJECT_OS`, `Display/Theme=classic`, `Net/Mode=static` in
+memory; the first `config set`/`config del` writes the file and the shell
+boundary flush persists it. The shell session exercises `config`,
+`config get`, `config set`, `config list`, `config del` and the `error: bad
+key` path; the persistence session pins the reboot-load, rollback and
+fresh-format cases. Limits are enforced in the codec (host tests) and in the
+shell, never by truncation.
 
 ## Network test details
 

@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::x86_64::{pit, read_tsc};
 use crate::sync::IrqSpinLock;
-use crate::{blk, console, heap, memory, net, persist, sched, serial, vfs};
+use crate::{blk, config, console, heap, memory, net, persist, sched, serial, vfs};
 
 static BUILD_ID: IrqSpinLock<&'static str> = IrqSpinLock::new("dev");
 static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
@@ -75,6 +75,7 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
             crate::kprintln!("  mkdir <path>      create a directory");
             crate::kprintln!("  rm <path>         remove a file or empty directory");
             crate::kprintln!("  stat <path>       node kind and size");
+            crate::kprintln!("  config [get|set|del|list]  registry-like configuration store");
             crate::kprintln!("  vfs               re-run the VFS self-test");
             crate::kprintln!("  blk               ATA device information");
             crate::kprintln!("  persist           checkpoint image status");
@@ -206,6 +207,56 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
             match kind {
                 vfs::NodeKind::File => crate::kprintln!("{}: file ({} B)", args, size),
                 vfs::NodeKind::Dir => crate::kprintln!("{}: directory ({} entries)", args, size),
+            }
+        }
+        "config" => {
+            let (sub, rest) = match args.find(' ') {
+                Some(index) => (&args[..index], args[index + 1..].trim()),
+                None => (args, ""),
+            };
+            match sub {
+                "" => {
+                    let (entries, bytes) = config::status()?;
+                    crate::kprintln!("config: {} entries (/etc/config, {} bytes)", entries, bytes);
+                }
+                "get" => {
+                    if rest.is_empty() {
+                        return Err("usage: config get <key>");
+                    }
+                    let value = config::get(rest)?.ok_or("no such key")?;
+                    crate::kprintln!("{} = {}", rest, value);
+                }
+                "set" => {
+                    let Some(index) = rest.find(' ') else {
+                        return Err("usage: config set <key> <value>");
+                    };
+                    let (key, value) = (&rest[..index], &rest[index + 1..]);
+                    config::set(key, value)?;
+                    config::save()?;
+                    crate::kprintln!("config set: ok");
+                }
+                "del" => {
+                    if rest.is_empty() {
+                        return Err("usage: config del <key>");
+                    }
+                    config::remove(rest)?;
+                    config::save()?;
+                    crate::kprintln!("config del: ok");
+                }
+                "list" => {
+                    let prefix = if rest.is_empty() { None } else { Some(rest) };
+                    let entries = config::list(prefix)?;
+                    match prefix {
+                        Some(prefix) => {
+                            crate::kprintln!("{} entries matching {}:", entries.len(), prefix)
+                        }
+                        None => crate::kprintln!("{} entries in config:", entries.len()),
+                    }
+                    for (key, value) in entries {
+                        crate::kprintln!("  {} = {}", key, value);
+                    }
+                }
+                _ => return Err("usage: config [get|set|del|list] [key] [value]"),
             }
         }
         "vfs" => {

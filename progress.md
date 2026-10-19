@@ -47,10 +47,12 @@ in the scheduler thread slot, and a new `pebasics.exe` fixture with nine
 persistence across a successful call, the synthetic IDs, a wrap-safe
 `GetTickCount` pair and the loader-owned command line at CPL3; the
 `pebadfn2.exe` mutant (`Sleep` substituted for `GetTickCount`) is rejected
-before any allocation. The remaining Phase 7 scope (a broader API surface,
-imports from real system DLLs, ordinals, forwarders, delay imports,
-SEH/unwind, TLS, CLR, PE32) is not started; there is still no Windows
-application compatibility.
+before any allocation. After the user reviewed this evidence, **Phase 7
+acceptance was marked complete** in `docs/ROADMAP.md` (2026-10-19). The
+remaining Phase 7-adjacent scope (a broader API surface, imports from real
+system DLLs, ordinals, forwarders, delay imports, SEH/unwind, TLS, CLR,
+PE32) is explicitly outside the phase and not started; there is still no
+Windows application compatibility.
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
@@ -76,8 +78,12 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   The Phase 7 stage-3 commit is `8045d2b` (`phase7: win32 program basics
   (five-arg writefile stub, per-thread last-error, eleven-name kernel32
   allowlist, loader-owned command line)`); it is pushed (`ec04e74..8045d2b`)
-  together with this progress follow-up commit, same pattern as `f3b17a3`,
-  `5467bde`, `25606ad` and `b8a2910`.
+  together with its progress follow-up `68b3cc9` (`progress: record phase7
+  stage 3 commit and push`). After the user reviewed the stage-3 evidence,
+  `docs/ROADMAP.md` was updated to mark Phase 7 acceptance complete; that
+  edit (with this progress update) is pushed after `68b3cc9`, same
+  commit-then-record pattern as `f3b17a3`, `5467bde`, `25606ad`, `b8a2910`
+  and `68b3cc9`.
   Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
@@ -1042,11 +1048,10 @@ Phase 7 stage 3 is complete: the Win32 program-basics surface (eleven-name
 allowlist, five-argument `WriteFile` stub, per-thread last-error,
 loader-owned command line), fixture pipeline and harnesses are implemented
 and verified (22 PASS / 0 FAIL / 4 SKIP; stage-3 Win32 boot log in
-`artifacts/qemu-serial-pe.log`); this edit records the stage commit `8045d2b`
-and pushes `orgin/main`. The user reviews the evidence above and the
-ROADMAP's pending Phase 7 acceptance note before it is marked complete.
-Candidate work, none of it started: a wider Win32/NT surface (console
-input, `ReadFile`, more process/thread functions, imports from more than one
+`artifacts/qemu-serial-pe.log`); the stage commit `8045d2b` and progress
+commit `68b3cc9` are pushed to `orgin/main`, and Phase 7 acceptance is
+marked complete in `docs/ROADMAP.md` (2026-10-19, user-reviewed). Candidate
+work, none of it started: a wider Win32/NT surface (console input, `ReadFile`, more process/thread functions, imports from more than one
 synthetic DLL), the remaining Phase 2–4 scope gaps (APIC timer/IOAPIC/SMP,
 recoverable exceptions, user address-space hardening, heap growth), and
 Phase 9 (minimal PCI/driver framework — which also unblocks AHCI — plus a

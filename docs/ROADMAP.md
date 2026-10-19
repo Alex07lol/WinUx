@@ -12,7 +12,7 @@ were run and observed. No dates or completion percentages are implied.
 | 4 | kernel heap, slab/size classes, performance harness | **partial** — fixed 8 MiB first-fit free-list heap with global allocator, IRQ-safe locking, poisoning, double-free detection, `validate()` walk, host tests (14) and in-kernel self-test; growth, slabs per measurement and the heap benchmark harness outstanding |
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
-| 7 | PE loader and minimal native Windows console compatibility | **partial (stages 1–3 done, acceptance review pending)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 not started |
+| 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
@@ -217,14 +217,19 @@ the explicit command-line terminator and the `sched::wait_all_finished` TSC
 budget removal. `test_all.sh` reports PASS=22 FAIL=0 SKIP=4. Broader API
 surface, real DLL loading, ordinals, forwarders, delay imports, SEH/unwind,
 TLS, CLR and PE32 remain explicitly deferred; no compatibility claim is
-made. Phase 7 acceptance is reviewed by the user before being marked
-complete.
+made. Phase 7 acceptance was reviewed and marked complete (2026-10-19).
 
-## Phase 7 acceptance (planned)
+## Phase 7 acceptance (met, 2026-10-19)
 
 PE parser/loader handles malformed inputs safely; a named set of controlled
 x86-64 Windows console fixtures runs repeatedly with recorded outcomes using our
-own API services. No general compatibility claim.
+own API services. Met by stages 1–3: three positive fixtures (`pehello.exe`,
+`peconsole.exe`, `pebasics.exe`) execute at CPL3 through the native loader and
+syscall gate, four rejection mutants (`pebad`, `pebadimp`, `pebadfn`,
+`pebadfn2`) are refused before allocation, and the outcomes are pinned in
+`scripts/test_pe_qemu.sh` (`artifacts/qemu-serial-pe.log`; 22 PASS / 0 FAIL /
+4 SKIP in the final `test_all.sh` run). Evidence: R-013/R-014/R-015,
+ADR-0019/0020/0021, `progress.md`. No general compatibility claim.
 
 ## Phase 8 acceptance (planned)
 

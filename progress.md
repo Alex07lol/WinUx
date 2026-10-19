@@ -68,6 +68,29 @@ The persistence harness now also proves theme survival across reboots, theme
 rollback when the newest slot is corrupt, and defaults after a fresh format.
 This is not a Windows registry: no `advapi32`/`HKEY_*` API, no hives, no
 typed values (limits: `docs/CONFIG.md` §8).
+**Phase 8 stage 2** — Win32 console input — is implemented and verified:
+`GetStdHandle(-10)` now serves the distinct input handle `2`; service 14
+(`ReadFile`, the existing five-argument stub, allowlist grows from eleven to
+twelve names) blocks inside the `int 0x80` handler with interrupts enabled and
+`hlt` (no lock held), consumes serial-console bytes one at a time, echoes
+printable ASCII with backspace/DEL editing, terminates on CR/LF with a
+CRLF-inclusive line and count, zeroes `*lpNumberOfBytesRead` before any
+check, and returns the documented `FALSE` + WinError values (`0`+6 bad
+handle, `0`+87 overlapped or length outside `2..=4096`); unmapped pointers
+kill the thread like the write services (`docs/WIN32_INPUT.md`, ADR-0023,
+research R-016). A genuine `peinput.exe` fixture (five `kernel32.dll`
+imports, distinct exit codes per assertion) ships only on
+`artifacts/project-os-input.iso` (`make_iso.sh --input-fixture`); the default
+and interactive ISOs, their module counts, serial assertions and all markers
+are byte-identical to stages 1–3. The paced TCP-serial harness
+(`scripts/test_input_qemu.sh`) types one known line while the fixture is
+blocked and asserts echo, playback, `ReadFile(2, 64 bytes) -> 1 (14 bytes)`,
+the error lines and the self-test line; the full regression stayed green
+(23 PASS / 0 FAIL / 4 SKIP). Limits: line mode with echo only — no
+`ReadConsole`, console modes, Ctrl+C/Ctrl+Z semantics, raw mode, Unicode/W
+variants, redirected stdin, overlapped/async I/O or multiple readers; CRLF
+inclusion is our documented contract, not vendor-verified (`docs/
+WIN32_INPUT.md` §1/§7).
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
@@ -102,7 +125,15 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   The Phase 8 stage-1 commit is `e7ecdc4` (`phase8: native configuration store
   (pocf codec, /etc/config on the checkpoint, config shell builtin)`), 14
   files changed; it is pushed (`82bc098..e7ecdc4`) together with its progress
-  follow-up (this commit).
+  follow-up `58f98e4` (`progress: record phase8 stage 1 commit and push`).
+  The Phase 8 stage-2 commit is `0ec7a59` (`phase8: win32 console input
+  (blocking line-mode ReadFile service, distinct input handle, paced-serial
+  fixture and harness)`), 20 files changed; it is pushed
+  (`58f98e4..0ec7a59`) together with its progress follow-up (this commit),
+  same commit-then-record pattern as `f3b17a3`, `5467bde`, `25606ad`,
+  `b8a2910`, `68b3cc9`, `e7ecdc4` and `58f98e4`. (An earlier attempt created
+  `a7b35f6` with a truncated message and was amended before any push; the
+  remote never saw it.)
   Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
@@ -565,6 +596,53 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   iterations during development (an initial 6-byte header assumption corrected
   to the 8-byte header, and a cap-boundary assertion refined so it tests the
   actual invariant) were fixed before any artifact was recorded.
+- Phase 8 stage 2 — syscall surface (`kernel/src/syscall.rs`):
+  `STD_INPUT_HANDLE = -10`, `INPUT_HANDLE = 2`, `SYS_READFILE = 14`,
+  `MAX_READ = 4096`, `WIN32_READFILE_CALLS` counter, the `-10` branch in
+  `get_std_handle` (pinned line `win32: GetStdHandle(-10) -> 2`), the service
+  dispatch arm and `read_file()`: out-count page validated writable then
+  zeroed, handle/overlapped/length checks with the documented lines and
+  last-errors (6 / 87), buffer span validated before waiting, then the
+  blocking loop (`interrupts_enable()` + `halt()`, no lock held) consuming
+  the serial RX ring byte by byte, echoing printables and `\x08 \x08` for
+  backspace/DEL, appending CRLF at CR/LF with at most `length - 2` content
+  bytes. `kernel/src/pe_loader.rs`: the allowlist grows from eleven to
+  twelve names (`ReadFile`, service 14, `Args5`); stub page/loader untouched.
+- Phase 8 stage 2 — fixture (`userland/pe/peinput`, workspace member added):
+  five `raw-dylib` imports, distinct exit codes 1–8 for each assertion
+  (std handle, invalid-handle result/count, last-error 6, overlapped 87,
+  blocking read failure, CRLF structure, playback, surface line),
+  `const BUFFER_LEN: usize = 64` static buffer (a `static_mut_refs` error was
+  fixed during bring-up), playback via `WriteFile` and
+  `win32: input surface verified` (30 bytes) before `ExitThread(0)`.
+- Phase 8 stage 2 — pipeline and harnesses: `scripts/build_user_pe.sh` builds
+  and checker-verifies `peinput.exe` (eight artifacts, hash log);
+  `scripts/make_iso.sh` gains `--input-fixture` (rejects `--interactive`,
+  output `artifacts/project-os-input.iso`, `debug_exit` kept) and injects the
+  `peinput.exe` module line into the staged `limine.conf` with a grep guard —
+  the static module list in `boot/limine.conf` is copied as-is, so a variant
+  module must be injected (found when the first input run booted without the
+  module; `sed` + verify fix). The new `scripts/test_input_qemu.py`/`.sh`
+  drive the session (wait line → paced typed line → marker → exit-33);
+  `scripts/test_all.sh` gains the `input` step after `shell`. Cosmetic fix:
+  `make_iso.sh`'s build log printed the interactive note for every variant
+  (`${INTERACTIVE:+...}` is non-empty for `0`); it now uses explicit
+  `-eq 1` conditionals. `user.rs` gains `PEINPUT_PATH`/`thread_peinput`, the
+  stage-4 probe block (skip when the module is absent; 30 s window;
+  counter deltas `GetStdHandle +1`, `ReadFile +3`, `GetLastError +2`,
+  `WriteFile +2`, exit 0, no faults) and the verdict line.
+- Phase 8 stage 2 — bring-up defects (harness-side, fixed before the PASS):
+  (1) the echo/playback expectation ignored the serial layer's LF→CRLF
+  expansion, so the transcript shows `hello, win32\r\r\n` while the buffer
+  holds 14 bytes ending CRLF — the pinned expectation and
+  `docs/WIN32_INPUT.md` now record the display artifact; (2) the marker
+  checks ran as soon as `wait_for` matched the marker *prefix*, before the
+  rest of the line arrived — the harness now waits for the marker line's
+  terminator. Also fixed during lint: clippy `manual_range_contains` in
+  `read_file` (now `!(2..=MAX_READ).contains(&length)`), `static_mut_refs`
+  in the fixture (`BUFFER_LEN` const), and a dead `CONSOLE_HANDLE` warning
+  (now used by the fixture's `WriteFile` calls). No kernel defect was found;
+  the first boot passed on unmodified kernel code.
 
 ## Exact commands and results
 
@@ -606,6 +684,12 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
 | `scripts/test_shell_qemu.sh` (Phase 8 stage 1) | PASS: 25-command session (the eight config commands incl. `config: 3 entries (/etc/config, …)`, list/`error: no such key`/`error: bad key`), 0 overruns, 10022 bytes received |
 | `scripts/test_persistence_qemu.sh` (Phase 8 stage 1) | PASS: 4 boots — boot 1 `write` → B seq=1 and `config set Display/Theme light` → A seq=2; boot 2 loads A seq=2 with `light`, `mkdir` → B seq=3, `write /tmp/notes/a.txt` → A seq=4, `config set Display/Theme dark` → B seq=5; boot 3 corrupts B → `loaded slot A seq=4` with theme `light` (rollback) and `alpha`; boot 4 both invalid → fresh format, `classic` defaults |
 | `scripts/test_all.sh` (Phase 8 stage 1, final) | PASS: 22 PASS, 0 FAIL, 4 SKIP (skipped is not passed); unit suite 269 passed; format/lint green in the same run; marker `checks=...,sched,user,elf,pe,win32,vfs,config`, disk boots add `,blk,persist,net` |
+| `cargo test -p os_core` (Phase 8 stage 2) | PASS: 269 passed, 0 failed (no new host-tested code; the stage is kernel/syscall/fixture-side) |
+| `scripts/build_user_pe.sh` (Phase 8 stage 2) | PASS: eight artifacts — `pehello.exe`/`pebad.exe` unchanged and hash-stable; `peconsole.exe`/`pebasics.exe`/`pebadimp.exe`/`pebadfn.exe`/`pebadfn2.exe` unchanged from stages 2–3; `peinput.exe` 4096 bytes, 5 sections, 1 relocation, imports `kernel32.dll:ExitThread,GetLastError,GetStdHandle,ReadFile,WriteFile`, checker-verified |
+| `scripts/make_iso.sh` (Phase 8 stage 2) | PASS: default ISO rebuilt (kernel + three ELF modules + seven PE modules), BIOS+UEFI catalog entries verified; `scripts/make_iso.sh --no-build --input-fixture` built `artifacts/project-os-input.iso` (kernel + three ELF modules + eight PE modules, `debug_exit` kept, `peinput.exe` module line injected into the staged `limine.conf` and grep-verified) |
+| `scripts/test_input_qemu.sh` (Phase 8 stage 2) | PASS: `pe: peinput.exe loaded at 0x400000 (entry 0x401000, 5 sections, 1 relocation applied)`; `win32: GetStdHandle(-10) -> 2`; `win32: ReadFile(1) -> 0 (invalid handle)` + `GetLastError() -> 6`; overlapped read `-> 0 (invalid parameter)` + `GetLastError() -> 87`; `win32: ReadFile(2, 64 bytes) waiting for input`; typed line echoed and played back; `win32: ReadFile(2, 64 bytes) -> 1 (14 bytes)`; `win32: input surface verified`; `win32 input selftest: passed (...)`; marker `checks=...,win32,vfs,config`; QEMU exit 33; transcript 9,166 bytes |
+| `scripts/test_pe_qemu.sh` (Phase 8 stage 2 regression) | PASS: unchanged stage-1–3 assertions on the default ISO (7 modules, allowlist resolution, stub page, all stage-2/3 `win32:` lines and mutants) |
+| `scripts/test_all.sh` (Phase 8 stage 2, final) | PASS: 23 PASS, 0 FAIL, 4 SKIP (skipped is not passed); unit suite 269 passed; format/lint and every boot/shell/persistence/network/VirtualBox step green in the same run; the new `input` step runs after `shell`. Two earlier harness iterations failed on their own pinned expectations (serial LF display, marker prefix race) and were fixed before this run; the kernel passed unmodified on the first boot. |
 | QEMU BIOS boot matrix, 256 MiB / 512 MiB / 1 GiB | PASS at each size: marker `checks=...,sched,user,elf,vfs`, exit 33; q35's default e1000e is deliberately unclaimed, so these boots log `net: inactive (no supported e1000 NIC)` and `net selftest: skipped (no NIC)` |
 | VirtualBox BIOS (`scripts/test_virtualbox.sh`) | PASS with ELF-module ring-3 checks, `fbcon: enabled 85x48 cells at scale 2` / `3133440 bytes match after 1088 redraws`, and the 82540EM NIC observed: `net: e1000 at 00:03.0`, MAC `08:00:27:c4:5d:0a`, loopback `unsupported`, `net selftest: no gateway reply (arp timeout)` — non-fatal, marker without `,net` (`vbox-serial.log`); isolated VM created and deleted |
 | `scripts/test_boot_qemu.sh --firmware uefi` | SKIP: no `OVMF_FD` / OVMF firmware |
@@ -839,6 +923,45 @@ in the corrupt slot — and `/tmp/notes/a.txt` → `alpha`; boot 4 formats fresh
 and reads `Display/Theme = classic` (defaults reseeded) with
 `/tmp/hello.txt` gone.
 
+Win32 console input (Phase 8 stage 2; `artifacts/qemu-input-session.log`,
+`project-os-input.iso`, build `0.1.0-58f98e48`; QEMU q35 512 MiB,
+`isa-debug-exit`, paced TCP serial; the harness typed `hello, win32` as soon
+as the wait line appeared):
+
+```text
+pe: peinput.exe loaded at 0x400000 (entry 0x401000, 5 sections, 1 relocation applied)
+win32: GetStdHandle(-10) -> 2
+win32: ReadFile(1) -> 0 (invalid handle)
+win32: GetLastError() -> 6
+win32: ReadFile(2, 16 bytes, overlapped) -> 0 (invalid parameter)
+win32: GetLastError() -> 87
+win32: ReadFile(2, 64 bytes) waiting for input
+hello, win32
+win32: ReadFile(2, 64 bytes) -> 1 (14 bytes)
+hello, win32
+win32: WriteFile(1, 14 bytes) -> 1
+win32: input surface verified
+win32: WriteFile(1, 30 bytes) -> 1
+win32: ExitThread(0)
+win32 input selftest: passed (ReadFile line input, echo, byte count, invalid handle/parameter errors verified through kernel32.dll imports)
+user: ring-3 program exited (code 0), 9 write(s), 287 bytes, 1 isolated fault(s), 0 rejected syscall(s)
+PROJECT_OS_BOOT_SUCCESS:0.1.0-58f98e48 checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs,config
+```
+
+The first `hello, win32` line is the kernel's echo while reading; the second
+is the fixture's `WriteFile` playback of the 14-byte CRLF-terminated buffer
+(`ReadFile(2, 64 bytes) -> 1 (14 bytes)` is the count line). The serial layer
+expands every LF to CRLF (`kernel/src/serial.rs`), so both displayed lines
+end `CR CR LF` while the buffer holds a single CRLF — the doubled CR is a
+display-layer artifact, and the count line plus the fixture's own CRLF
+structural check are the normative evidence. The harness asserts QEMU exit
+33 (isa-debug-exit). Two harness bring-up defects were found and fixed by the
+runner before this PASS: the echo/playback expectation did not account for
+the serial LF expansion, and the marker checks were asserted before the
+marker line's terminator had arrived (`wait_for` returns on the prefix). No
+kernel defect was found; the kernel and loader behaved as specified on the
+first run.
+
 Framebuffer console (`artifacts/qemu-console-session.log`, interactive ISO,
 512 MiB; QEMU monitor screendump kept as `artifacts/console-screendump.ppm`):
 
@@ -908,29 +1031,32 @@ build from HEAD would carry a new ID.)
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 1,739,896 bytes (Phase 8 stage 1) |
-| Kernel SHA-256 | `8de3faa87c3113dbbc474d5efcd438187143ac5fc281f3e6b2eec669ad8ab608` |
+| Kernel ELF | `artifacts/kernel.elf`, 1,745,512 bytes (Phase 8 stage 2) |
+| Kernel SHA-256 | `56bd754ea1f7f302417940cbe3da280fae1669b800d335d34fcafd438a9e06af` (rebuild-verified twice from unchanged sources) |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
-| PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1`; `artifacts/pebasics.exe` (Phase 7 stage 3: 5 sections, 1 relocation, nine imports `kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile`), 4096 bytes, SHA-256 `4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`; `artifacts/pebadfn2.exe` (`GetTickCount` → `Sleep` pattern patch), 4096 bytes, SHA-256 `9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d` (pehello/pebad hash-stable from clean rebuilds; the other add-ons rebuild deterministically from their patches) |
-| ISO | `artifacts/project-os.iso` |
-| ISO size | 7,776,256 bytes |
-| ISO SHA-256 | `cded5276dae6e9c8495618f5206cd02c0daf39a0451d6dd99b035cf27e105699` |
+| PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1`; `artifacts/pebasics.exe` (Phase 7 stage 3: 5 sections, 1 relocation, nine imports `kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile`), 4096 bytes, SHA-256 `4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`; `artifacts/pebadfn2.exe` (`GetTickCount` → `Sleep` pattern patch), 4096 bytes, SHA-256 `9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d`; `artifacts/peinput.exe` (Phase 8 stage 2: 5 sections, 1 relocation, five imports `kernel32.dll:ExitThread,GetLastError,GetStdHandle,ReadFile,WriteFile`), 4096 bytes, SHA-256 `a2ab21aa4ea7e282c79e2ed1b437c72cee0a21e7b706ba4d0b007a46d5167de0` (pehello/pebad hash-stable from clean rebuilds; the other add-ons rebuild deterministically from their patches) |
+| ISO | `artifacts/project-os.iso` (default: seven PE modules) |
+| ISO size | 7,782,400 bytes |
+| ISO SHA-256 | `9a50df40d2dcad6e43d9f2723869560284516ce5023fe8e97205083ecc3dd06d` |
+| Input ISO | `artifacts/project-os-input.iso` (`make_iso.sh --input-fixture`: kernel + three ELF modules + eight PE modules incl. `peinput.exe`, `debug_exit` kept; built by `scripts/test_input_qemu.sh` with `--no-build`) |
+| Input ISO size / SHA-256 | 7,786,496 bytes / `e5b8165347b33fb45769477488783804812d96f649622b69953d7f21d0c0d834` (rebuilt in the final stage-2 `test_all.sh` run) |
 | Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline; rebuilt by each session harness) |
-| Interactive ISO SHA-256 | `4db4877a82c5893fd83dd61d7abb4e148ed9bc8127c3bf71a935bb61cceeee4c` (rebuilt during the final stage-1 Phase 8 `test_all.sh` run; the shell and persistence runs each rebuild it, so each harness log names its own build) |
+| Interactive ISO size / SHA-256 | 7,782,400 bytes / `7c2cc9036daf77581906ba8a2ee982044094a8bbdb8782c308b4e03e2e0b1c6c` (rebuilt during the final stage-2 Phase 8 `test_all.sh` run; the shell and persistence runs each rebuild it, so each harness log names its own build) |
 | Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `002f45ab44049304dbf7f8605b58a597791caba5c6837ec7e4311c4ea73c0c40`; checker PASS (rebuilt in the stage-5 suite run; the boot log now includes the `net:` lines) |
 | Framebuffer session log | `artifacts/qemu-console-session.log`, SHA-256 `501334a8fde73879a109602782a68a7591c8c571c2ca3e09f119ff8ad6c296e3` |
 | Net session log | `artifacts/qemu-net-session.log`, 4,494 bytes, SHA-256 `940b29fbdd4477e325164e2df7615ef690947de1ca4dff7e6a5cda624ed3eb44`; `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
-| Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the stage-1 Phase 8 4-boot test: fresh format, slot A seq 0, defaults reseeded), SHA-256 `05d2d3ad26aa59c8140d1195e6e8423e19206895c6ed4dbe7c0aff0c0c245d22` |
+| Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the stage-2 Phase 8 4-boot regression: fresh format, slot A seq 0, defaults reseeded — byte-identical to the stage-1 final state), SHA-256 `05d2d3ad26aa59c8140d1195e6e8423e19206895c6ed4dbe7c0aff0c0c245d22` |
+| Input session log | `artifacts/qemu-input-session.log`, 9,166 bytes, SHA-256 `bfd2a9e1cdf7e067485c53e97a0771bcd9faec3134030635884d3a78739e293e` (paced TCP serial transcript, exit-33 run); `artifacts/qemu-input.log`, 192 bytes, SHA-256 `c6d656b1ee32a5417881efedf818357259300ce9bd72abfc3c6507dc9bb129c2` (only QEMU's `wait=on` connection-info line) |
 | ISO boot entries | BIOS platform 0x00 (4 sectors), UEFI platform 0xEF (6144 sectors), both no-emulation, verified by `scripts/verify_iso.py` |
-| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot; stage-3 log 8177 bytes, SHA-256 `d0e172bce65d01cafe5c8cd5074976138edad6d822a233ea6e064539fb0b9e2a`), `artifacts/qemu-net-session.log` (e1000 network session) |
+| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot; stage-2 phase-8 regression log 8408 bytes, SHA-256 `4ab8e01a845d43187ab430c4b8af8e8263bed6b7e59aa65f4b236126cdcda8ec`), `artifacts/qemu-input-session.log` (Win32 console-input session), `artifacts/qemu-net-session.log` (e1000 network session) |
 | VirtualBox result | `artifacts/vbox-test.log`: VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed; with the 82540EM NAT NIC the kernel detected the NIC and reported `net: loopback selftest: unsupported` + `net selftest: no gateway reply (arp timeout)` — non-fatal, no VirtualBox networking claim |
 
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
 The kernel and fixture builds are deterministic for identical sources, flags
-and build ID. The checksums above are from the final Phase 8 stage-1
-`scripts/test_all.sh` run (22 PASS / 0 FAIL / 4 SKIP, unit suite 269 passed).
+and build ID. The checksums above are from the final Phase 8 stage-2
+`scripts/test_all.sh` run (23 PASS / 0 FAIL / 4 SKIP, unit suite 269 passed).
 The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
@@ -979,6 +1105,15 @@ This is a host model, not a kernel or Linux comparison.
   memory with a lazy first-mutation save, `,config` after `,vfs`); no new
   research entry was needed because the format is internal and makes no
   external protocol claim.
+  The Phase 8 stage-2 Win32 console-input surface is governed by
+  `docs/WIN32_INPUT.md` (the contract), ADR-0023 (one new service `ReadFile` =
+  14 behind the existing five-argument stub, distinct input handle `2`,
+  blocking line-mode read with echo inside the syscall via `hlt`, CRLF-
+  inclusive line/count as the project contract, documented `FALSE` + WinError
+  mapping with the count zeroed first, dedicated `--input-fixture` ISO, no
+  marker change) and research R-016 (MS `ReadFile`/console documentation;
+  PASSED with the observed session log, the corrected serial CRLF display
+  expectation and the final `PASS=23 FAIL=0 SKIP=4` summary).
   ADR-0006's framing still holds: serial is authoritative
   for tests, the framebuffer is a display mirror, not a gate.
 - [docs/RESEARCH.md](docs/RESEARCH.md): primary sources, findings, confidence and
@@ -998,10 +1133,10 @@ This is a host model, not a kernel or Linux comparison.
 - UEFI boot has not been run (no OVMF firmware). The UEFI El Torito entry is
   verified; a catalog entry is not a boot test.
 - No PCI driver model, no general Win32/API compatibility and no GPU
-  acceleration. The PE32+ path is Phase 7 stages 1–3: it runs
-  filesystem-less fixtures and resolves imports against an eleven-name
-  `kernel32.dll` allowlist; see the stage-1/stage-2/stage-3 limits bullets
-  below.
+  acceleration. The PE32+ path is Phase 7 stages 1–3 plus Phase 8 stage 2:
+  it runs filesystem-less fixtures and resolves imports against a twelve-name
+  `kernel32.dll` allowlist; see the stage-1/stage-2/stage-3 and Phase 8
+  stage-2 limits bullets below.
   Networking exists as stage 5 (one polled e1000 with static addressing);
   there is no general on-disk filesystem: persistence is the
   whole-tree checkpoint image (stage 2) described above.
@@ -1053,6 +1188,23 @@ This is a host model, not a kernel or Linux comparison.
   settings on the next boot; the boot self-test never writes the file. No
   bring-up defect occurred in this stage (two host-test iterations during
   development were fixed before any artifact was recorded).
+- Phase 8 stage-2 limits (spec: `docs/WIN32_INPUT.md` §1/§7, ADR-0023):
+  twelve allowlisted `kernel32.dll` names now, with `ReadFile` accepting only
+  handle `2` (`GetStdHandle(-10)`, the distinct input handle; output stays
+  `1`); line mode with echo is the only mode — no `ReadConsoleA/W`,
+  `GetConsoleMode`/`SetConsoleMode`, Ctrl+C (`ERROR_OPERATION_ABORTED`) or
+  Ctrl+Z/EOF semantics, raw mode, `INPUT_RECORD` low-level input, Unicode/W
+  variants, redirected stdin, overlapped/asynchronous I/O or a second reader;
+  the read length must be `2..=4096` (a CRLF terminator plus the `MAX_READ`
+  cap), the buffer always reserves two bytes for CRLF, and a full buffer
+  returns the accumulated content with the rest kept in the 256-byte serial
+  RX ring. CRLF inclusion in line and count is our documented contract, not
+  a vendor-verified `ReadFile` statement. The wait re-enables interrupts and
+  uses `hlt`: it depends on the serial RX IRQ and the still-running PIT. A
+  boot of the input ISO without a harness fails the phase after the 30 s
+  window instead of hanging. No kernel defect was found; two harness
+  bring-up defects (serial LF display expectation, marker-prefix race) were
+  fixed before the PASS.
 - Phase 6 stage-5 limits (spec/ADR: `docs/NETWORK.md` §10, ADR-0018): one
   polled e1000 on bus 0 with static `10.0.2.15/24`; no DHCP/DNS/TCP/sockets,
   no interrupt/MSI receive or background RX (packets are processed only while
@@ -1107,19 +1259,20 @@ This is a host model, not a kernel or Linux comparison.
   after the first scanline. The final comparison is per scanline, and the
   self-test's diagnostic fields (row, offset, expected, actual) made the
   failures analyzable.
-- User-mode limits (Phase 6 stage 3, extended by Phase 7 stages 1–3): programs
-  are our own ELF64 `ET_EXEC` modules or PE32+ images loaded from Limine —
-  the PE path resolves only the eleven stage-2/stage-3 `kernel32.dll` names
-  (see the stage-2/stage-3 limits above), and neither path has PIE/dynamic
-  linking, PT_INTERP or ASLR, and there is no filesystem-backed exec; the
-  code window is fixed at 0x400000..0x500000 with a one-page stack at
-  0x500000.
+- User-mode limits (Phase 6 stage 3, extended by Phase 7 stages 1–3 and
+  Phase 8 stage 2): programs are our own ELF64 `ET_EXEC` modules or PE32+
+  images loaded from Limine — the PE path resolves only the twelve
+  stage-2/stage-3/Phase-8-stage-2 `kernel32.dll` names (see those limits
+  above), and neither path has PIE/dynamic linking, PT_INTERP or ASLR, and
+  there is no filesystem-backed exec; the code window is fixed at
+  0x400000..0x500000 with a one-page stack at 0x500000.
   One user program runs at a time (the TSS `rsp0` is programmed for the sole
   user thread, so concurrent user threads are not supported); there is no
-  fork/exec/wait, no guard page above the user stack, and no syscall returns
-  user data yet; the syscall gate is `int 0x80` with a 4 KiB write cap and
-  console-fd-only write. Skip paths print explicit skipped verdicts when
-  modules are absent (not a pass).
+  fork/exec/wait, no guard page above the user stack, and the only syscall
+  that returns data into user memory is `ReadFile` (line-mode console input
+  into a validated user buffer); the syscall gate is `int 0x80` with a 4 KiB
+  write cap, console-fd-only write and console-input-fd-only read. Skip paths
+  print explicit skipped verdicts when modules are absent (not a pass).
 - Stage-3 environment constraint (ADR-0017): any `build.rs` is unusable in
   this checkout — build-script executable paths exceed the Windows
   260-character `MAX_PATH` (MSVC `LNK1104`). Kernel link flags therefore stay
@@ -1157,20 +1310,24 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 8 stage 1 is complete: the native configuration store (`POCF` codec,
-`/etc/config` carried by the existing checkpoint, `config` shell builtin) is
-implemented and verified (22 PASS / 0 FAIL / 4 SKIP; unit suite 269;
-`docs/CONFIG.md`, ADR-0022); the stage commit `e7ecdc4` and this progress
-commit are pushed to `orgin/main`. Single best next action: **Phase 8
-stage 2 — a scoped Win32 surface on the proven machinery, starting with
-console input.** The strongest candidate is `ReadFile` on the standard input
-handle with a cmdline-gated fixture (the cmdline-gated pattern already exists
-for the console fixtures), because it adds a new call shape (buffer fill +
-out-pointer byte count + EOF semantics) without new storage
-(`docs/WIN32_CONSOLE.md` §9 records the open design questions). Candidate
-work beyond that, none of it started: a Win32-visible read-only view of the
-configuration store, more process/thread functions, imports from more than
-one synthetic DLL, the remaining Phase 2–4 scope gaps (APIC timer/IOAPIC/SMP,
-recoverable exceptions, user address-space hardening, heap growth), and
+Phase 8 stage 1 (configuration store) and stage 2 (Win32 console input) are
+complete: the store rides the existing checkpoint with a host-tested `POCF`
+codec (`docs/CONFIG.md`, ADR-0022), and service 14 `ReadFile` gives a
+PE32+ program a blocking, echoing line-mode read from the serial console
+with documented error mapping (`docs/WIN32_INPUT.md`, ADR-0023, R-016).
+Verified: 23 PASS / 0 FAIL / 4 SKIP; unit suite 269; stage-2 artifacts
+recorded above. The stage-2 commit and this progress commit will be pushed
+to `orgin/main` with the usual commit-then-record pattern. Single best next
+action: **choose and implement Phase 8 stage 3 — the next scoped Win32
+surface on the proven machinery.** Strongest candidates:
+(1) a Win32-visible read-only view of the configuration store (a small
+`kernel32`-shaped or `advapi32`-named read path that proves the store is
+consumable by real imports, with the same allowlist/stub machinery);
+(2) a second synthetic DLL (`user32.dll`-shaped or similar) to prove the
+loader resolves more than one DLL name while the runtime stays honest about
+what that means; (3) more process/thread functions (e.g. a wait/sleep pair)
+extending the stage-4 program basics. None are started. Later work
+candidates: the remaining Phase 2–4 scope gaps (APIC timer/IOAPIC/SMP,
+recoverable exceptions, user address-space hardening, heap growth) and
 Phase 9 (minimal PCI/driver framework — which also unblocks AHCI — plus a
 virtual GPU target).

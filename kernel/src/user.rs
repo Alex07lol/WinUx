@@ -1,5 +1,5 @@
 //! Ring-3 user-mode demonstration and self-test (Phase 6, stage 3; PE32+
-//! phase 7, stages 1 and 2).
+//! phase 7, stages 1–3).
 //!
 //! User programs are ELF64 executables built from `userland/` (Rust, no_std)
 //! and PE32+ executables built from `userland/pe`, shipped as Limine modules
@@ -23,6 +23,11 @@
 //!   import table, dispatched by the kernel-owned stub page.
 //!   `pebadimp.exe` (unknown DLL) and `pebadfn.exe` (unknown function) must
 //!   be rejected by the import allowlist before any page is allocated.
+//! * `pebasics.exe` (stage 3) calls the eight new `kernel32.dll` functions
+//!   plus `GetStdHandle` — including the five-argument `WriteFile` and the
+//!   per-thread `GetLastError`/`SetLastError` pair — and ends through
+//!   `ExitThread`. `pebadfn2.exe` (unknown function) must be rejected the
+//!   same way as `pebadfn.exe`.
 //!
 //! Each program runs one at a time on its own scheduler thread. The thread
 //! publishes its address space and load plan into a static slot; after the
@@ -56,6 +61,8 @@ const PEBAD_PATH: &str = "/boot/pebad.exe";
 const PECONSOLE_PATH: &str = "/boot/peconsole.exe";
 const PEBADIMP_PATH: &str = "/boot/pebadimp.exe";
 const PEBADFN_PATH: &str = "/boot/pebadfn.exe";
+const PEBASICS_PATH: &str = "/boot/pebasics.exe";
+const PEBADFN2_PATH: &str = "/boot/pebadfn2.exe";
 
 /// Single user stack page, at the stage-5b placement just above the code
 /// window (`loader::CODE_END` == `STACK_VA`).
@@ -120,6 +127,8 @@ pub struct DemoReport {
     pub pe: bool,
     /// False when the Win32 console self-test was skipped.
     pub win32: bool,
+    /// False when the Win32 program-basics self-test was skipped.
+    pub win32_program: bool,
 }
 
 fn thread_fatal(message: core::fmt::Arguments<'_>) -> ! {
@@ -300,6 +309,10 @@ fn thread_peconsole() {
     run_pe(PECONSOLE_PATH);
 }
 
+fn thread_pebasics() {
+    run_pe(PEBASICS_PATH);
+}
+
 fn unmap_and_free(space: &mut AddressSpace, virtual_address: u64) -> Result<(), &'static str> {
     if let Ok(physical) = space.unmap_page(virtual_address)
         && let Some(frame) = PhysFrame::from_address(physical)
@@ -354,6 +367,7 @@ fn idle_report() -> DemoReport {
         elf: false,
         pe: false,
         win32: false,
+        win32_program: false,
     }
 }
 
@@ -368,7 +382,7 @@ fn module_name(file: &*const limine::File) -> &'static str {
 }
 
 /// Boot-time demonstration. The scheduler must already be initialised.
-pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
+pub fn demo() -> Result<DemoReport, &'static str> {
     sched::set_preemption(true);
 
     let Some(modules) = limine::modules().filter(|modules| !modules.is_empty()) else {
@@ -407,7 +421,7 @@ pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
     }
 
     sched::spawn("user-hello", thread_hello)?;
-    sched::wait_all_finished(300, tsc_frequency)?;
+    sched::wait_all_finished(300)?;
     vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
     cleanup_slot()?;
     if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
@@ -421,7 +435,7 @@ pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
     let faults_after_hello = syscall::USER_FAULTS.load(Ordering::SeqCst);
 
     sched::spawn("user-fault", thread_fault)?;
-    sched::wait_all_finished(300, tsc_frequency)?;
+    sched::wait_all_finished(300)?;
     vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
     cleanup_slot()?;
     if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_after_hello + 1 {
@@ -455,7 +469,7 @@ pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
     let faults_before_pe = syscall::USER_FAULTS.load(Ordering::SeqCst);
 
     sched::spawn("user-pe", thread_pehello)?;
-    sched::wait_all_finished(300, tsc_frequency)?;
+    sched::wait_all_finished(300)?;
     vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
     cleanup_slot()?;
     if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
@@ -519,7 +533,7 @@ pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
     let exit_before_win32 = syscall::WIN32_EXIT_PROCESS_CALLS.load(Ordering::SeqCst);
 
     sched::spawn("user-win32", thread_peconsole)?;
-    sched::wait_all_finished(300, tsc_frequency)?;
+    sched::wait_all_finished(300)?;
     vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
     cleanup_slot()?;
     if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
@@ -544,12 +558,121 @@ pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
         return Err("peconsole.exe produced a user fault");
     }
 
+    // Phase 7, stage 3: the Win32 program basics. `pebadfn2.exe` is probed
+    // first — a rejection proves the allowlist before any allocation — then
+    // `pebasics.exe` runs at CPL3 and exercises the five-argument WriteFile,
+    // the per-thread last-error pair, identity/tick queries, the command
+    // line and ExitThread.
+    for path in [PEBASICS_PATH, PEBADFN2_PATH] {
+        if limine::module_by_path(path).is_none() {
+            kprintln!(
+                "user: Win32 program self-test skipped (`{}` module missing)",
+                path
+            );
+            kprintln!("win32 program selftest: skipped (no program fixtures present)");
+            sched::set_preemption(false);
+            return Ok(DemoReport {
+                elf: true,
+                pe: true,
+                win32: true,
+                ..idle_report()
+            });
+        }
+    }
+
+    let Some(bad_function2) = limine::module_by_path(PEBADFN2_PATH) else {
+        return Err("pebadfn2.exe module vanished after the presence check");
+    };
+    match pe_loader::inspect(bad_function2) {
+        Ok(_) => return Err("module pebadfn2.exe was accepted despite an unknown import function"),
+        Err(pe_loader::Reject::UnknownImportFunction) => {
+            kprintln!("user: /boot/pebadfn2.exe rejected (unknown import function)");
+        }
+        Err(_) => return Err("module pebadfn2.exe was rejected for an unexpected reason"),
+    }
+
+    let writes_before_program = syscall::WRITE_CALLS.load(Ordering::SeqCst);
+    let bytes_before_program = syscall::BYTES_WRITTEN.load(Ordering::SeqCst);
+    let faults_before_program = syscall::USER_FAULTS.load(Ordering::SeqCst);
+    let get_before_program = syscall::WIN32_GET_STD_HANDLE_CALLS.load(Ordering::SeqCst);
+    let console_before_program = syscall::WIN32_WRITE_CONSOLE_CALLS.load(Ordering::SeqCst);
+    let exit_before_program = syscall::WIN32_EXIT_PROCESS_CALLS.load(Ordering::SeqCst);
+    let writefile_before_program = syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst);
+    let last_error_before_program = syscall::WIN32_GET_LAST_ERROR_CALLS.load(Ordering::SeqCst);
+    let set_last_error_before_program = syscall::WIN32_SET_LAST_ERROR_CALLS.load(Ordering::SeqCst);
+    let exit_thread_before_program = syscall::WIN32_EXIT_THREAD_CALLS.load(Ordering::SeqCst);
+    let process_id_before_program =
+        syscall::WIN32_GET_CURRENT_PROCESS_ID_CALLS.load(Ordering::SeqCst);
+    let thread_id_before_program =
+        syscall::WIN32_GET_CURRENT_THREAD_ID_CALLS.load(Ordering::SeqCst);
+    let tick_before_program = syscall::WIN32_GET_TICK_COUNT_CALLS.load(Ordering::SeqCst);
+    let command_line_before_program = syscall::WIN32_GET_COMMAND_LINE_CALLS.load(Ordering::SeqCst);
+
+    sched::spawn("user-win32-prog", thread_pebasics)?;
+    sched::wait_all_finished(300)?;
+    vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
+    cleanup_slot()?;
+    if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
+        return Err("pebasics.exe did not exit with code 0");
+    }
+    if syscall::WIN32_GET_STD_HANDLE_CALLS.load(Ordering::SeqCst) != get_before_program + 1 {
+        return Err("pebasics.exe did not call GetStdHandle exactly once");
+    }
+    if syscall::WIN32_WRITE_CONSOLE_CALLS.load(Ordering::SeqCst) != console_before_program {
+        return Err("pebasics.exe called WriteConsoleA");
+    }
+    if syscall::WIN32_EXIT_PROCESS_CALLS.load(Ordering::SeqCst) != exit_before_program {
+        return Err("pebasics.exe called ExitProcess");
+    }
+    if syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst) != writefile_before_program + 4 {
+        return Err("pebasics.exe did not call WriteFile exactly four times");
+    }
+    if syscall::WIN32_GET_LAST_ERROR_CALLS.load(Ordering::SeqCst) != last_error_before_program + 5 {
+        return Err("pebasics.exe did not call GetLastError exactly five times");
+    }
+    if syscall::WIN32_SET_LAST_ERROR_CALLS.load(Ordering::SeqCst)
+        != set_last_error_before_program + 2
+    {
+        return Err("pebasics.exe did not call SetLastError exactly twice");
+    }
+    if syscall::WIN32_EXIT_THREAD_CALLS.load(Ordering::SeqCst) != exit_thread_before_program + 1 {
+        return Err("pebasics.exe did not call ExitThread exactly once");
+    }
+    if syscall::WIN32_GET_CURRENT_PROCESS_ID_CALLS.load(Ordering::SeqCst)
+        != process_id_before_program + 1
+    {
+        return Err("pebasics.exe did not call GetCurrentProcessId exactly once");
+    }
+    if syscall::WIN32_GET_CURRENT_THREAD_ID_CALLS.load(Ordering::SeqCst)
+        != thread_id_before_program + 1
+    {
+        return Err("pebasics.exe did not call GetCurrentThreadId exactly once");
+    }
+    if syscall::WIN32_GET_TICK_COUNT_CALLS.load(Ordering::SeqCst) != tick_before_program + 2 {
+        return Err("pebasics.exe did not call GetTickCount exactly twice");
+    }
+    if syscall::WIN32_GET_COMMAND_LINE_CALLS.load(Ordering::SeqCst)
+        != command_line_before_program + 1
+    {
+        return Err("pebasics.exe did not call GetCommandLineA exactly once");
+    }
+    if syscall::WRITE_CALLS.load(Ordering::SeqCst) != writes_before_program + 2 {
+        return Err("pebasics.exe did not perform exactly two console writes");
+    }
+    if syscall::BYTES_WRITTEN.load(Ordering::SeqCst) != bytes_before_program + 59 {
+        return Err("pebasics.exe did not write exactly 59 bytes");
+    }
+    if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_before_program {
+        return Err("pebasics.exe produced a user fault");
+    }
+
     sched::set_preemption(false);
 
     let report = DemoReport {
         elf: true,
         pe: true,
         win32: true,
+        win32_program: true,
         ..idle_report()
     };
     if report.rejected_syscalls != 0 {

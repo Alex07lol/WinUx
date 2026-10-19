@@ -28,7 +28,6 @@ use os_core::frame::PAGE_SIZE;
 use crate::arch::x86_64::context::project_os_context_switch;
 use crate::arch::x86_64::{
     halt, interrupts_disable, interrupts_enable, interrupts_restore, interrupts_save_disable,
-    read_tsc,
 };
 use crate::kprintln;
 use crate::memory;
@@ -54,6 +53,9 @@ struct Thread {
     entry: Option<fn()>,
     name: &'static str,
     id: u64,
+    /// Win32 last-error value (`GetLastError`/`SetLastError`): per-thread
+    /// state, initialised to 0 like a fresh thread's error slot.
+    last_error: u32,
     state: ThreadState,
 }
 
@@ -65,6 +67,7 @@ impl Thread {
             entry: None,
             name: "",
             id: 0,
+            last_error: 0,
             state: ThreadState::Unused,
         }
     }
@@ -142,6 +145,7 @@ pub fn init(hhdm_offset: u64) -> Result<(), &'static str> {
         entry: None,
         name: "boot",
         id: 0,
+        last_error: 0,
         state: ThreadState::Running,
     };
     sched.current = Some(0);
@@ -212,6 +216,7 @@ pub fn spawn(name: &'static str, entry: fn()) -> Result<u64, &'static str> {
         entry: Some(entry),
         name,
         id,
+        last_error: 0,
         state: ThreadState::Ready,
     };
     sched.live += 1;
@@ -391,6 +396,20 @@ pub fn current_kernel_stack_top() -> Option<u64> {
         .map(|base| base + bytes)
 }
 
+/// The calling thread's last-error value (Win32 `GetLastError` state).
+pub fn current_last_error() -> u32 {
+    let sched = SCHED.lock();
+    let current = sched.current.unwrap_or(0);
+    threads()[current].last_error
+}
+
+/// Set the calling thread's last-error value (Win32 `SetLastError` state).
+pub fn set_current_last_error(value: u32) {
+    let sched = SCHED.lock();
+    let current = sched.current.unwrap_or(0);
+    threads()[current].last_error = value;
+}
+
 pub fn stats() -> SchedStats {
     let sched = SCHED.lock();
     SchedStats {
@@ -400,23 +419,21 @@ pub fn stats() -> SchedStats {
     }
 }
 
-/// Block (with `hlt`) until only thread 0 remains. Bounded by PIT ticks and,
-/// when the bootloader provided a TSC frequency, by wall time as well.
-pub fn wait_all_finished(
-    timeout_ticks: u64,
-    tsc_frequency: Option<u64>,
-) -> Result<(), &'static str> {
+/// Block (with `hlt`) until only thread 0 remains. Bounded by PIT ticks, which
+/// are wall time on every supported target (100 Hz programmed rate).
+///
+/// A TSC-based bound was removed in Phase 7 stage 3: the Limine-reported TSC
+/// frequency disagrees with the real `rdtsc` rate under QEMU, so the old
+/// fixed two-second budget expired while the stage-3 Win32 program self-test
+/// was still completing syscalls, and the resulting boot failure halted the
+/// machine mid-program. Wiring faults that stop the timer entirely already
+/// prevent the `hlt` in this loop from waking, so the TSC bound was not an
+/// effective backstop for them anyway.
+pub fn wait_all_finished(timeout_ticks: u64) -> Result<(), &'static str> {
     let start_ticks = crate::arch::x86_64::pit::ticks();
-    let start_tsc = read_tsc();
-    let tsc_limit = tsc_frequency.map(|frequency| frequency.saturating_mul(2));
     while live_count() > 1 {
         if crate::arch::x86_64::pit::ticks().saturating_sub(start_ticks) > timeout_ticks {
             return Err("threads did not finish within the tick budget");
-        }
-        if let Some(limit) = tsc_limit
-            && read_tsc().wrapping_sub(start_tsc) > limit
-        {
-            return Err("threads did not finish within the TSC budget");
         }
         // With interrupts enabled, `hlt` wakes on the next timer tick, whose
         // ISR switches to runnable worker threads and back.
@@ -470,12 +487,12 @@ fn spinner() {
 
 /// Run the boot demonstration: two yielding workers, one CPU-bound spinner,
 /// timer preemption enabled. `init` must have been called first.
-pub fn demo(tsc_frequency: Option<u64>) -> Result<DemoReport, &'static str> {
+pub fn demo() -> Result<DemoReport, &'static str> {
     spawn("worker-a", worker_a)?;
     spawn("worker-b", worker_b)?;
     spawn("spinner", spinner)?;
     set_preemption(true);
-    wait_all_finished(300, tsc_frequency)?;
+    wait_all_finished(300)?;
     set_preemption(false);
 
     let worker_a_steps = DEMO_A.load(Ordering::SeqCst);

@@ -753,3 +753,116 @@ loaded, no handle/process semantics exist beyond the single console handle,
 and the allowlist means an image importing anything else is rejected by
 design. Limits stay as stated in `docs/WIN32_CONSOLE.md` §1/§9.
 
+## ADR-0021 – Win32 program basics: five-argument stubs, per-thread last-error, loader-owned command line (Phase 7, stage 3)
+
+**Context.** Stage 2 proved the import mechanism with three four-argument
+functions but left the obvious console-program facilities unproven: a
+five-argument call shape (`WriteFile`), per-thread error state
+(`GetLastError`/`SetLastError`), a thread exit path (`ExitThread`), identity
+and time queries, and a command line. The full contract (fixture sequence,
+pinned serial lines, counter deltas, limits) lives in
+`docs/WIN32_PROGRAM.md`; the research record is R-015.
+
+**Decision.**
+
+- **The fifth integer argument flows through `r10`.** The new stub shape is
+  `mov r10, [rsp+0x28]; mov eax, service; int 0x80; ret` — the documented
+  x64 position of the first stack argument (32-byte shadow space + 8-byte
+  return address). `InterruptFrame` already captures `r10`
+  (`kernel/src/arch/x86_64/idt.rs:22-23`), so the syscall gate reads it with
+  no entry-stub or frame change, and the 13-byte instruction sequence still
+  fits the 16-byte stub stride (3 padding bytes instead of 8). Rejected
+  alternatives: copying the user shadow space into the interrupt frame
+  (larger frame for one call shape), variable-stub-length layout (breaks the
+  stride math and the teardown assumptions for no benefit), per-service
+  entry stubs that remap registers (an assembly surface we do not need).
+- **`last_error` is per-thread scheduler state, not a global.** Each thread
+  slot carries `last_error: u32` initialized to `0`; `GetLastError` reads
+  and `SetLastError` writes it. The docs are explicit that the last-error
+  code is maintained per-thread, so a global atomic would encode the wrong
+  semantics into the ABI. Rejected alternative: global atomic (simpler but
+  wrong and untestable per-thread later).
+- **`WriteFile` returns documented failure values instead of killing for
+  argument errors.** Bad handle → `0` + `ERROR_INVALID_HANDLE` (6);
+  non-null `lpOverlapped` and zero/oversized length → `0` +
+  `ERROR_INVALID_PARAMETER` (87); success does not clear `last_error`. Only
+  unmapped buffer/out-pointer spans kill the thread, matching the existing
+  memory-safety gate (documented divergence: Windows would raise an access
+  violation). Overlapped I/O is never accept-ed — with one synchronous
+  console handle the only honest answer is "invalid parameter". Rejected
+  alternatives: killing on every error path (no way to exercise
+  `GetLastError`), pretending to support overlapped writes (nothing
+  asynchronous exists to report through).
+- **`GetCurrentProcessId`/`GetCurrentThreadId` return synthetic constants
+  `1`/`1`.** There is no NT PID/TID space and no user handle table; the
+  value is documented as a constant, not a unique identifier. Rejected
+  alternatives: reusing the scheduler thread index (looks unique but is not
+  a stable identifier across applications and still not NT), fake
+  NT-looking ranges (dishonest precision).
+- **`GetTickCount` is the PIT tick count × 10 as `u32`.** The PIT runs at
+  100 Hz, inside the documented 10–16 ms resolution range, and the `u32`
+  wraps after 49.7 days like the documented `DWORD`; the fixture compares
+  wrap-safely. Rejected alternatives: TSC-derived milliseconds (needs
+  calibration data as kernel state for one fixture), a fake constant
+  (defeats the point of a time source).
+- **`GetCommandLineA` returns a loader-written string in the stub-page
+  tail.** `map` writes the NUL-terminated real Limine module path (e.g.
+  `/boot/pebasics.exe`) at `WIN32_STUB_VA + 0xF00` when it prepares the stub
+  page; the service validates, copies out for the log line, and returns the
+  fixed VA. The string is honest (it is the path this OS actually loaded
+  from), read-only by construction, and freed with the stub page. A path
+  longer than 255 bytes is a named rejection (`CommandLineTooLong`), never a
+  truncation. Rejected alternatives: fabricating a Windows-shaped
+  `C:\...` command line (dishonest — no such path exists here), returning
+  an empty string (a command line that lies by omission), building an
+  `argv`-style blob (that is parsing, explicitly out of scope).
+- **The marker keeps the `,win32` token.** Stage 3 extends the same
+  kernel32 allowlist and the same self-test family; a new `,win32prog`
+  suffix would force edits to every marker assertion for no added
+  information. Rejected alternative: a new marker suffix (churn without
+  signal).
+- **Stub shapes are two (4-arg, 5-arg); 0- and 1-argument functions reuse
+  the 4-arg shape.** Unused argument registers are simply ignored by the
+  services, so extra shapes would be dead weight. Rejected alternative: one
+  shape per arity (four encodings to test for no behavioural difference).
+- **New fixtures only; stage 1/2 bytes and contracts untouched.**
+  `pebasics.exe` plus the `pebadfn2.exe` mutant (unknown function `Sleep`)
+  join the ISO; `pehello`, `pebad`, `peconsole`, `pebadimp` and `pebadfn`
+  are not rebuilt differently and all their pinned lines stay
+  byte-identical.
+
+**Alternatives considered.** A wider jump into real compatibility
+(implementing `ReadFile`, console modes, dynamic allocation for buffers) —
+each needs machinery this stage does not have and would balloon the
+contract; returning real NT identifiers — no NT objects exist to identify;
+making the allowlist case-insensitive now — no consumer needs it and the
+byte-exact list is easier to audit; a third fixture for the error paths —
+the single `pebasics` sequence already exercises all four `WriteFile`
+outcomes and keeps counter deltas readable.
+
+**Evidence.** PASSED (2026-10-19, QEMU 11.1.0, build `0.1.0-ec04e74f`).
+`scripts/build_user_pe.sh`: `pebasics.exe` 4096 bytes, SHA-256
+`4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`,
+5 sections, 1 relocation, 9 imports; `pebadfn2.exe` 4096 bytes, SHA-256
+`9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d`.
+`scripts/test_pe_qemu.sh` PASS with the pinned lines of
+`docs/WIN32_PROGRAM.md` §7 (`pe: pebasics.exe loaded at 0x400000 (entry
+0x401000, 5 sections, 1 relocation applied)`, the full `win32:` program
+sequence, `win32 program selftest: passed (...)`,
+`user: /boot/pebadfn2.exe rejected (unknown import function)`) and marker
+`PROJECT_OS_BOOT_SUCCESS:0.1.0-ec04e74f checks=...,sched,user,elf,pe,win32,vfs`.
+Full `scripts/test_all.sh`: `PASS=22 FAIL=0 SKIP=4`. Deviations observed and
+fixed during bring-up (none in the final artifact): the stub-page command-line
+terminator is now written explicitly (the page is `int3`-filled, so a trailing
+zero cannot be assumed), and `sched::wait_all_finished` dropped its
+TSC-frequency budget after Limine's reported frequency disagreed with real
+`rdtsc` under QEMU; it is bounded by PIT ticks only. Both fixes are recorded in
+`progress.md`.
+
+**Consequences.** The native surface grows from three to eleven
+`kernel32.dll` names covering the first five-argument call, thread exit and
+per-thread error state. This remains a mechanism, not compatibility: IDs are
+constants, overlapped I/O does not exist, unmapped buffers kill the thread,
+and the allowlist still rejects every unknown import — all divergences are
+documented in `docs/WIN32_PROGRAM.md` §9 rather than hidden.
+

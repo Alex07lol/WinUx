@@ -37,12 +37,12 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_unit.sh` | 252 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), ELF64 parser incl. all rejection vectors, PE32+ parser incl. all rejection vectors, relocation walk and import directory (descriptors, ILT/IAT fallback, names, ordinals, caps), PCI config/BAR math, Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (252/252) |
 | `scripts/build.sh` | kernel builds; ELF entry and Limine requests verified | PASS |
 | `scripts/build_user.sh` | userland workspace builds; `hello`/`fault` pass the header checker; `bad.elf` fails with `bad magic` | PASS |
-| `scripts/build_user_pe.sh` | `userland/pe` builds via rust-lld; `pehello.exe`/`peconsole.exe` pass `check_user_pe.py` (imports included); `pebad.exe` fails with `bad signature`; the `pebadimp`/`pebadfn` mutants patch a unique byte pattern each and stay structurally valid | PASS |
-| `scripts/make_iso.sh` | ISO built (kernel + three ELF modules + five PE modules); both El Torito entries verified | PASS |
+| `scripts/build_user_pe.sh` | `userland/pe` builds via rust-lld; `pehello.exe`/`peconsole.exe`/`pebasics.exe` pass `check_user_pe.py` (imports included); `pebad.exe` fails with `bad signature`; the `pebadimp`/`pebadfn`/`pebadfn2` mutants patch a unique byte pattern each and stay structurally valid | PASS |
+| `scripts/make_iso.sh` | ISO built (kernel + three ELF modules + seven PE modules); both El Torito entries verified | PASS |
 | `scripts/test_boot_qemu.sh` | BIOS boot at 256 MiB, 512 MiB and 1 GiB; marker; no panic; debug-exit 33 | PASS (all three) |
 | `scripts/test_boot_qemu.sh --firmware uefi` | UEFI boot | SKIP (no `OVMF_FD`) |
 | `scripts/test_elf_qemu.sh` | ELF64 module self-test: 3 modules present, ring-3 greeting from the ELF, exit 0, one isolated fault, `bad.elf` rejected, `,elf` marker | PASS |
-| `scripts/test_pe_qemu.sh` | PE32+/Win32 self-test (stages 1–2): 5 modules present, pehello load line (4 sections, 1 relocation) + greeting + relocation verified, `pebad.exe` rejected (`bad signature`), peconsole load line (5 sections, 1 relocation), the seven `win32:` service lines, `pebadimp.exe` rejected (`unknown import dll`), `pebadfn.exe` rejected (`unknown import function`), `win32 selftest: passed`, `pe`+`win32` markers | PASS |
+| `scripts/test_pe_qemu.sh` | PE32+/Win32 self-test (stages 1–3): 7 modules present, pehello load line (4 sections, 1 relocation) + greeting + relocation verified, `pebad.exe` rejected (`bad signature`), peconsole load line (5 sections, 1 relocation), the seven `win32:` console lines, `pebadimp.exe` rejected (`unknown import dll`), `pebadfn.exe` rejected (`unknown import function`), `win32 selftest: passed`, pebasics load line (5 sections, 1 relocation), the full `win32:` program-basics block (incl. `WriteFile(0) -> 0 (invalid handle)`, `WriteFile(1, 28 bytes, overlapped) -> 0 (invalid parameter)`, `GetCommandLineA() -> "/boot/pebasics.exe"`), `pebadfn2.exe` rejected (`unknown import function`), `win32 program selftest: passed`, `pe`+`win32` markers | PASS |
 | `scripts/test_memory.sh` | allocator host tests + in-VM allocator self-test | PASS (both) |
 | `scripts/test_vfs.sh` | host path tests + in-VM VFS self-test | PASS (both) |
 | `scripts/test_shell_qemu.sh` | scripted interactive shell session over a paced TCP serial chardev | PASS (17 commands) |
@@ -142,8 +142,18 @@ and the kernel idles, so the same ISO can be booted manually.
     `GetStdHandle`/`WriteConsoleA`/`ExitProcess` reached at CPL3 through the
     resolved imports with exactly 1/2/1 calls, two console writes (76 bytes),
     exit 0, no new user faults (`docs/WIN32_CONSOLE.md` §7).
-16. VFS self-test: create/read/append/overwrite/remove/list and the error paths.
-17. Framebuffer console self-test: the whole grid plus cursor is re-rendered in
+16. Win32 program-basics self-test (when the `pebasics`/`pebadfn2` modules are
+    present): `pebadfn2.exe` rejected before any allocation (`unknown import
+    function`); `pebasics.exe`'s nine imports resolved through the same stub
+    page (one 13-byte five-argument stub for `WriteFile`), the fixture's error
+    ladder observed (`GetLastError` keeps 42 across a successful `WriteFile`,
+    then 6 for a bad handle and 87 for a non-null overlapped pointer),
+    synthetic IDs `1`/`1`, wrap-safe `GetTickCount` pair, the loader-owned
+    command line `/boot/pebasics.exe`, and `ExitThread(0)` ending the thread;
+    exactly two additional writes, 59 bytes, no new user faults
+    (`docs/WIN32_PROGRAM.md` §7).
+17. VFS self-test: create/read/append/overwrite/remove/list and the error paths.
+18. Framebuffer console self-test: the whole grid plus cursor is re-rendered in
     host-testable code, `sfence` is executed, and the framebuffer bytes are read
     back and compared scanline by scanline; any mismatch is a `PROJECT_OS_FATAL`.
     The console also logs its activation line (`fbcon: enabled ...` or the

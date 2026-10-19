@@ -55,9 +55,39 @@ const BUILD_ID: &str = match option_env!("PROJECT_OS_BUILD_ID") {
 const MAX_REGIONS: usize = 256;
 
 fn fatal(args: core::fmt::Arguments<'_>) -> ! {
-    serial::force_write_str("\r\nPROJECT_OS_FATAL: ");
-    serial::force_print(args);
-    serial::force_write_str("\r\n");
+    // Render the whole line into a stack buffer and hold interrupts off while
+    // it is written. A fatal diagnostic must not interleave with a still
+    // running thread's serial output: during stage-3 bring-up a preempted
+    // fatal writer produced split, misleading messages that masked the real
+    // failure (a wait timeout while a user program was making progress).
+    struct BufferWriter {
+        bytes: [u8; 512],
+        length: usize,
+    }
+    impl core::fmt::Write for BufferWriter {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            // Two bytes are reserved for the trailing CRLF.
+            let room = self.bytes.len().saturating_sub(self.length + 2);
+            let source = text.as_bytes();
+            let take = source.len().min(room);
+            self.bytes[self.length..self.length + take].copy_from_slice(&source[..take]);
+            self.length += take;
+            Ok(())
+        }
+    }
+    const PREFIX: &[u8] = b"\r\nPROJECT_OS_FATAL: ";
+    let mut writer = BufferWriter {
+        bytes: [0; 512],
+        length: 0,
+    };
+    writer.bytes[..PREFIX.len()].copy_from_slice(PREFIX);
+    writer.length = PREFIX.len();
+    let _ = core::fmt::Write::write_fmt(&mut writer, args);
+    writer.bytes[writer.length] = b'\r';
+    writer.bytes[writer.length + 1] = b'\n';
+    writer.length += 2;
+    arch::x86_64::interrupts_disable();
+    serial::force_write_bytes(&writer.bytes[..writer.length]);
     arch::halt_forever()
 }
 
@@ -440,7 +470,7 @@ pub extern "C" fn kmain() -> ! {
     if let Err(error) = sched::init(hhdm_offset) {
         fatal(format_args!("{}", error));
     }
-    match sched::demo(tsc_frequency) {
+    match sched::demo() {
         Ok(report) => kprintln!(
             "sched: {} workers finished (a={}, b={}, spinner={}), {} switches, {} preemptions, {} live",
             report.worker_a_steps.min(report.worker_b_steps),
@@ -455,7 +485,7 @@ pub extern "C" fn kmain() -> ! {
     }
     kprintln!("sched selftest: passed (round-robin yield + timer preemption)");
 
-    let user_report = match user::demo(tsc_frequency) {
+    let user_report = match user::demo() {
         Ok(report) => {
             if report.elf {
                 kprintln!(
@@ -482,6 +512,11 @@ pub extern "C" fn kmain() -> ! {
             if report.win32 {
                 kprintln!(
                     "win32 selftest: passed (kernel32.dll imports resolved, WriteConsoleA wrote to the console fd, ExitProcess ended the thread)"
+                );
+            }
+            if report.win32_program {
+                kprintln!(
+                    "win32 program selftest: passed (WriteFile, GetLastError/SetLastError, ExitThread, GetCurrentProcessId/GetCurrentThreadId, GetTickCount, GetCommandLineA verified through kernel32.dll imports)"
                 );
             }
             report

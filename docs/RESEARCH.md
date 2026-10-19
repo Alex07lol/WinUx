@@ -601,6 +601,98 @@ as ADR-0020. Limits (three functions, one console handle, no DLL loading,
 no ordinals/forwarders, no general compatibility) stay as stated in
 `docs/WIN32_CONSOLE.md` §1 and §9.
 
+## R-015 — Five-argument Win32 calls, per-thread last-error and a loader-owned command line
+
+**Question.** What are the exact documented contracts of `WriteFile`,
+`GetLastError`, `SetLastError`, `ExitThread`, `GetCurrentProcessId`,
+`GetCurrentThreadId`, `GetTickCount` and `GetCommandLineA`; where does the
+x64 ABI place the fifth integer argument (and does our stub-page dispatch
+capture it already); and which error values do `WriteFile` and the
+last-error APIs use?
+
+**Sources.**
+- Microsoft Learn `WriteFile` (fetched 2026-10-19, ms.date 2025-02-28):
+  `BOOL WriteFile(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED)` — the
+  fifth parameter is the first stack argument; `lpNumberOfBytesWritten`
+  receives the count; failure is `0` plus `GetLastError`; console handles
+  paint at the cursor position through the same call.
+- Microsoft Learn `GetLastError` (fetched 2026-10-19, ms.date 2024-02-02):
+  the last-error code is maintained on a per-thread basis; functions set it
+  on failure; some functions also set it on success and not all clear it,
+  so callers must not assume a success resets it.
+- Microsoft Learn `SetLastError` (fetched 2026-10-19, ms.date 2024-02-02):
+  `VOID SetLastError(DWORD)`; value is kept in thread-local storage.
+- Microsoft Learn `ExitThread` (fetched 2026-10-19, ms.date 2018-12-05):
+  `VOID ExitThread(DWORD)`; ends the calling thread with the exit code; the
+  last thread also terminates the process; per-thread stack cleanup is
+  documented.
+- Microsoft Learn `GetCurrentProcessId` / `GetCurrentThreadId` (fetched
+  2026-10-19, ms.date 2018-12-05 / 2024-02-02): both return `DWORD`
+  identifiers that uniquely identify the process/thread until termination.
+- Microsoft Learn `GetTickCount` (fetched 2026-10-19, ms.date 2018-12-05):
+  milliseconds elapsed since system start; resolution limited by the system
+  timer, typically 10–16 ms; stored as a `DWORD`, wraps after 49.7 days;
+  the docs explicitly advise overflow-aware comparisons.
+- Microsoft Learn `GetCommandLineA` (fetched 2026-10-19, ms.date
+  2024-10-23): returns a pointer to the process command-line string whose
+  lifetime is managed by the system; applications must not free or modify
+  it.
+- Microsoft Learn *System Error Codes (0–499)* (fetched 2026-10-19,
+  ms.date 2025-07-14): `ERROR_INVALID_HANDLE` = 6, `ERROR_INVALID_PARAMETER`
+  = 87.
+- Microsoft Learn *x64 calling convention* (reused from R-014): at function
+  entry the first stack argument sits at `[rsp+0x28]` — 32 bytes of shadow
+  space plus the 8-byte return address.
+
+**Claim.** A stub of the shape `mov r10, [rsp+0x28]; mov eax, service;
+int 0x80; ret` forwards a fifth integer argument to the kernel without any
+entry-stub change, because `InterruptFrame` already captures `r10`
+(`kernel/src/arch/x86_64/idt.rs:22-23`) and the sequence fits the 16-byte
+stub stride. Per-thread `last_error` state in the scheduler thread slot is
+the documented semantics of `GetLastError`/`SetLastError`; `WriteFile`'s
+documented failure contract is `0` plus a WinError.h code (6 for a bad
+handle, 87 for an invalid parameter); `GetTickCount`'s documented shape is
+milliseconds in a wrapping `DWORD`, which a 100 Hz PIT × 10 reproduces with
+10 ms resolution; `GetCommandLineA` returns a system-owned string, which the
+loader's stub-page tail can hold for the module's real path. Confidence high
+for the ABI position and API contracts (vendor documentation plus an
+existing frame field); the end-to-end behaviour is verified only by the
+stage-3 tests (see `docs/WIN32_PROGRAM.md`).
+
+**Experiment.** PASSED (2026-10-19, QEMU 11.1.0, build `0.1.0-ec04e74f`).
+`scripts/build_user_pe.sh` built and checker-verified `pebasics.exe`
+(4096 bytes, SHA-256
+`4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`, 5
+sections, 1 relocation, 9 `kernel32.dll` imports) plus the `pebadfn2.exe`
+mutant (`Sleep` substituted for `GetTickCount`; 4096 bytes, SHA-256
+`9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d`).
+`scripts/test_pe_qemu.sh` reached
+`PROJECT_OS_BOOT_SUCCESS:0.1.0-ec04e74f checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs`
+with the pinned §7 lines observed (`pe: pebasics.exe loaded at 0x400000
+(entry 0x401000, 5 sections, 1 relocation applied)`, the full `win32:`
+program-basics sequence incl. `WriteFile(1, 28 bytes, overlapped) -> 0
+(invalid parameter)`, `win32: GetCommandLineA() -> "/boot/pebasics.exe"`,
+`win32 program selftest: passed (...)`) and
+`user: /boot/pebadfn2.exe rejected (unknown import function)`; full
+`scripts/test_all.sh`: `PASS=22 FAIL=0 SKIP=4`. Two defects were found and
+fixed during bring-up, both recorded in `progress.md`: the command-line tail
+was assumed zeroed but the stub page is `int3`-filled, so the terminator is
+now written explicitly; and `sched::wait_all_finished` no longer uses its
+TSC-frequency budget (Limine's reported frequency disagrees with real
+`rdtsc` under QEMU, so the budget expired while the stage-3 program was still
+making progress), bounding the wait by PIT ticks only. No divergence from the
+documented API contracts above was observed; the deltas from Windows
+semantics are the ones stated in `docs/WIN32_PROGRAM.md` §9.
+
+**Conclusion.** PASSED. A 13-byte `mov r10, [rsp+0x28]; mov eax, service;
+int 0x80; ret` stub forwarded the fifth stack argument through
+`InterruptFrame.r10` with no entry-stub change; per-thread `last_error`
+round-tripped (`SetLastError(42)` → `GetLastError() -> 42`, still 42 after a
+successful `WriteFile`); the documented `WriteFile` failure values (0 + 6 /
+0 + 87) and the loader-owned command line (`/boot/pebasics.exe`) behaved as
+claimed. Confidence: high for the observed eleven-function surface in
+QEMU; Windows compatibility is not claimed.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

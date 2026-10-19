@@ -25,7 +25,9 @@ Deliberately **not** in this stage:
   kernel only through the existing syscall gate (the gate was already shaped
   Windows-style: `rax` service, `rcx/rdx/r8/r9` arguments; stage 2 adds
   import-directory parsing and IAT resolution for three allowlisted
-  `kernel32.dll` names — `docs/WIN32_CONSOLE.md`, ADR-0020);
+  `kernel32.dll` names — `docs/WIN32_CONSOLE.md`, ADR-0020; stage 3 grows the
+  same allowlist to eleven names, adds the five-argument stub form and the
+  stub-page command-line tail — `docs/WIN32_PROGRAM.md`, ADR-0021);
 - no Win32 API services yet (that is stage 2 of Phase 7: a named console
   fixture set against our own API surface);
 - no exception directory (`.pdata`) processing, no SEH, no unwind — the
@@ -347,23 +349,31 @@ pub fn map(space: &mut AddressSpace, module: &limine::File, image: &Inspection)
   Returns the applied count for the boot log; a nonzero delta with zero
   applied relocations cannot occur (rejected in `inspect` except when
   relocations exist precisely to be applied).
-- Import policy (`docs/WIN32_CONSOLE.md` §5; stage 2): `inspect` rejects any
-  import whose DLL name is not exactly `kernel32.dll` (`UnknownImportDll`) or
-  whose function name is not in the fixed three-entry service table
-  (`UnknownImportFunction`), and any IAT slot that is not an 8-byte, in-page
+- Import policy (`docs/WIN32_CONSOLE.md` §5; `docs/WIN32_PROGRAM.md` §5, stage
+  3): `inspect` rejects any import whose DLL name is not exactly
+  `kernel32.dll` (`UnknownImportDll`) or whose function name is not in the
+  fixed service table (`UnknownImportFunction`) — three entries in stage 2,
+  eleven in stage 3 — and any IAT slot that is not an 8-byte, in-page
   location inside a readable section of the window (`ImportTarget`). No
   allocation happens before these checks, so the negative fixtures are
   rejected cleanly.
 - `map` resolves imports after relocations: one stub per unique function name
-  (first-occurrence order) is written as 16-byte records (`mov eax, imm32`;
-  `int 0x80`; `ret`; `nop` padding, unused bytes `0xCC`) into a single
+  (first-occurrence order) is written as 16-byte records into a single
   read+execute page mapped at `WIN32_STUB_VA = 0x51_0000`, and every IAT slot
-  is patched to the stub address. The IAT lives in read-only `.rdata`
-  (R-014), so — exactly like relocations — each slot is written through its
-  physical frame via the HHDM (the Windows fixup-before-protection order) and
-  the mapping flags are never widened. Post-mapping failures unmap the stub
-  page and free its frame (`Loaded::stub_page` is what `user.rs` unmaps during
-  teardown).
+  is patched to the stub address. The 4-argument stub form is
+  `mov eax, imm32; int 0x80; ret; nop*5`; the 5-argument form (stage 3, for
+  `WriteFile`) is `mov r10, [rsp+0x28]; mov eax, imm32; int 0x80; ret`
+  (`rsp+0x28` = return address + shadow space, the documented position of the
+  first stack argument; `InterruptFrame` already captures `r10`), 13 bytes
+  with 3 padding bytes instead of 8. `map` also writes the NUL-terminated
+  module path at `COMMAND_LINE_VA = WIN32_STUB_VA + 0xF00` (capacity 0x100;
+  explicit terminator because the frame is `int3`-filled) and fails with
+  `Reject::CommandLineTooLong` beyond 255 path bytes. The IAT lives in
+  read-only `.rdata` (R-014), so — exactly like relocations — each slot is
+  written through its physical frame via the HHDM (the Windows
+  fixup-before-protection order) and the mapping flags are never widened.
+  Post-mapping failures unmap the stub page and free its frame
+  (`Loaded::stub_page` is what `user.rs` unmaps during teardown).
 
 ## 7. Boot flow and serial contract (`kernel/src/user.rs`, `main.rs`)
 
@@ -469,14 +479,14 @@ boot. Evidence: `os_core` unit tests, `check_user_pe.py`, `test_pe_qemu.sh`
 serial log, full `test_all.sh` run, VirtualBox re-run.
 
 May **not** claim (stage 1 scope): any Windows API compatibility, general
-import resolution/DLL loading of real system DLLs (stage 2 resolves only the
-three-name `kernel32.dll` allowlist, see `docs/WIN32_CONSOLE.md` §9), PE32
-(32-bit), SEH/unwind, TLS, CLR, resources, dynamic code, ASLR,
-filesystem-backed exec, or running third-party Windows binaries. Limits
-to restate: fixed 1 MiB code window at `0x400000`, one 4 KiB stack page, max
-16 sections / 256 relocations per image at load, W^X enforced per section,
-relocation targets must not cross a page, one user thread at a time,
-modules from the bootloader only, QEMU/VirtualBox only.
+import resolution/DLL loading of real system DLLs (stages 2–3 resolve only
+the eleven-name `kernel32.dll` allowlist, see `docs/WIN32_CONSOLE.md` §9 and
+`docs/WIN32_PROGRAM.md` §9), PE32 (32-bit), SEH/unwind, TLS, CLR, resources,
+dynamic code, ASLR, filesystem-backed exec, or running third-party Windows
+binaries. Limits to restate: fixed 1 MiB code window at `0x400000`, one 4 KiB
+stack page, max 16 sections / 256 relocations per image at load, W^X enforced
+per section, relocation targets must not cross a page, one user thread at a
+time, modules from the bootloader only, QEMU/VirtualBox only.
 
 ## 10. Documentation and evidence updates (on implementation)
 
@@ -492,7 +502,9 @@ modules from the bootloader only, QEMU/VirtualBox only.
 - `docs/ROADMAP.md`: Phase 7 stage 1 complete; remaining Phase 7 items
   (Win32 console surface) explicitly deferred — as written for stage 1; stage 2
   later added the three-name console surface (`docs/WIN32_CONSOLE.md`,
-  ADR-0020) and updated the roadmap again.
+  ADR-0020) and updated the roadmap again; stage 3 grew the surface to eleven
+  names with the five-argument stub form and the command-line tail
+  (`docs/WIN32_PROGRAM.md`, ADR-0021).
 - `progress.md`: milestone entry, exact commands, artifact table with sizes
   and SHA-256s (`pehello.exe`, `pebad.exe`, `kernel.elf`, ISOs), serial
   excerpts, defects, next action.

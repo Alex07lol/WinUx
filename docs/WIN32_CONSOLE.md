@@ -351,6 +351,12 @@ named functions. Limits to restate: fixed window and stub page, one console
 handle (`1`), one user thread, four-argument services, `MAX_WRITE` byte cap,
 bootloader-provided modules only, QEMU/VirtualBox only.
 
+Stage 3 (`docs/WIN32_PROGRAM.md`, ADR-0021) extends the same allowlist to
+eleven `kernel32.dll` functions and adds the five-argument stub form plus the
+loader-owned command line without changing any stage-2 contract: the three
+functions above keep their service numbers, semantics and serial lines, and
+every pinned stage-2 line stays byte-identical.
+
 ## 10. Documentation and evidence updates (on implementation)
 
 - `docs/RESEARCH.md`: R-014 (sources, probe, claims; experiment section

@@ -81,11 +81,11 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/memory.rs` | usable-RAM-only bitmap frame allocator, stats, self-test | working |
 | `kernel/src/heap.rs` | fixed 8 MiB kernel heap, `#[global_allocator]`, stats/validate | working |
 | `kernel/src/vm.rs` | own 4-level PML4, map/unmap/translate, W^X, user-half teardown | working |
-| `kernel/src/sched.rs` | 16 kernel threads, round-robin yield + timer preemption | working |
-| `kernel/src/syscall.rs` | `int 0x80` dispatch, pointer validation, user-fault kill path; services 3–5 are the Win32-shaped `GetStdHandle`/`WriteConsoleA`/`ExitProcess` | working |
-| `kernel/src/user.rs` | ring-3 module life cycle (ELF and PE), iretq trampoline, teardown | working (ELF + PE32+ modules, Win32 console phase) |
+| `kernel/src/sched.rs` | 16 kernel threads, round-robin yield + timer preemption, per-thread `last_error`; `wait_all_finished` bounded by PIT ticks (TSC budget removed in stage 3 after Limine's reported frequency disagreed with real `rdtsc` under QEMU) | working |
+| `kernel/src/syscall.rs` | `int 0x80` dispatch, pointer validation, user-fault kill path; services 3–13 are the Win32-shaped surface (`GetStdHandle`/`WriteConsoleA`/`ExitProcess` plus the stage-3 program basics `WriteFile`/`GetLastError`/`SetLastError`/`ExitThread`/`GetCurrentProcessId`/`GetCurrentThreadId`/`GetTickCount`/`GetCommandLineA`) | working |
+| `kernel/src/user.rs` | ring-3 module life cycle (ELF and PE), iretq trampoline, teardown | working (ELF + PE32+ modules, Win32 console + program-basics phases) |
 | `kernel/src/loader.rs` | two-phase ELF64 module loader (`inspect`/`map`), code window, rollback | working (ADR-0017) |
-| `kernel/src/pe_loader.rs` | two-phase PE32+ loader: window/W^X policy, DIR64 base relocations, `kernel32.dll` allowlist, stub page + HHDM IAT patch | working (stages 1–2, ADR-0019/0020) |
+| `kernel/src/pe_loader.rs` | two-phase PE32+ loader: window/W^X policy, DIR64 base relocations, eleven-name `kernel32.dll` allowlist, 4-/5-argument stub page, command-line tail + HHDM IAT patch | working (stages 1–3, ADR-0019/0020/0021) |
 | `kernel/src/console.rs` | IRQ4 receive ring, echo and line editing | working (serial only) |
 | `kernel/src/vfs.rs` | in-memory arena VFS, boot self-test, dirty tracking, export/replace for checkpoints | working |
 | `kernel/src/blk.rs` | ATA PIO block device (PIIX primary master, LBA28, polled) | working (QEMU `-machine pc`) |
@@ -104,7 +104,7 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/sync.rs` | `SpinLock` and RFLAGS-saving `IrqSpinLock` | working |
 | `kernel/src/panic.rs` | panic report and halt | working |
 | `userland/` | independent no_std cargo workspace: syscall runtime plus the `hello`/`fault` ELF programs | working (ADR-0017) |
-| `userland/pe/` | separate workspace: `pehello` (stage 1) and `peconsole` (`raw-dylib` import fixture, stage 2), linked by rust-lld without an SDK | working (ADR-0019/0020) |
+| `userland/pe/` | separate workspace: `pehello` (stage 1), `peconsole` (stage 2) and `pebasics` (stage 3) `raw-dylib` import fixtures, linked by rust-lld without an SDK | working (ADR-0019/0020/0021) |
 | `os_core::memmap` | classification/accounting/validation | host-tested |
 | `os_core::fb` | geometry, pixel format, bounds, colour packing | host-tested |
 | `os_core::frame` | bitmap frame allocator | host- and in-VM-tested |
@@ -185,11 +185,14 @@ as well (ADR-0014).
   policy belongs above it.
 - The framebuffer log console is a debugging/UI aid, not a graphics driver. No GPU
   acceleration, command submission or display-driver interface exists.
-- Windows/NT compatibility code is limited to what Phase 7 stages 1–2
-  implement: the PE32+ loader and three `kernel32.dll`-shaped console services
-  resolved through a real import table (`docs/WIN32_CONSOLE.md`). Everything
-  beyond that is unimplemented; `docs/WINDOWS_COMPATIBILITY.md` describes the
-  intended path.
+- Windows/NT compatibility code is limited to what Phase 7 stages 1–3
+  implement: the PE32+ loader and eleven `kernel32.dll`-shaped services
+  (console surface plus program basics: `WriteFile`, per-thread
+  `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`,
+  `GetCommandLineA`) resolved through a real import table
+  (`docs/WIN32_CONSOLE.md`, `docs/WIN32_PROGRAM.md`). Everything beyond that
+  is unimplemented; `docs/WINDOWS_COMPATIBILITY.md` describes the intended
+  path.
 
 ## Known limitations
 
@@ -203,10 +206,10 @@ as well (ADR-0014).
   ELF64 `ET_EXEC` modules and PE32+ images loaded from Limine, with no
   PIE/dynamic linking, no ASLR, no filesystem-backed exec and no process model
   (ADR-0017, ADR-0019). The PE path resolves imports only against a fixed
-  three-name `kernel32.dll` allowlist (stub page + `int 0x80` dispatch,
-  ADR-0020): no real DLL loading, exports, forwarders, ordinals, delay
+  eleven-name `kernel32.dll` allowlist (stub page + `int 0x80` dispatch,
+  ADR-0020/0021): no real DLL loading, exports, forwarders, ordinals, delay
   imports, SEH/unwind, TLS, CLR, resources, PE32 or general Win32 API surface
-  exists, so it is not Windows application compatibility (Phase 7 stages 1–2
+  exists, so it is not Windows application compatibility (Phase 7 stages 1–3
   of the roadmap).
 - The filesystem is a whole-tree checkpoint image: two 1 MiB slots on a
   PIIX-legacy ATA disk, flushed write-through at shell-command boundaries

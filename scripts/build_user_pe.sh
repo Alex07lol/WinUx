@@ -37,7 +37,7 @@ log "  linker: $RUST_LLD"
 (cd "$ROOT_DIR/userland/pe" && RUSTFLAGS="-C linker=$RUST_LLD -C link-arg=/nodefaultlib -C link-arg=/entry:_start -C link-arg=/subsystem:console" cargo build --release --target "$PE_TARGET")
 
 mkdir -p "$ROOT_DIR/artifacts"
-for fixture in pehello peconsole; do
+for fixture in pehello peconsole pebasics; do
     [ -f "$PE_TARGET_DIR/$fixture.exe" ] || die "cargo did not produce $PE_TARGET_DIR/$fixture.exe"
     cp "$PE_TARGET_DIR/$fixture.exe" "$ROOT_DIR/artifacts/$fixture.exe"
 done
@@ -81,9 +81,29 @@ open(badimp, "wb").write(patch(data, b"kernel32.dll", b"user32.dll\x00\x00", "un
 open(badfn, "wb").write(patch(data, b"WriteConsoleA", b"WriteConsoleB", "unknown-function mutant"))
 PY
 
+# pebadfn2.exe is a deterministic single byte-sequence patch of pebasics.exe's
+# import table: the function name `GetTickCount` (12 bytes) becomes `Sleep`
+# plus NUL padding, so the entry stays 12 bytes and the image remains
+# structurally valid. The kernel's allowlist is what must reject it.
+python - "$ROOT_DIR/artifacts/pebasics.exe" "$ROOT_DIR/artifacts/pebadfn2.exe" <<'PY'
+import sys
+
+source, badfn2 = sys.argv[1], sys.argv[2]
+data = open(source, "rb").read()
+
+old, new = b"GetTickCount", b"Sleep\x00\x00\x00\x00\x00\x00\x00"
+assert len(old) == len(new), "internal error: pebadfn2 replacement changes size"
+count = data.count(old)
+if count != 1:
+    raise SystemExit(f"error: GetTickCount pattern occurs {count} times (must be 1)")
+open(badfn2, "wb").write(data.replace(old, new))
+PY
+
 python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pehello.exe" --imports -
 python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/peconsole.exe" \
     --imports 'kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA'
+python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pebasics.exe" \
+    --imports 'kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile'
 if CHECK_OUT=$(python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pebad.exe" 2>&1); then
     die "pebad.exe passed the header checker; it must be rejected"
 fi
@@ -93,8 +113,10 @@ python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pebadimp.exe" \
     --imports 'user32.dll:ExitProcess,GetStdHandle,WriteConsoleA'
 python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pebadfn.exe" \
     --imports 'kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleB'
+python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pebadfn2.exe" \
+    --imports 'kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,Sleep,SetLastError,WriteFile'
 
-for artifact in pehello.exe peconsole.exe pebad.exe pebadimp.exe pebadfn.exe; do
+for artifact in pehello.exe peconsole.exe pebasics.exe pebad.exe pebadimp.exe pebadfn.exe pebadfn2.exe; do
     log "  $artifact: $(wc -c <"$ROOT_DIR/artifacts/$artifact") bytes, sha256 $(sha256sum "$ROOT_DIR/artifacts/$artifact" | awk '{print $1}')"
 done
 log "PASS: PE fixtures built and checked"

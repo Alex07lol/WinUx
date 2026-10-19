@@ -1,11 +1,12 @@
 //! The ring-3 syscall boundary (`int 0x80`) and user-fault handling (Phase 5b;
-//! Win32 console services Phase 7, stage 2).
+//! Win32 console services Phase 7, stages 2–3).
 //!
 //! ABI (Windows-style argument registers chosen so the later PE compatibility
 //! layer can reuse the same gate):
 //!
 //! * `rax` — service number
 //! * `rcx`, `rdx`, `r8`, `r9` — arguments
+//! * `r10` — fifth argument (`WriteFile`'s `lpOverlapped`)
 //! * `rax` — return value / status after the call
 //!
 //! Services:
@@ -20,6 +21,21 @@
 //!   byte write, out-parameter updated).
 //! * `5 ExitProcess(rcx = code)` — native `kernel32!ExitProcess`; ends the
 //!   thread through the same scheduler-kill path as `2 exit`.
+//! * `6 WriteFile(rcx = handle, rdx = buffer, r8 = length, r9 = written,
+//!   r10 = overlapped)` → `1`/`0`; native `kernel32!WriteFile` for the one
+//!   console handle. Argument errors return `0` and set the per-thread
+//!   last-error value; unmapped spans still kill the thread.
+//! * `7 GetLastError()` → the calling thread's last-error value.
+//! * `8 SetLastError(rcx = code)` — set the calling thread's last-error
+//!   value.
+//! * `9 ExitThread(rcx = code)` — native `kernel32!ExitThread`; same kill
+//!   path as `5`.
+//! * `10 GetCurrentProcessId()` / `11 GetCurrentThreadId()` → synthetic
+//!   constant `1` (no NT ID space exists here; documented).
+//! * `12 GetTickCount()` → milliseconds since boot (`PIT ticks × 10`, a
+//!   wrapping 32-bit value, 10 ms resolution).
+//! * `13 GetCommandLineA()` → the loader-owned NUL-terminated module path
+//!   in the stub page tail.
 //!
 //! Every user pointer is validated against the live page tables before the
 //! kernel reads it (mapped, user-accessible, canonical, bounded span). A
@@ -31,6 +47,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::x86_64::idt::InterruptFrame;
 use crate::arch::x86_64::read_cr2;
+use crate::pe_loader::COMMAND_LINE_VA;
 use crate::sched;
 use crate::serial;
 use crate::vm;
@@ -40,6 +57,14 @@ pub const SYS_EXIT: u64 = 2;
 pub const SYS_GET_STD_HANDLE: u64 = 3;
 pub const SYS_WRITE_CONSOLE: u64 = 4;
 pub const SYS_EXIT_PROCESS: u64 = 5;
+pub const SYS_WRITEFILE: u64 = 6;
+pub const SYS_GET_LAST_ERROR: u64 = 7;
+pub const SYS_SET_LAST_ERROR: u64 = 8;
+pub const SYS_EXIT_THREAD: u64 = 9;
+pub const SYS_GET_CURRENT_PROCESS_ID: u64 = 10;
+pub const SYS_GET_CURRENT_THREAD_ID: u64 = 11;
+pub const SYS_GET_TICK_COUNT: u64 = 12;
+pub const SYS_GET_COMMAND_LINE: u64 = 13;
 
 /// Maximum accepted console write, small enough to bound the kernel copy.
 pub const MAX_WRITE: u64 = 4096;
@@ -49,12 +74,17 @@ const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
 /// The fabricated console handle `GetStdHandle(2)` returns.
 const CONSOLE_HANDLE: u64 = 1;
 
+/// WinError.h `ERROR_INVALID_HANDLE`.
+const ERROR_INVALID_HANDLE: u32 = 6;
+/// WinError.h `ERROR_INVALID_PARAMETER`.
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
 /// Highest address the kernel accepts from user space (canonical user half:
 /// PML4 entries 0..256).
 const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 
-/// Last exit code passed to `SYS_EXIT` or `SYS_EXIT_PROCESS` (single user
-/// thread in this milestone).
+/// Last exit code passed to `SYS_EXIT`, `SYS_EXIT_PROCESS` or
+/// `SYS_EXIT_THREAD` (single user thread in this milestone).
 pub static LAST_EXIT_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Successful `SYS_WRITE` calls.
 pub static WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +96,22 @@ pub static WIN32_GET_STD_HANDLE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static WIN32_WRITE_CONSOLE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// `SYS_EXIT_PROCESS` calls (each one ends the thread).
 pub static WIN32_EXIT_PROCESS_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_WRITEFILE` calls (successful and failing alike).
+pub static WIN32_WRITEFILE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_GET_LAST_ERROR` calls.
+pub static WIN32_GET_LAST_ERROR_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_SET_LAST_ERROR` calls.
+pub static WIN32_SET_LAST_ERROR_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_EXIT_THREAD` calls (each one ends the thread).
+pub static WIN32_EXIT_THREAD_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_GET_CURRENT_PROCESS_ID` calls.
+pub static WIN32_GET_CURRENT_PROCESS_ID_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_GET_CURRENT_THREAD_ID` calls.
+pub static WIN32_GET_CURRENT_THREAD_ID_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_GET_TICK_COUNT` calls.
+pub static WIN32_GET_TICK_COUNT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_GET_COMMAND_LINE` calls.
+pub static WIN32_GET_COMMAND_LINE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Faults taken from CPL3 and isolated (thread killed, kernel alive).
 pub static USER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Repeated `int 0x80` calls made with an invalid pointer or bad service.
@@ -84,6 +130,14 @@ pub fn dispatch(frame: &mut InterruptFrame) {
         SYS_GET_STD_HANDLE => get_std_handle(frame),
         SYS_WRITE_CONSOLE => write_console(frame),
         SYS_EXIT_PROCESS => exit_process(frame),
+        SYS_WRITEFILE => write_file(frame),
+        SYS_GET_LAST_ERROR => get_last_error(frame),
+        SYS_SET_LAST_ERROR => set_last_error(frame),
+        SYS_EXIT_THREAD => exit_thread(frame),
+        SYS_GET_CURRENT_PROCESS_ID => get_current_process_id(frame),
+        SYS_GET_CURRENT_THREAD_ID => get_current_thread_id(frame),
+        SYS_GET_TICK_COUNT => get_tick_count(frame),
+        SYS_GET_COMMAND_LINE => get_command_line(frame),
         _ => {
             REJECTED_SYSCALLS.fetch_add(1, Ordering::SeqCst);
             serial::force_print(format_args!(
@@ -124,32 +178,13 @@ fn write_console(frame: &mut InterruptFrame) {
         return;
     }
     // The out-parameter must be a mapped user page with 4 bytes available.
-    let Some(hhdm) = vm::hhdm_offset() else {
-        kill(frame, "WriteConsoleA out-pointer is not mapped");
+    let Some(cell) = validated_out_pointer(
+        frame,
+        written_pointer,
+        "WriteConsoleA out-pointer is not mapped",
+    ) else {
         return;
     };
-    if written_pointer < 0x1000
-        || written_pointer
-            .checked_add(4)
-            .is_none_or(|end| end > USER_LIMIT)
-        || written_pointer % 4096 > 4092
-    {
-        kill(frame, "WriteConsoleA out-pointer is not mapped");
-        return;
-    }
-    let Some((physical, flags)) = vm::translate_live(written_pointer) else {
-        kill(frame, "WriteConsoleA out-pointer is not mapped");
-        return;
-    };
-    if flags & os_core::paging::USER == 0 {
-        kill(frame, "WriteConsoleA out-pointer is not mapped");
-        return;
-    }
-    let Some(cell) = hhdm.checked_add(physical) else {
-        kill(frame, "WriteConsoleA out-pointer is not mapped");
-        return;
-    };
-    let cell = cell as *mut u32;
 
     // SAFETY: the buffer span was validated as mapped, user-accessible and
     // bounded, exactly like `SYS_WRITE`; the out-pointer was validated as a
@@ -178,6 +213,199 @@ fn exit_process(frame: &mut InterruptFrame) -> ! {
     WIN32_EXIT_PROCESS_CALLS.fetch_add(1, Ordering::SeqCst);
     serial::force_print(format_args!("win32: ExitProcess({})\r\n", code));
     sched::exit()
+}
+
+/// `6 WriteFile`: native `kernel32!WriteFile` for the one console handle.
+/// Documented argument errors return `0` and set the thread's last-error
+/// value (`ERROR_INVALID_HANDLE` / `ERROR_INVALID_PARAMETER`) without killing
+/// the thread; unmapped spans are memory-safety violations and still kill it.
+/// Success writes the bytes, stores the count and leaves the last-error value
+/// untouched.
+fn write_file(frame: &mut InterruptFrame) {
+    let handle = frame.rcx;
+    let buffer = frame.rdx;
+    let length = frame.r8;
+    let written_pointer = frame.r9;
+    let overlapped = frame.r10;
+    WIN32_WRITEFILE_CALLS.fetch_add(1, Ordering::SeqCst);
+    if handle != CONSOLE_HANDLE {
+        sched::set_current_last_error(ERROR_INVALID_HANDLE);
+        serial::force_print(format_args!(
+            "win32: WriteFile({}) -> 0 (invalid handle)\r\n",
+            handle
+        ));
+        frame.rax = 0;
+        return;
+    }
+    if overlapped != 0 {
+        sched::set_current_last_error(ERROR_INVALID_PARAMETER);
+        serial::force_print(format_args!(
+            "win32: WriteFile(1, {} bytes, overlapped) -> 0 (invalid parameter)\r\n",
+            length
+        ));
+        frame.rax = 0;
+        return;
+    }
+    if length == 0 || length > MAX_WRITE {
+        sched::set_current_last_error(ERROR_INVALID_PARAMETER);
+        serial::force_print(format_args!(
+            "win32: WriteFile(1, {} bytes) -> 0 (invalid parameter)\r\n",
+            length
+        ));
+        frame.rax = 0;
+        return;
+    }
+    if !validate_user_span(frame, buffer, length) {
+        return;
+    }
+    // The out-parameter must be a mapped user page with 4 bytes available.
+    let Some(cell) = validated_out_pointer(
+        frame,
+        written_pointer,
+        "WriteFile out-pointer is not mapped",
+    ) else {
+        return;
+    };
+
+    // SAFETY: the span was validated as mapped, user-accessible and bounded;
+    // the out-pointer was validated as a mapped user page with 4 bytes
+    // available, and the kernel stores through the HHDM so a read-only user
+    // mapping cannot fault it. The last-error value is deliberately untouched.
+    unsafe {
+        let bytes = core::slice::from_raw_parts(buffer as *const u8, length as usize);
+        serial::force_write_bytes(bytes);
+        core::ptr::write_volatile(cell, length as u32);
+    }
+    WRITE_CALLS.fetch_add(1, Ordering::SeqCst);
+    BYTES_WRITTEN.fetch_add(length, Ordering::SeqCst);
+    serial::force_print(format_args!(
+        "win32: WriteFile(1, {} bytes) -> 1\r\n",
+        length
+    ));
+    frame.rax = 1;
+}
+
+/// `7 GetLastError`: the calling thread's last-error value.
+fn get_last_error(frame: &mut InterruptFrame) {
+    let value = sched::current_last_error();
+    WIN32_GET_LAST_ERROR_CALLS.fetch_add(1, Ordering::SeqCst);
+    serial::force_print(format_args!("win32: GetLastError() -> {}\r\n", value));
+    frame.rax = u64::from(value);
+}
+
+/// `8 SetLastError`: set the calling thread's last-error value.
+fn set_last_error(frame: &mut InterruptFrame) {
+    let code = frame.rcx as u32;
+    sched::set_current_last_error(code);
+    WIN32_SET_LAST_ERROR_CALLS.fetch_add(1, Ordering::SeqCst);
+    serial::force_print(format_args!("win32: SetLastError({})\r\n", code));
+}
+
+/// `9 ExitThread`: record the exit code and end the thread through the same
+/// scheduler-kill path as `5 ExitProcess`.
+fn exit_thread(frame: &mut InterruptFrame) -> ! {
+    let code = frame.rcx as u32;
+    LAST_EXIT_CODE.store(u64::from(code), Ordering::SeqCst);
+    WIN32_EXIT_THREAD_CALLS.fetch_add(1, Ordering::SeqCst);
+    serial::force_print(format_args!("win32: ExitThread({})\r\n", code));
+    sched::exit()
+}
+
+/// `10 GetCurrentProcessId`: synthetic constant `1` (no NT ID space exists).
+fn get_current_process_id(frame: &mut InterruptFrame) {
+    WIN32_GET_CURRENT_PROCESS_ID_CALLS.fetch_add(1, Ordering::SeqCst);
+    serial::force_print(format_args!("win32: GetCurrentProcessId() -> 1\r\n"));
+    frame.rax = 1;
+}
+
+/// `11 GetCurrentThreadId`: synthetic constant `1` (no NT ID space exists).
+fn get_current_thread_id(frame: &mut InterruptFrame) {
+    WIN32_GET_CURRENT_THREAD_ID_CALLS.fetch_add(1, Ordering::SeqCst);
+    serial::force_print(format_args!("win32: GetCurrentThreadId() -> 1\r\n"));
+    frame.rax = 1;
+}
+
+/// `12 GetTickCount`: milliseconds since boot, derived from the 100 Hz PIT
+/// (10 ms resolution) as a wrapping 32-bit value, like the documented DWORD.
+fn get_tick_count(frame: &mut InterruptFrame) {
+    let milliseconds = crate::arch::x86_64::pit::ticks().wrapping_mul(10) as u32;
+    WIN32_GET_TICK_COUNT_CALLS.fetch_add(1, Ordering::SeqCst);
+    serial::force_print(format_args!(
+        "win32: GetTickCount() -> {}\r\n",
+        milliseconds
+    ));
+    frame.rax = u64::from(milliseconds);
+}
+
+/// `13 GetCommandLineA`: the loader-owned NUL-terminated module path in the
+/// stub page tail. The string is read back through the live user mapping;
+/// the loader guarantees the terminator inside the fixed span.
+fn get_command_line(frame: &mut InterruptFrame) {
+    let pointer = COMMAND_LINE_VA;
+    match vm::translate_live(pointer) {
+        Some((_, flags)) if flags & os_core::paging::USER != 0 => {}
+        _ => {
+            kill(frame, "GetCommandLineA buffer is not mapped");
+            return;
+        }
+    }
+    let mut text = [0u8; 255];
+    let mut length = 0usize;
+    // SAFETY: the stub page is mapped user-readable for the whole program
+    // lifetime and the loader wrote the path (at most 255 bytes) followed by
+    // a zeroed terminator into it; the read stays inside the fixed span.
+    unsafe {
+        while length < text.len() {
+            let byte = core::ptr::read_volatile((pointer + length as u64) as *const u8);
+            if byte == 0 {
+                break;
+            }
+            text[length] = byte;
+            length += 1;
+        }
+    }
+    if length == text.len() {
+        kill(frame, "GetCommandLineA string is not terminated");
+        return;
+    }
+    let path = core::str::from_utf8(&text[..length]).unwrap_or("<non-utf8 path>");
+    WIN32_GET_COMMAND_LINE_CALLS.fetch_add(1, Ordering::SeqCst);
+    serial::force_print(format_args!("win32: GetCommandLineA() -> \"{}\"\r\n", path));
+    frame.rax = pointer;
+}
+
+/// Validate a 4-byte user out-pointer (mapped, user-accessible, canonical,
+/// in-page) and return its HHDM cell, or kill the thread with `reason`.
+/// Shared by `WriteConsoleA` and `WriteFile`.
+fn validated_out_pointer(
+    frame: &InterruptFrame,
+    pointer: u64,
+    reason: &'static str,
+) -> Option<*mut u32> {
+    let Some(hhdm) = vm::hhdm_offset() else {
+        kill(frame, reason);
+        return None;
+    };
+    if pointer < 0x1000
+        || pointer.checked_add(4).is_none_or(|end| end > USER_LIMIT)
+        || pointer % 4096 > 4092
+    {
+        kill(frame, reason);
+        return None;
+    }
+    let Some((physical, flags)) = vm::translate_live(pointer) else {
+        kill(frame, reason);
+        return None;
+    };
+    if flags & os_core::paging::USER == 0 {
+        kill(frame, reason);
+        return None;
+    }
+    let Some(cell) = hhdm.checked_add(physical) else {
+        kill(frame, reason);
+        return None;
+    };
+    Some(cell as *mut u32)
 }
 
 fn write(frame: &mut InterruptFrame) {

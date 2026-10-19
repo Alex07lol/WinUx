@@ -148,7 +148,10 @@ def main():
     )
     if status:
         return status
-    if b"invalid" in session.data:
+    # Only persist slot diagnostics count here: the Win32 program self-test
+    # legitimately logs `(invalid handle)` / `(invalid parameter)` lines, so a
+    # bare `b"invalid"` search would misread a healthy boot.
+    if b"persist: slot A invalid" in session.data or b"persist: slot B invalid" in session.data:
         return session.finish(fail("boot 1: unexpected slot-invalid line", session.data))
     for line, tokens in [
         ("blk", [b"QEMU HARDDISK", b"16384 sectors (8 MiB)"]),

@@ -12,7 +12,7 @@ were run and observed. No dates or completion percentages are implied.
 | 4 | kernel heap, slab/size classes, performance harness | **partial** — fixed 8 MiB first-fit free-list heap with global allocator, IRQ-safe locking, poisoning, double-free detection, `validate()` walk, host tests (14) and in-kernel self-test; growth, slabs per measurement and the heap benchmark harness outstanding |
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
-| 7 | PE loader and minimal native Windows console compatibility | **partial (stages 1–2 done)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving three `kernel32.dll`-shaped console services against our own kernel implementations; broader API surface, real DLL loading, SEH, TLS and PE32 not started |
+| 7 | PE loader and minimal native Windows console compatibility | **partial (stages 1–3 done, acceptance review pending)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
@@ -199,6 +199,26 @@ ADR-0020, `docs/WIN32_CONSOLE.md`). Remaining Phase 7 items (broader API
 surface, imports from real system DLLs, ordinals, forwarders, delay imports,
 SEH/unwind, TLS, CLR, PE32) are explicitly deferred; no compatibility claim is
 made.
+
+## Phase 7 stage 3 (2026-10-19): Win32 program basics
+
+Implemented and verified: the exact-name `kernel32.dll` allowlist grows from
+three to eleven functions (`WriteFile`, `GetLastError`, `SetLastError`,
+`ExitThread`, `GetCurrentProcessId`, `GetCurrentThreadId`, `GetTickCount`,
+`GetCommandLineA` join the console surface), the stub page gains a 13-byte
+five-argument form (`mov r10, [rsp+0x28]`) and a loader-owned command-line
+tail, and per-thread `last_error` lives in the scheduler thread slot. A new
+`pebasics.exe` fixture with nine `raw-dylib` imports exercises the documented
+`WriteFile` failure values (0 + 6 / 0 + 87), error-state persistence, the
+synthetic IDs, `GetTickCount` and the command line at CPL3; `pebadfn2.exe`
+(`Sleep` substituted for `GetTickCount`) is rejected before allocation (see
+R-015, ADR-0021, `docs/WIN32_PROGRAM.md`). Two bring-up defects were fixed:
+the explicit command-line terminator and the `sched::wait_all_finished` TSC
+budget removal. `test_all.sh` reports PASS=22 FAIL=0 SKIP=4. Broader API
+surface, real DLL loading, ordinals, forwarders, delay imports, SEH/unwind,
+TLS, CLR and PE32 remain explicitly deferred; no compatibility claim is
+made. Phase 7 acceptance is reviewed by the user before being marked
+complete.
 
 ## Phase 7 acceptance (planned)
 

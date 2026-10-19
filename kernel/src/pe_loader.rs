@@ -1,17 +1,19 @@
 //! Two-phase PE32+ loader for ring-3 programs shipped as Limine modules
-//! (Phase 7, stages 1 and 2).
+//! (Phase 7, stages 1–3).
 //!
 //! [`inspect`] validates the module without touching memory: the shared
 //! `os_core::pe` parser enforces the format rules and this module adds the
 //! kernel policy — every section's page-rounded range must lie inside the
 //! fixed code window, W^X must hold per section, a nonzero load delta
 //! requires relocations, and every import must resolve against the fixed
-//! Win32 allowlist (exact `kernel32.dll` name and one of three function
+//! Win32 allowlist (exact `kernel32.dll` name and one of eleven function
 //! names). [`map`] then allocates, zero-fills, maps and base-relocates each
 //! section page into a fresh user address space and, when the image has
-//! imports, maps one stub page of `int 0x80` trampolines and patches the IAT
-//! through the HHDM, rolling the whole mapping back on any failure. The stack
-//! is owned by `user.rs`.
+//! imports, maps one stub page of `int 0x80` trampolines (4-argument and
+//! 5-argument shapes; the fifth integer argument is forwarded through `r10`)
+//! and patches the IAT through the HHDM, rolling the whole mapping back on
+//! any failure. The same page carries the loader-written command-line string
+//! that `GetCommandLineA` returns. The stack is owned by `user.rs`.
 //!
 //! With the ELF loader this shares the fixed 1 MiB window at `0x400000`: one
 //! program runs at a time, so the two loaders cannot collide. The import stub
@@ -45,6 +47,13 @@ pub const WIN32_STUB_VA: u64 = 0x51_0000;
 const STUB_STRIDE: u64 = 16;
 const STUB_UNUSED: u8 = 0xCC;
 
+/// Command-line string for `GetCommandLineA`: a fixed 256-byte tail region
+/// of the stub page (255 path bytes + NUL terminator).
+const COMMAND_LINE_OFFSET: usize = 0xF00;
+pub const COMMAND_LINE_CAPACITY: usize = 0x100;
+pub const COMMAND_LINE_VA: u64 = WIN32_STUB_VA + COMMAND_LINE_OFFSET as u64;
+const _: () = assert!(COMMAND_LINE_OFFSET + COMMAND_LINE_CAPACITY <= PAGE_SIZE as usize);
+
 /// Worst-case rollback bookkeeping: every page of the code window.
 const MAX_WINDOW_PAGES: usize = ((loader::CODE_END - loader::CODE_BASE) / PAGE_SIZE) as usize;
 
@@ -60,6 +69,7 @@ pub enum Reject {
     UnknownImportDll,
     UnknownImportFunction,
     ImportTarget,
+    CommandLineTooLong,
     OutOfMemory,
     MapFailed,
 }
@@ -76,26 +86,87 @@ impl Reject {
             Reject::UnknownImportDll => "unknown import dll",
             Reject::UnknownImportFunction => "unknown import function",
             Reject::ImportTarget => "import target invalid",
+            Reject::CommandLineTooLong => "command line too long",
             Reject::OutOfMemory => "out of memory",
             Reject::MapFailed => "mapping failed",
         }
     }
 }
 
+/// How many integer arguments an import's stub must forward. `Args4` covers
+/// zero to four arguments: the services ignore unused registers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StubShape {
+    Args4,
+    Args5,
+}
+
 /// The fixed Win32 service table of this stage: function name (byte-exact) to
-/// `int 0x80` service number. This single table backs both the import policy
-/// and the stub bytes.
-const WIN32_SERVICES: [(&[u8], u32); 3] = [
-    (b"GetStdHandle", syscall::SYS_GET_STD_HANDLE as u32),
-    (b"WriteConsoleA", syscall::SYS_WRITE_CONSOLE as u32),
-    (b"ExitProcess", syscall::SYS_EXIT_PROCESS as u32),
+/// `int 0x80` service number and stub shape. This single table backs both the
+/// import policy and the stub bytes.
+const WIN32_SERVICES: [(&[u8], u32, StubShape); 11] = [
+    (
+        b"GetStdHandle",
+        syscall::SYS_GET_STD_HANDLE as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"WriteConsoleA",
+        syscall::SYS_WRITE_CONSOLE as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"ExitProcess",
+        syscall::SYS_EXIT_PROCESS as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"WriteFile",
+        syscall::SYS_WRITEFILE as u32,
+        StubShape::Args5,
+    ),
+    (
+        b"GetLastError",
+        syscall::SYS_GET_LAST_ERROR as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"SetLastError",
+        syscall::SYS_SET_LAST_ERROR as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"ExitThread",
+        syscall::SYS_EXIT_THREAD as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"GetCurrentProcessId",
+        syscall::SYS_GET_CURRENT_PROCESS_ID as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"GetCurrentThreadId",
+        syscall::SYS_GET_CURRENT_THREAD_ID as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"GetTickCount",
+        syscall::SYS_GET_TICK_COUNT as u32,
+        StubShape::Args4,
+    ),
+    (
+        b"GetCommandLineA",
+        syscall::SYS_GET_COMMAND_LINE as u32,
+        StubShape::Args4,
+    ),
 ];
 
-fn win32_service(name: &[u8]) -> Option<u32> {
+fn win32_service(name: &[u8]) -> Option<(u32, StubShape)> {
     WIN32_SERVICES
         .iter()
-        .find(|(candidate, _)| *candidate == name)
-        .map(|(_, service)| *service)
+        .find(|(candidate, _, _)| *candidate == name)
+        .map(|(_, service, shape)| (*service, *shape))
 }
 
 /// Validated load plan for one PE module: entry RVA, link-time image base and
@@ -329,20 +400,31 @@ pub fn map(
         // already proved every name resolves, so planning cannot fail here.
         let mut stub_index = [0u8; MAX_IMPORTS];
         let mut stub_services = [0u32; MAX_IMPORTS];
+        let mut stub_shapes = [StubShape::Args4; MAX_IMPORTS];
         let mut stub_count = 0usize;
         for (slot, import) in image.imports[..image.import_count].iter().enumerate() {
             match (0..stub_count).find(|&index| image.imports[index].name() == import.name()) {
                 Some(index) => stub_index[slot] = index as u8,
                 None => {
-                    let Some(service) = win32_service(import.name()) else {
+                    let Some((service, shape)) = win32_service(import.name()) else {
                         rollback(space, &mapped[..mapped_count]);
                         return Err(Reject::UnknownImportFunction);
                     };
                     stub_index[slot] = stub_count as u8;
                     stub_services[stub_count] = service;
+                    stub_shapes[stub_count] = shape;
                     stub_count += 1;
                 }
             }
+        }
+
+        // The command line is the module's real Limine path; both the
+        // fixture and the kernel log read it back through the mapping. The
+        // fixed capacity is checked before any stub-page frame is allocated.
+        let command_line = limine::cstr(module.path);
+        if command_line.len() + 1 > COMMAND_LINE_CAPACITY {
+            rollback(space, &mapped[..mapped_count]);
+            return Err(Reject::CommandLineTooLong);
         }
 
         let frame = match memory::alloc_frame() {
@@ -362,14 +444,22 @@ pub fn map(
         // mapped anywhere; HHDM maps all of usable RAM. Unused bytes are
         // `int3`, so a stray call faults in isolation.
         unsafe { core::ptr::write_bytes(window, STUB_UNUSED, PAGE_SIZE as usize) };
-        for (index, service) in stub_services[..stub_count].iter().enumerate() {
+        for index in 0..stub_count {
+            let service = stub_services[index];
             let mut stub = [STUB_UNUSED; STUB_STRIDE as usize];
-            stub[0] = 0xB8; // mov eax, imm32
-            stub[1..5].copy_from_slice(&service.to_le_bytes());
-            stub[5] = 0xCD; // int 0x80
-            stub[6] = 0x80;
-            stub[7] = 0xC3; // ret
-            for byte in &mut stub[8..] {
+            let mut cursor = 0usize;
+            if stub_shapes[index] == StubShape::Args5 {
+                // mov r10, [rsp+0x28]: the fifth integer argument at
+                // function entry (32-byte shadow space + return address).
+                stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x54, 0x24, 0x28]);
+                cursor += 5;
+            }
+            stub[cursor] = 0xB8; // mov eax, imm32
+            stub[cursor + 1..cursor + 5].copy_from_slice(&service.to_le_bytes());
+            stub[cursor + 5] = 0xCD; // int 0x80
+            stub[cursor + 6] = 0x80;
+            stub[cursor + 7] = 0xC3; // ret
+            for byte in &mut stub[cursor + 8..] {
                 *byte = 0x90; // nop
             }
             // SAFETY: `index * STUB_STRIDE + 16` stays inside the one frame
@@ -381,6 +471,18 @@ pub fn map(
                     stub.len(),
                 )
             };
+        }
+        // The path bytes plus an explicit NUL terminator; the frame itself is
+        // `int3`-filled, so the terminator must be written, not assumed.
+        // SAFETY: `command_line.len() + 1 <= COMMAND_LINE_CAPACITY` was
+        // checked above and the fixed region lies inside this one frame.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                command_line.as_ptr(),
+                window.add(COMMAND_LINE_OFFSET),
+                command_line.len(),
+            );
+            core::ptr::write_volatile(window.add(COMMAND_LINE_OFFSET + command_line.len()), 0);
         }
 
         if space

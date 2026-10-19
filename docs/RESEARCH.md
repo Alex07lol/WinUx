@@ -693,6 +693,96 @@ successful `WriteFile`); the documented `WriteFile` failure values (0 + 6 /
 claimed. Confidence: high for the observed eleven-function surface in
 QEMU; Windows compatibility is not claimed.
 
+## R-016 — Win32 console input: blocking `ReadFile` line mode, echo and byte counts
+
+**Question.** What are the documented contracts of `ReadFile` on a console
+input handle in the default line-input mode — blocking, echo, byte count and
+error behavior — what does `GetStdHandle(STD_INPUT_HANDLE)` return, and how
+can a blocking read be implemented inside our `int 0x80` service without
+deadlocking a single-CPU scheduler whose gate enters with interrupts
+disabled?
+
+**Sources.**
+- Microsoft Learn `ReadFile` (fetched 2026-10-19, ms.date 2024-10-02):
+  success is nonzero, failure is `0` plus `GetLastError`;
+  `lpNumberOfBytesRead` is set "to zero before doing any work or error
+  checking"; with a synchronous handle and NULL `lpOverlapped`, `ReadFile`
+  "does not return until the operation is complete"; "Characters can be read
+  from the console input buffer by using ReadFile with a handle to console
+  input. The console mode determines the exact behavior. By default, the
+  console mode is ENABLE_LINE_INPUT, which indicates that ReadFile should
+  read until it reaches a carriage return."
+- Microsoft Learn *High-Level Console Input and Output Functions* (fetched
+  2026-10-19, ms.date 2018-07-12): in line-input mode `ReadFile` and
+  `ReadConsole` "do not return to the calling application until the ENTER key
+  is pressed"; "all available characters are read until either no more keys
+  are available or the specified number of characters has been read. Unread
+  characters are buffered until the next read operation. The functions report
+  the total number of characters actually read. If echo input mode is
+  enabled, characters read by these functions are written to the active
+  screen buffer."
+- Microsoft Learn `ReadConsole` (fetched 2026-10-19, ms.date 2018-07-12):
+  behaves like `ReadFile`; "Cooked Mode is when ENABLE_LINE_INPUT is set ...
+  calls to ReadFile or ReadConsole will not return until the enter key is
+  pressed"; the console input handle must have `GENERIC_READ`.
+- Microsoft Learn *Console Input Buffer* (fetched 2026-10-19, ms.date
+  2018-07-12): input records queue behind a console input buffer; the
+  high-level functions filter them down to a character stream (no function,
+  arrow or mouse events).
+- `GetStdHandle` (`STD_INPUT_HANDLE` is `(DWORD)-10`) and the WinError values
+  (`ERROR_INVALID_HANDLE` = 6, `ERROR_INVALID_PARAMETER` = 87) are reused
+  from the R-014/R-015 source set.
+
+**Claim.** Our console model can serve `GetStdHandle(STD_INPUT_HANDLE)` with
+a handle distinct from the output handle and a synchronous, line-mode
+`ReadFile` that blocks until CR/LF, echoes accepted printable bytes, stores a
+CRLF-terminated line in the user buffer and returns `TRUE` with the byte
+count. `*lpNumberOfBytesRead` is zeroed before argument checks (documented);
+a wrong handle returns `FALSE` + 6; a non-NULL overlapped pointer or a length
+outside `2..=4096` returns `FALSE` + 87; unmapped pointers kill the thread
+(memory-safety policy). CRLF inclusion in the line and count is our normative
+choice: the fetched docs pin the return point and "characters actually read"
+but not the terminator bytes for `ReadFile`. On one CPU the service can
+block safely by enabling interrupts in the handler and waiting with `hlt`:
+the serial RX IRQ supplies bytes, the PIT keeps preemption alive, and no lock
+is held across the wait. Confidence high for the API shape, blocking/echo/
+count statements and the `hlt` mechanism; medium for CRLF inclusion (project
+contract, covered by our own tests, not vendor-verified).
+
+**Experiment.** Run 2026-10-19: `scripts/test_input_qemu.sh` (QEMU 11.1.0,
+q35, 512 MiB, `isa-debug-exit`, paced TCP serial; kernel build id
+`0.1.0-58f98e48`, kernel SHA-256
+`56bd754ea1f7f302417940cbe3da280fae1669b800d335d34fcafd438a9e06af`; the
+input ISO was rebuilt once more when the runner re-ran the full suite after
+the final comment-only source touch-up, so the recorded ISO SHA-256 is
+`e5b8165347b33fb45769477488783804812d96f649622b69953d7f21d0c0d834`;
+`peinput.exe` 4,096 bytes, SHA-256
+`a2ab21aa4ea7e282c79e2ed1b437c72cee0a21e7b706ba4d0b007a46d5167de0`) passed:
+with the fixture blocked in `ReadFile`, the harness typed `hello, win32`;
+the transcript (`artifacts/qemu-input-session.log`) shows the echo, the
+playback, `win32: ReadFile(2, 64 bytes) -> 1 (14 bytes)`, the error lines
+for handle `1` (`-> 0 (invalid handle)`, `GetLastError() -> 6`) and a
+non-NULL overlapped pointer (`-> 0 (invalid parameter)`, `GetLastError() ->
+87`), the self-test line and the boot marker; QEMU then exited 33
+(isa-debug-exit). One harness iteration failed on the CRLF expectation:
+serial output expands LF to CRLF, so both the echo and the playback appear
+as `hello, win32\r\r\n` while the buffer holds 14 bytes ending CRLF; the
+harness expectation was corrected to the display form. A second iteration
+failed because the marker line was asserted before its terminator arrived;
+the harness now waits for the marker line to end. `scripts/test_all.sh`:
+`PASS=23 FAIL=0 SKIP=4`.
+
+**Conclusion.** Confirmed in QEMU for the observed surface: the genuine
+PE32+ fixture receives a typed line through its own `ReadFile` import, the
+read blocks without spinning (interrupts enabled + `hlt`, no lock held), the
+count line reports the CRLF-inclusive length, `*lpNumberOfBytesRead` is
+zeroed before checks, and the documented failure values (0 + 6, 0 + 87) and
+serial lines match the contract. The CRLF-inclusion choice, the minimum
+length 2 and line-mode-only echo behavior remain our documented contract,
+not vendor-verified statements. Confidence: high within the recorded
+QEMU scope; Windows console compatibility beyond the listed surface is not
+claimed.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

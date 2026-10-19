@@ -13,3 +13,7 @@ version = "0.1.0"
 [[package]]
 name = "pehello"
 version = "0.1.0"
+
+[[package]]
+name = "peinput"
+version = "0.1.0"

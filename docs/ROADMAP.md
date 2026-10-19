@@ -13,7 +13,7 @@ were run and observed. No dates or completion percentages are implied.
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
-| 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stage 1: native configuration store, 2026-10-19)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change; larger Win32 surface, GUI/text/input and the compatibility matrix not started |
+| 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–2, 2026-10-19)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, and a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023); larger Win32 surface, GUI and the compatibility matrix not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
@@ -252,6 +252,28 @@ fresh format reseeds defaults), `scripts/test_all.sh` PASS=22 FAIL=0 SKIP=4
 (269 host unit tests). Limits: no Windows registry API, no typed values, no
 ACLs/multi-user separation, no transactions or notifications
 (`docs/CONFIG.md` §1/§8). No compatibility claim is made.
+
+## Phase 8 stage 2 (2026-10-19): Win32 console input (`ReadFile` line mode)
+
+Implemented and verified: `GetStdHandle(STD_INPUT_HANDLE)` returns the distinct
+handle `2`; service 14 (`ReadFile`, five-argument stub, allowlist grows to
+twelve names) blocks in the `int 0x80` handler with interrupts enabled and
+`hlt` (no lock held), consumes serial-console bytes one at a time, echoes
+printables with backspace/DEL editing, terminates on CR/LF with a CRLF-
+inclusive line and count, and returns the documented `FALSE` + WinError values
+(`0`+6 bad handle, `0`+87 overlapped or length outside `2..=4096`) with
+`*lpNumberOfBytesRead` zeroed first (`docs/WIN32_INPUT.md`, ADR-0023, R-016).
+The `peinput.exe` fixture ships only on `artifacts/project-os-input.iso`
+(`make_iso.sh --input-fixture`); default ISOs, module counts and markers are
+unchanged. Evidence: `scripts/test_input_qemu.sh` PASS (typed line echoed and
+played back, `ReadFile(2, 64 bytes) -> 1 (14 bytes)`, error lines, selftest
+line, QEMU exit 33), `scripts/test_pe_qemu.sh` / shell / persistence / boot
+regressions unchanged, `scripts/test_all.sh` PASS=23 FAIL=0 SKIP=4 (269 host
+unit tests). Limits: line mode with echo only; no `ReadConsole`,
+`GetConsoleMode`/`SetConsoleMode`, Ctrl+C/Ctrl+Z semantics, raw mode,
+Unicode/W variants, redirected stdin, overlapped/async I/O or multiple
+readers; CRLF inclusion is a project contract, not vendor-verified
+(`docs/WIN32_INPUT.md` §1/§7). No compatibility claim is made.
 
 ## Phase 8 acceptance (planned)
 

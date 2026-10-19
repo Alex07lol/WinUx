@@ -479,9 +479,10 @@ boot. Evidence: `os_core` unit tests, `check_user_pe.py`, `test_pe_qemu.sh`
 serial log, full `test_all.sh` run, VirtualBox re-run.
 
 May **not** claim (stage 1 scope): any Windows API compatibility, general
-import resolution/DLL loading of real system DLLs (stages 2–3 resolve only
-the eleven-name `kernel32.dll` allowlist, see `docs/WIN32_CONSOLE.md` §9 and
-`docs/WIN32_PROGRAM.md` §9), PE32 (32-bit), SEH/unwind, TLS, CLR, resources,
+import resolution/DLL loading of real system DLLs (stages 2–3 and Phase 8
+stage 2 resolve only the twelve-name `kernel32.dll` allowlist, see
+`docs/WIN32_CONSOLE.md` §9, `docs/WIN32_PROGRAM.md` §9 and
+`docs/WIN32_INPUT.md`), PE32 (32-bit), SEH/unwind, TLS, CLR, resources,
 dynamic code, ASLR, filesystem-backed exec, or running third-party Windows
 binaries. Limits to restate: fixed 1 MiB code window at `0x400000`, one 4 KiB
 stack page, max 16 sections / 256 relocations per image at load, W^X enforced

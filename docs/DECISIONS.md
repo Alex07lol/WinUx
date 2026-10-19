@@ -977,3 +977,95 @@ reboots, rolls back when the newest slot is corrupt, and resets to defaults
 after a fresh format. A future format change must bump `VERSION` and update
 `docs/CONFIG.md` §2 before any parser change.
 
+## ADR-0023 – Win32 console input as a blocking line-mode `ReadFile` service (Phase 8, stage 2)
+
+**Context.** The Phase 7 Win32 surface is output-only: the console handle
+supports `WriteConsoleA`/`WriteFile`, there is no way for a user program to
+read input, and `ReadFile` is not in the import allowlist. Phase 8 stage 2
+adds the smallest honest input surface. The full contract (arguments, order
+of checks, line-mode editing, pinned serial lines, fixture and harness) lives
+in `docs/WIN32_INPUT.md`; primary sources are in R-016.
+
+**Decision.**
+
+- **One new service (14) behind one new allowlist entry.** `ReadFile` is
+  resolved through the existing import machinery with the existing
+  five-argument stub shape; the stub page, import policy and IAT patch are
+  unchanged. The allowlist grows from eleven to twelve `kernel32.dll` names.
+  Rejected alternatives: a second stub shape (no need — `WriteFile` already
+  forwards five integer arguments); exposing `ReadConsoleA` first (adds a
+  console-handle/mode distinction for no additional behavior).
+- **A distinct input handle.** `GetStdHandle(-10)` returns `2`; the output
+  handle stays `1`. `ReadFile` accepts only `2`, `WriteFile`/`WriteConsoleA`
+  only `1`. Rejected: making `1` duplex (hides direction, removes the
+  negative `ReadFile(1)` test) and returning the same handle for both
+  (programs comparing handles would observe a divergence that is easy to
+  avoid).
+- **Line mode with echo is the only mode, and the read blocks.** The service
+  re-enables interrupts inside the `int 0x80` handler and waits with `hlt`
+  until a terminator arrives, so a blocked read consumes no CPU and timer
+  preemption keeps other threads alive; no lock is held across the wait.
+  Rejected: a non-blocking dip returning 0 immediately (contradicts the
+  documented default line-input behavior and pushes a retry loop into every
+  program); a new scheduler sleep/wake state (one caller does not justify a
+  new blocking primitive; `hlt` is already the kernel's idle mechanism).
+- **CRLF-terminated line and CRLF-inclusive count are our normative
+  contract.** The fetched documentation pins the return point (carriage
+  return) and "the total number of characters actually read" but not the
+  terminator bytes for `ReadFile`; tests define the two-byte terminator, and
+  the stage claims it as a project contract, not vendor-verified Windows
+  behavior. The buffer always has room for CRLF (at most `length - 2`
+  content bytes); a full buffer returns the accumulated bytes and leaves the
+  rest in the ring, matching the documented "unread characters are buffered".
+- **Argument errors return `FALSE` + WinError; memory-safety violations
+  kill.** `*lpNumberOfBytesRead` is validated and zeroed before any other
+  check; a bad handle returns 6, an overlapped request or a length outside
+  `2..=4096` returns 87. Unmapped out-pointers/buffers kill the calling
+  thread, consistent with the write services. Rejected: silently ignoring
+  `lpOverlapped` (a program would believe an overlapped read happened);
+  accepting length 1 (cannot hold CRLF).
+- **The fixture is isolated in a dedicated ISO variant.** `peinput.exe` is
+  copied only by `make_iso.sh --input-fixture`
+  (`artifacts/project-os-input.iso`); the default and interactive ISOs, all
+  pinned module counts, serial lines and markers stay byte-identical. The
+  phase is probed by module presence like the other fixture stages and runs
+  with a 30 s window; the harness types the known line as soon as the kernel
+  prints `win32: ReadFile(2, 64 bytes) waiting for input`. A boot of that
+  special ISO without a harness fails the demo phase after the window
+  instead of hanging forever.
+- **No new marker token.** Console input is part of the existing `win32`
+  check; no `checks` string in any existing test changes.
+- **No console-mode API in this stage.** No `GetConsoleMode`,
+  `SetConsoleMode`, Ctrl+C abort, Ctrl+Z/EOF, raw mode, Unicode/W variants,
+  redirected stdin or asynchronous I/O. These are recorded gaps, not
+  implemented pretense.
+
+**Alternatives considered.** A host-side syscall test without a real PE image
+(does not prove the import/IAT path and would not exercise the blocking
+interaction); driving input through the shell (the shell is a kernel thread
+and would consume the bytes before the user program could read them);
+implementing `ReadConsoleA` instead (same behavior, extra name and argument
+shape for no consumer); a `poll`-style kernel service (not in the Win32
+surface and not needed by the fixture).
+
+**Evidence.** PASSED 2026-10-19 (QEMU 11.1.0, q35, 512 MiB; build id
+`0.1.0-58f98e48`; kernel SHA-256
+`56bd754ea1f7f302417940cbe3da280fae1669b800d335d34fcafd438a9e06af`).
+`scripts/test_input_qemu.sh` booted the input ISO
+(SHA-256 `e5b8165347b33fb45769477488783804812d96f649622b69953d7f21d0c0d834`)
+and passed with the pinned lines (`GetStdHandle(-10) -> 2`; invalid handle
+`-> 0` + `GetLastError() -> 6`; overlapped `-> 0` + `GetLastError() -> 87`;
+`ReadFile(2, 64 bytes) waiting for input`; echo and playback of the typed
+line; `-> 1 (14 bytes)`; `input surface verified`; `win32 input selftest:
+passed`; boot marker) and QEMU exit 33; `peinput.exe` SHA-256
+`a2ab21aa4ea7e282c79e2ed1b437c72cee0a21e7b706ba4d0b007a46d5167de0`.
+`scripts/test_all.sh`: `PASS=23 FAIL=0 SKIP=4`. Transcript:
+`artifacts/qemu-input-session.log`; R-016 records the full experiment.
+
+**Consequences.** PROJECT_OS can now deliver a typed line to a CPL3 PE
+program through its own import table and a blocking native service. Programs
+still cannot query or change console modes; typing Ctrl+C or Ctrl+Z is
+ordinary data to this model (Ctrl+C is ignored as a control byte, Ctrl+Z is
+not EOF); there is one reader and one console. Those limits must be restated
+whenever this stage is cited.
+

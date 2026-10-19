@@ -1,5 +1,5 @@
 //! Ring-3 user-mode demonstration and self-test (Phase 6, stage 3; PE32+
-//! phase 7, stages 1–3).
+//! phase 7, stages 1–3; Phase 8, stage 2).
 //!
 //! User programs are ELF64 executables built from `userland/` (Rust, no_std)
 //! and PE32+ executables built from `userland/pe`, shipped as Limine modules
@@ -28,6 +28,13 @@
 //!   per-thread `GetLastError`/`SetLastError` pair — and ends through
 //!   `ExitThread`. `pebadfn2.exe` (unknown function) must be rejected the
 //!   same way as `pebadfn.exe`.
+//! * `peinput.exe` (Phase 8, stage 2) calls `GetStdHandle(STD_INPUT_HANDLE)`,
+//!   blocks in a line-mode `ReadFile` until the harness types a line, checks
+//!   the documented failure values (`0` + last-error 6 for a bad handle,
+//!   `0` + 87 for an overlapped request), plays the line back with `WriteFile`
+//!   and exits through `ExitThread`. It exists only on the dedicated input
+//!   ISO (`make_iso.sh --input-fixture`); without the module the phase is
+//!   skipped with an explicit line.
 //!
 //! Each program runs one at a time on its own scheduler thread. The thread
 //! publishes its address space and load plan into a static slot; after the
@@ -63,6 +70,7 @@ const PEBADIMP_PATH: &str = "/boot/pebadimp.exe";
 const PEBADFN_PATH: &str = "/boot/pebadfn.exe";
 const PEBASICS_PATH: &str = "/boot/pebasics.exe";
 const PEBADFN2_PATH: &str = "/boot/pebadfn2.exe";
+const PEINPUT_PATH: &str = "/boot/peinput.exe";
 
 /// Single user stack page, at the stage-5b placement just above the code
 /// window (`loader::CODE_END` == `STACK_VA`).
@@ -311,6 +319,10 @@ fn thread_peconsole() {
 
 fn thread_pebasics() {
     run_pe(PEBASICS_PATH);
+}
+
+fn thread_peinput() {
+    run_pe(PEINPUT_PATH);
 }
 
 fn unmap_and_free(space: &mut AddressSpace, virtual_address: u64) -> Result<(), &'static str> {
@@ -664,6 +676,53 @@ pub fn demo() -> Result<DemoReport, &'static str> {
     }
     if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_before_program {
         return Err("pebasics.exe produced a user fault");
+    }
+
+    // Phase 8, stage 2: the Win32 console-input surface. `peinput.exe` is
+    // only present on the dedicated input ISO, so a missing module skips the
+    // phase like the stages above and every default-boot contract stays
+    // unchanged.
+    if limine::module_by_path(PEINPUT_PATH).is_some() {
+        let get_before_input = syscall::WIN32_GET_STD_HANDLE_CALLS.load(Ordering::SeqCst);
+        let readfile_before_input = syscall::WIN32_READFILE_CALLS.load(Ordering::SeqCst);
+        let last_error_before_input = syscall::WIN32_GET_LAST_ERROR_CALLS.load(Ordering::SeqCst);
+        let writefile_before_input = syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst);
+        let faults_before_input = syscall::USER_FAULTS.load(Ordering::SeqCst);
+
+        // The fixture blocks in ReadFile until the harness types a line, so
+        // this phase gets a longer window than the compute-only phases.
+        sched::spawn("user-win32-input", thread_peinput)?;
+        sched::wait_all_finished(3000)?;
+        vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
+        cleanup_slot()?;
+        if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
+            return Err("peinput.exe did not exit with code 0");
+        }
+        if syscall::WIN32_GET_STD_HANDLE_CALLS.load(Ordering::SeqCst) != get_before_input + 1 {
+            return Err("peinput.exe did not call GetStdHandle exactly once");
+        }
+        if syscall::WIN32_READFILE_CALLS.load(Ordering::SeqCst) != readfile_before_input + 3 {
+            return Err("peinput.exe did not call ReadFile exactly three times");
+        }
+        if syscall::WIN32_GET_LAST_ERROR_CALLS.load(Ordering::SeqCst) != last_error_before_input + 2
+        {
+            return Err("peinput.exe did not call GetLastError exactly twice");
+        }
+        if syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst) != writefile_before_input + 2 {
+            return Err("peinput.exe did not call WriteFile exactly twice");
+        }
+        if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_before_input {
+            return Err("peinput.exe produced a user fault");
+        }
+        kprintln!(
+            "win32 input selftest: passed (ReadFile line input, echo, byte count, invalid handle/parameter errors verified through kernel32.dll imports)"
+        );
+    } else {
+        kprintln!(
+            "user: Win32 input self-test skipped (`{}` module missing)",
+            PEINPUT_PATH
+        );
+        kprintln!("win32 input selftest: skipped (no input fixture present)");
     }
 
     sched::set_preemption(false);

@@ -46,7 +46,8 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::x86_64::idt::InterruptFrame;
-use crate::arch::x86_64::read_cr2;
+use crate::arch::x86_64::{halt, interrupts_enable, read_cr2};
+use crate::console;
 use crate::pe_loader::COMMAND_LINE_VA;
 use crate::sched;
 use crate::serial;
@@ -65,14 +66,20 @@ pub const SYS_GET_CURRENT_PROCESS_ID: u64 = 10;
 pub const SYS_GET_CURRENT_THREAD_ID: u64 = 11;
 pub const SYS_GET_TICK_COUNT: u64 = 12;
 pub const SYS_GET_COMMAND_LINE: u64 = 13;
+pub const SYS_READFILE: u64 = 14;
 
 /// Maximum accepted console write, small enough to bound the kernel copy.
 pub const MAX_WRITE: u64 = 4096;
+/// Maximum accepted console read; the line buffer never exceeds this.
+pub const MAX_READ: u64 = 4096;
 
-/// `STD_OUTPUT_HANDLE` is `((DWORD)-11)`; the one handle this stage serves.
+/// `STD_OUTPUT_HANDLE` is `((DWORD)-11)`; `STD_INPUT_HANDLE` is `((DWORD)-10)`.
 const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
-/// The fabricated console handle `GetStdHandle(2)` returns.
+const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+/// The fabricated console output handle `GetStdHandle(-11)` returns.
 const CONSOLE_HANDLE: u64 = 1;
+/// The fabricated console input handle `GetStdHandle(-10)` returns.
+const INPUT_HANDLE: u64 = 2;
 
 /// WinError.h `ERROR_INVALID_HANDLE`.
 const ERROR_INVALID_HANDLE: u32 = 6;
@@ -112,6 +119,8 @@ pub static WIN32_GET_CURRENT_THREAD_ID_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static WIN32_GET_TICK_COUNT_CALLS: AtomicU64 = AtomicU64::new(0);
 /// `SYS_GET_COMMAND_LINE` calls.
 pub static WIN32_GET_COMMAND_LINE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_READFILE` calls (successful and failing alike).
+pub static WIN32_READFILE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Faults taken from CPL3 and isolated (thread killed, kernel alive).
 pub static USER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Repeated `int 0x80` calls made with an invalid pointer or bad service.
@@ -138,6 +147,7 @@ pub fn dispatch(frame: &mut InterruptFrame) {
         SYS_GET_CURRENT_THREAD_ID => get_current_thread_id(frame),
         SYS_GET_TICK_COUNT => get_tick_count(frame),
         SYS_GET_COMMAND_LINE => get_command_line(frame),
+        SYS_READFILE => read_file(frame),
         _ => {
             REJECTED_SYSCALLS.fetch_add(1, Ordering::SeqCst);
             serial::force_print(format_args!(
@@ -150,13 +160,16 @@ pub fn dispatch(frame: &mut InterruptFrame) {
 }
 
 /// `3 GetStdHandle`: no validation of the value happens here (per the API
-/// docs), so only the output handle is recognized and anything else returns
-/// `INVALID_HANDLE_VALUE` without killing the thread.
+/// docs), so only the input and output handles are recognized and anything
+/// else returns `INVALID_HANDLE_VALUE` without killing the thread.
 fn get_std_handle(frame: &mut InterruptFrame) {
     WIN32_GET_STD_HANDLE_CALLS.fetch_add(1, Ordering::SeqCst);
     if frame.rcx as u32 == STD_OUTPUT_HANDLE {
         serial::force_print(format_args!("win32: GetStdHandle(-11) -> 1\r\n"));
         frame.rax = CONSOLE_HANDLE;
+    } else if frame.rcx as u32 == STD_INPUT_HANDLE {
+        serial::force_print(format_args!("win32: GetStdHandle(-10) -> 2\r\n"));
+        frame.rax = INPUT_HANDLE;
     } else {
         frame.rax = u64::MAX;
     }
@@ -281,6 +294,122 @@ fn write_file(frame: &mut InterruptFrame) {
     serial::force_print(format_args!(
         "win32: WriteFile(1, {} bytes) -> 1\r\n",
         length
+    ));
+    frame.rax = 1;
+}
+
+/// `14 ReadFile`: native `kernel32!ReadFile` for the console input handle.
+/// Line mode with echo is the only mode: the call blocks until CR/LF, stores
+/// the line plus CRLF and reports the count. `*lpNumberOfBytesRead` is zeroed
+/// before the argument checks, as documented. Documented argument errors
+/// return `0` and set the thread's last-error value without killing the
+/// thread; unmapped spans are memory-safety violations and still kill it.
+fn read_file(frame: &mut InterruptFrame) {
+    let handle = frame.rcx;
+    let buffer = frame.rdx;
+    let length = frame.r8;
+    let read_pointer = frame.r9;
+    let overlapped = frame.r10;
+    WIN32_READFILE_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    // The documented contract sets the count to zero before any work or error
+    // checking, so the out-pointer must be validated first.
+    let Some(cell) =
+        validated_out_pointer(frame, read_pointer, "ReadFile out-pointer is not mapped")
+    else {
+        return;
+    };
+    // SAFETY: the out-pointer was validated as a mapped user page with 4
+    // bytes available; the store goes through the HHDM.
+    unsafe { core::ptr::write_volatile(cell, 0) };
+
+    if handle != INPUT_HANDLE {
+        sched::set_current_last_error(ERROR_INVALID_HANDLE);
+        serial::force_print(format_args!(
+            "win32: ReadFile({}) -> 0 (invalid handle)\r\n",
+            handle
+        ));
+        frame.rax = 0;
+        return;
+    }
+    if overlapped != 0 {
+        sched::set_current_last_error(ERROR_INVALID_PARAMETER);
+        serial::force_print(format_args!(
+            "win32: ReadFile(2, {} bytes, overlapped) -> 0 (invalid parameter)\r\n",
+            length
+        ));
+        frame.rax = 0;
+        return;
+    }
+    if !(2..=MAX_READ).contains(&length) {
+        sched::set_current_last_error(ERROR_INVALID_PARAMETER);
+        serial::force_print(format_args!(
+            "win32: ReadFile(2, {} bytes) -> 0 (invalid parameter)\r\n",
+            length
+        ));
+        frame.rax = 0;
+        return;
+    }
+    if !validate_user_span(frame, buffer, length) {
+        return;
+    }
+
+    serial::force_print(format_args!(
+        "win32: ReadFile(2, {} bytes) waiting for input\r\n",
+        length
+    ));
+
+    // The `int 0x80` gate entered with interrupts disabled, so enable them
+    // before sleeping: the serial RX IRQ delivers input and the PIT keeps the
+    // scheduler alive. No lock is held across the wait.
+    interrupts_enable();
+    let capacity = length as usize;
+    let mut count = 0usize;
+    loop {
+        // Leave room for CRLF: at most `length - 2` content bytes.
+        if count >= capacity - 2 {
+            break;
+        }
+        let Some(byte) = console::try_read_byte() else {
+            halt();
+            continue;
+        };
+        match byte {
+            b'\r' | b'\n' => {
+                // SAFETY: the span was validated as mapped, user-accessible
+                // and bounded, and `count + 2 <= length`.
+                unsafe {
+                    let out = buffer as *mut u8;
+                    core::ptr::write_volatile(out.add(count), b'\r');
+                    core::ptr::write_volatile(out.add(count + 1), b'\n');
+                }
+                count += 2;
+                serial::force_write_bytes(b"\r\n");
+                break;
+            }
+            0x08 | 0x7f => {
+                if count > 0 {
+                    count -= 1;
+                    serial::force_write_bytes(b"\x08 \x08");
+                }
+            }
+            0x20..=0x7e => {
+                // SAFETY: the span was validated and `count < length`.
+                unsafe {
+                    core::ptr::write_volatile((buffer as *mut u8).add(count), byte);
+                }
+                count += 1;
+                serial::force_write_bytes(&[byte]);
+            }
+            _ => {}
+        }
+    }
+
+    // SAFETY: the out-pointer was validated earlier in this call.
+    unsafe { core::ptr::write_volatile(cell, count as u32) };
+    serial::force_print(format_args!(
+        "win32: ReadFile(2, {} bytes) -> 1 ({} bytes)\r\n",
+        length, count
     ));
     frame.rax = 1;
 }

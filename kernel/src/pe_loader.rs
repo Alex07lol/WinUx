@@ -6,7 +6,7 @@
 //! kernel policy — every section's page-rounded range must lie inside the
 //! fixed code window, W^X must hold per section, a nonzero load delta
 //! requires relocations, and every import must resolve against the fixed
-//! Win32 allowlist (exact `kernel32.dll` name and one of eleven function
+//! Win32 allowlist (exact `kernel32.dll` name and one of twelve function
 //! names). [`map`] then allocates, zero-fills, maps and base-relocates each
 //! section page into a fresh user address space and, when the image has
 //! imports, maps one stub page of `int 0x80` trampolines (4-argument and
@@ -104,7 +104,7 @@ enum StubShape {
 /// The fixed Win32 service table of this stage: function name (byte-exact) to
 /// `int 0x80` service number and stub shape. This single table backs both the
 /// import policy and the stub bytes.
-const WIN32_SERVICES: [(&[u8], u32, StubShape); 11] = [
+const WIN32_SERVICES: [(&[u8], u32, StubShape); 12] = [
     (
         b"GetStdHandle",
         syscall::SYS_GET_STD_HANDLE as u32,
@@ -160,6 +160,7 @@ const WIN32_SERVICES: [(&[u8], u32, StubShape); 11] = [
         syscall::SYS_GET_COMMAND_LINE as u32,
         StubShape::Args4,
     ),
+    (b"ReadFile", syscall::SYS_READFILE as u32, StubShape::Args5),
 ];
 
 fn win32_service(name: &[u8]) -> Option<(u32, StubShape)> {

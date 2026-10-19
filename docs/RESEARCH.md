@@ -783,6 +783,103 @@ not vendor-verified statements. Confidence: high within the recorded
 QEMU scope; Windows console compatibility beyond the listed surface is not
 claimed.
 
+## R-017 — Registry read surface: `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey` over the config store
+
+**Question.** What are the documented contracts of the three read-only
+`advapi32.dll` registry functions — argument shapes, documented error codes,
+buffer-size semantics and handle rules — and can our Phase 8 config store back
+a registry-shaped view for a genuine PE32+ importer without over-claiming
+Windows registry behavior?
+
+**Sources.**
+- Microsoft Learn `RegOpenKeyExA` (fetched 2026-10-19, ms.date 2018-12-05):
+  "Opens the specified registry key. Note that key names are not case
+  sensitive."; exported by `Advapi32.dll` (requirements table); five arguments
+  `(hKey, lpSubKey, ulOptions, samDesired, phkResult)`; "If the lpSubKey
+  parameter is NULL or a pointer to an empty string, and if hKey is a
+  predefined key, then the system refreshes the predefined key, and phkResult
+  receives the same hKey handle passed into the function."; `ulOptions` "Set
+  this parameter to zero or" `REG_OPTION_OPEN_LINK`; `samDesired` is an access
+  mask and "The function fails if the security descriptor of the key does not
+  permit the requested access"; "Unlike the RegCreateKeyEx function, the
+  RegOpenKeyEx function does not create the specified key if the key does not
+  exist"; the example maps `ERROR_FILE_NOT_FOUND` to "Key not found."
+- Microsoft Learn `RegQueryValueExA` (fetched 2026-10-19, ms.date
+  2018-12-05): six arguments `(hKey, lpValueName, lpReserved, lpType, lpData,
+  lpcbData)`; "If lpValueName is NULL or an empty string, "", the function
+  retrieves the type and data for the key's unnamed or default value"; "If
+  lpValueName specifies a value that is not in the registry, the function
+  returns ERROR_FILE_NOT_FOUND"; `lpReserved` "is reserved and must be NULL";
+  `lpType` "can be NULL if the type code is not required"; `lpData` "can be
+  NULL if the data is not required"; `lpcbData` "can be NULL only if lpData is
+  NULL"; "If the buffer specified by lpData parameter is not large enough to
+  hold the data, the function returns ERROR_MORE_DATA and stores the required
+  buffer size in the variable pointed to by lpcbData"; "If lpData is NULL, and
+  lpcbData is non-NULL, the function returns ERROR_SUCCESS and stores the size
+  of the data, in bytes, in the variable pointed to by lpcbData"; for REG_SZ
+  "this size includes any terminating null character"; the documented warning
+  states a returned REG_SZ is NOT guaranteed to be null-terminated.
+- Microsoft Learn `RegCloseKey` (fetched 2026-10-19, ms.date 2018-12-05):
+  one argument `(hKey)`; `Advapi32.dll`; success is `ERROR_SUCCESS`, failure a
+  WinError.h code; "The handle for a specified key should not be used after it
+  has been closed, because it will no longer be valid."
+- WinError numeric values: `ERROR_SUCCESS` 0, `ERROR_FILE_NOT_FOUND` 2,
+  `ERROR_INVALID_HANDLE` 6, `ERROR_INVALID_PARAMETER` 87 reused from the
+  R-014/R-015 source set; `ERROR_MORE_DATA` 234 and
+  `ERROR_TOO_MANY_OPEN_FILES` 4 also from WinError.h (used by our contracts).
+
+**Claim.** The config store can back a read-only registry view: `HKLM`
+(`0x80000002`) is the only backed root; `RegOpenKeyExA` opens a key whose
+"children" exist in the store (`prefix/...` entries), an empty/NULL subkey of
+`HKLM` returns the same handle per the fetched statement, and each other open
+uses one of four kernel slots with synthetic handles `0x1000 + slot`. Key
+existence and value lookup are ASCII case-insensitive, matching "key names are
+not case sensitive". `RegQueryValueExA` treats the joined `prefix/name` as a
+store key, models REG_SZ values as `bytes + NUL`, returns the size (including
+the NUL) for a NULL-data query and `ERROR_MORE_DATA` plus the required size for
+a short buffer. Documented argument errors return the WinError values above
+without killing the thread; unmapped pointers kill, as everywhere else.
+Deviations we state, not hide: `samDesired` is ignored (the store has no
+security descriptors; read-only anyway), `REG_OPTION_OPEN_LINK` is rejected
+with 87, unnamed/default values are not modeled (NULL/empty value name → 2),
+a NULL `lpcbData` returns 87 (the fetched docs permit it only with NULL
+`lpData` and do not define the result), values are always NUL-terminated
+(stronger than the documented warning), other predefined roots return
+`ERROR_FILE_NOT_FOUND` because no per-user/class namespace is backed,
+`ERROR_TOO_MANY_OPEN_FILES` (4) is our contract for slot exhaustion with four
+slots, and a failed open zeroes `*phkResult` (project contract; Windows leaves
+it undefined). Confidence: high for the argument shapes, documented error
+codes, handle and buffer-size statements; medium for the slot-count and
+zeroing choices, which our own tests define.
+
+**Experiment.** `scripts/test_registry_qemu.sh` booted
+`artifacts/project-os-registry.iso` (BIOS, QEMU 11.1.0) and `pereg.exe`
+exercised the surface through genuine `advapi32.dll` raw-dylib imports: bad
+handle → 6, nonzero `ulOptions` → 87, missing key → 2 with `*phkResult`
+zeroed, opens of `System`/`display` → handles 4096–4099, size query → 11,
+short buffer → 234 + required 11 with the buffer untouched, full reads →
+`PROJECT_OS\0` (11 B) and `classic\0` (8 B via the root with the path-shaped
+name `Display/Theme`), NULL/empty subkey of HKLM → HKLM itself, non-NULL
+`lpReserved` and NULL `lpcbData` → 87, fifth concurrent open → 4, close once →
+0, double close → 6, slot reuse → 4096 again, summary write 33 B. The
+transcript is `artifacts/qemu-registry-session.log` (10,420 bytes, sha256
+`021807014f814d557227c3774d7231a3d47386ec33b023f843b72d736a8e5945`); all phase
+counter assertions (open +10, query +7, close +7, WriteFile +1, console
+writes +1 / 33 bytes, exit 0, no user faults) passed and
+`scripts/test_all.sh` reported `PASS=24 FAIL=0 SKIP=4` at build id
+`0.1.0-b1b8542c`.
+
+**Conclusion.** All fetched statements the claim relies on were reproduced:
+the five- and six-argument shapes, `ERROR_FILE_NOT_FOUND` for a value not in
+the registry, `ERROR_MORE_DATA` plus the required size (including the
+terminating NUL) for a short buffer, the NULL-data size query, the
+`lpReserved`/`lpcbData` rules, case-insensitive key names, the HKLM
+refresh-same-handle behavior, and close-once handle invalidation. The
+contract choices our own tests define (four slots → `ERROR_TOO_MANY_OPEN_FILES`
+4, zeroed `*phkResult` on failure, always-NUL-terminated values,
+`REG_OPTION_OPEN_LINK` → 87, unnamed/default values → 2) held exactly. No
+statement about a real Windows registry beyond the fetched ones is claimed.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

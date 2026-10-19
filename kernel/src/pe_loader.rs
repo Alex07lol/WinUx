@@ -6,14 +6,15 @@
 //! kernel policy — every section's page-rounded range must lie inside the
 //! fixed code window, W^X must hold per section, a nonzero load delta
 //! requires relocations, and every import must resolve against the fixed
-//! Win32 allowlist (exact `kernel32.dll` name and one of twelve function
-//! names). [`map`] then allocates, zero-fills, maps and base-relocates each
-//! section page into a fresh user address space and, when the image has
-//! imports, maps one stub page of `int 0x80` trampolines (4-argument and
-//! 5-argument shapes; the fifth integer argument is forwarded through `r10`)
-//! and patches the IAT through the HHDM, rolling the whole mapping back on
-//! any failure. The same page carries the loader-written command-line string
-//! that `GetCommandLineA` returns. The stack is owned by `user.rs`.
+//! Win32 allowlist (exact `kernel32.dll` or `advapi32.dll` name and one of
+//! fifteen function names). [`map`] then allocates, zero-fills, maps and
+//! base-relocates each section page into a fresh user address space and, when
+//! the image has imports, maps one stub page of `int 0x80` trampolines
+//! (4-, 5- and 6-argument shapes; the fifth integer argument is forwarded
+//! through `r10` and the sixth through `r11`) and patches the IAT through the
+//! HHDM, rolling the whole mapping back on any failure. The same page carries
+//! the loader-written command-line string that `GetCommandLineA` returns. The
+//! stack is owned by `user.rs`.
 //!
 //! With the ELF loader this shares the fixed 1 MiB window at `0x400000`: one
 //! program runs at a time, so the two loaders cannot collide. The import stub
@@ -36,15 +37,18 @@ use crate::vm::{self, AddressSpace};
 pub const MAX_SECTIONS: usize = 16;
 pub const MAX_RELOCATIONS: usize = 256;
 
-/// The only DLL this stage resolves imports against, byte-exact.
-const WIN32_DLL: &[u8] = b"kernel32.dll";
+/// The DLLs this stage resolves imports against, byte-exact. Since Phase 8
+/// stage 3 the allowlist spans two DLLs: console/program services come from
+/// `kernel32.dll`, the read-only registry surface from `advapi32.dll`.
+const WIN32_DLLS: [&[u8]; 2] = [b"kernel32.dll", b"advapi32.dll"];
 
 /// Fixed import stub page: outside the code window (`loader::CODE_END`) and
 /// disjoint from the user stack page at `0x50_0000`.
 pub const WIN32_STUB_VA: u64 = 0x51_0000;
 
-/// One 16-byte stub per unique import; unused bytes are `int3`.
-const STUB_STRIDE: u64 = 16;
+/// One 24-byte stub per unique import (an `Args6` stub needs 18 bytes);
+/// unused bytes are `int3`.
+const STUB_STRIDE: u64 = 24;
 const STUB_UNUSED: u8 = 0xCC;
 
 /// Command-line string for `GetCommandLineA`: a fixed 256-byte tail region
@@ -53,6 +57,7 @@ const COMMAND_LINE_OFFSET: usize = 0xF00;
 pub const COMMAND_LINE_CAPACITY: usize = 0x100;
 pub const COMMAND_LINE_VA: u64 = WIN32_STUB_VA + COMMAND_LINE_OFFSET as u64;
 const _: () = assert!(COMMAND_LINE_OFFSET + COMMAND_LINE_CAPACITY <= PAGE_SIZE as usize);
+const _: () = assert!(MAX_IMPORTS as u64 * STUB_STRIDE <= COMMAND_LINE_OFFSET as u64);
 
 /// Worst-case rollback bookkeeping: every page of the code window.
 const MAX_WINDOW_PAGES: usize = ((loader::CODE_END - loader::CODE_BASE) / PAGE_SIZE) as usize;
@@ -94,80 +99,118 @@ impl Reject {
 }
 
 /// How many integer arguments an import's stub must forward. `Args4` covers
-/// zero to four arguments: the services ignore unused registers.
+/// zero to four arguments: the services ignore unused registers. `Args6`
+/// forwards the sixth argument (at `[rsp+0x30]` on entry) through `r11`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StubShape {
     Args4,
     Args5,
+    Args6,
 }
 
-/// The fixed Win32 service table of this stage: function name (byte-exact) to
-/// `int 0x80` service number and stub shape. This single table backs both the
-/// import policy and the stub bytes.
-const WIN32_SERVICES: [(&[u8], u32, StubShape); 12] = [
+/// The fixed Win32 service table of this stage: DLL and function name
+/// (byte-exact) to `int 0x80` service number and stub shape. This single
+/// table backs both the import policy and the stub bytes.
+const WIN32_SERVICES: [(&[u8], &[u8], u32, StubShape); 15] = [
     (
+        b"kernel32.dll",
         b"GetStdHandle",
         syscall::SYS_GET_STD_HANDLE as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"WriteConsoleA",
         syscall::SYS_WRITE_CONSOLE as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"ExitProcess",
         syscall::SYS_EXIT_PROCESS as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"WriteFile",
         syscall::SYS_WRITEFILE as u32,
         StubShape::Args5,
     ),
     (
+        b"kernel32.dll",
         b"GetLastError",
         syscall::SYS_GET_LAST_ERROR as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"SetLastError",
         syscall::SYS_SET_LAST_ERROR as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"ExitThread",
         syscall::SYS_EXIT_THREAD as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"GetCurrentProcessId",
         syscall::SYS_GET_CURRENT_PROCESS_ID as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"GetCurrentThreadId",
         syscall::SYS_GET_CURRENT_THREAD_ID as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"GetTickCount",
         syscall::SYS_GET_TICK_COUNT as u32,
         StubShape::Args4,
     ),
     (
+        b"kernel32.dll",
         b"GetCommandLineA",
         syscall::SYS_GET_COMMAND_LINE as u32,
         StubShape::Args4,
     ),
-    (b"ReadFile", syscall::SYS_READFILE as u32, StubShape::Args5),
+    (
+        b"kernel32.dll",
+        b"ReadFile",
+        syscall::SYS_READFILE as u32,
+        StubShape::Args5,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegOpenKeyExA",
+        syscall::SYS_REG_OPEN_KEY_EX as u32,
+        StubShape::Args5,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegQueryValueExA",
+        syscall::SYS_REG_QUERY_VALUE_EX as u32,
+        StubShape::Args6,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegCloseKey",
+        syscall::SYS_REG_CLOSE_KEY as u32,
+        StubShape::Args4,
+    ),
 ];
 
-fn win32_service(name: &[u8]) -> Option<(u32, StubShape)> {
+fn win32_service(dll: &[u8], name: &[u8]) -> Option<(u32, StubShape)> {
     WIN32_SERVICES
         .iter()
-        .find(|(candidate, _, _)| *candidate == name)
-        .map(|(_, service, shape)| (*service, *shape))
+        .find(|(candidate_dll, candidate_name, _, _)| {
+            *candidate_dll == dll && *candidate_name == name
+        })
+        .map(|(_, _, service, shape)| (*service, *shape))
 }
 
 /// Validated load plan for one PE module: entry RVA, link-time image base and
@@ -248,10 +291,10 @@ pub fn inspect(module: &limine::File) -> Result<Inspection, Reject> {
     // code window (the loader writes through the HHDM, so the section may
     // stay read-only to the user program).
     for import in pe.imports() {
-        if import.dll() != WIN32_DLL {
+        if !WIN32_DLLS.iter().any(|dll| *dll == import.dll()) {
             return Err(Reject::UnknownImportDll);
         }
-        if win32_service(import.name()).is_none() {
+        if win32_service(import.dll(), import.name()).is_none() {
             return Err(Reject::UnknownImportFunction);
         }
         let slot = u64::from(import.iat_rva);
@@ -404,10 +447,13 @@ pub fn map(
         let mut stub_shapes = [StubShape::Args4; MAX_IMPORTS];
         let mut stub_count = 0usize;
         for (slot, import) in image.imports[..image.import_count].iter().enumerate() {
-            match (0..stub_count).find(|&index| image.imports[index].name() == import.name()) {
+            match (0..stub_count).find(|&index| {
+                image.imports[index].dll() == import.dll()
+                    && image.imports[index].name() == import.name()
+            }) {
                 Some(index) => stub_index[slot] = index as u8,
                 None => {
-                    let Some((service, shape)) = win32_service(import.name()) else {
+                    let Some((service, shape)) = win32_service(import.dll(), import.name()) else {
                         rollback(space, &mapped[..mapped_count]);
                         return Err(Reject::UnknownImportFunction);
                     };
@@ -449,10 +495,15 @@ pub fn map(
             let service = stub_services[index];
             let mut stub = [STUB_UNUSED; STUB_STRIDE as usize];
             let mut cursor = 0usize;
-            if stub_shapes[index] == StubShape::Args5 {
+            if stub_shapes[index] == StubShape::Args5 || stub_shapes[index] == StubShape::Args6 {
                 // mov r10, [rsp+0x28]: the fifth integer argument at
                 // function entry (32-byte shadow space + return address).
                 stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x54, 0x24, 0x28]);
+                cursor += 5;
+            }
+            if stub_shapes[index] == StubShape::Args6 {
+                // mov r11, [rsp+0x30]: the sixth integer argument.
+                stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x5C, 0x24, 0x30]);
                 cursor += 5;
             }
             stub[cursor] = 0xB8; // mov eax, imm32
@@ -463,8 +514,9 @@ pub fn map(
             for byte in &mut stub[cursor + 8..] {
                 *byte = 0x90; // nop
             }
-            // SAFETY: `index * STUB_STRIDE + 16` stays inside the one frame
-            // (at most `MAX_IMPORTS * 16` bytes are ever used).
+            // SAFETY: `index * STUB_STRIDE + STUB_STRIDE` stays inside the
+            // one frame (`MAX_IMPORTS * STUB_STRIDE <= COMMAND_LINE_OFFSET`
+            // is a compile-time assertion).
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     stub.as_ptr(),

@@ -1,13 +1,17 @@
 # Windows application compatibility (future)
 
 Status: **not implemented** as application compatibility. Phase 7 stages 1–3
-and Phase 8 stage 2 provide a PE32+ loader and an import mechanism for one
-allowlisted surface: twelve `kernel32.dll`-shaped services (a console surface,
-program basics such as `WriteFile`, per-thread `GetLastError`/`SetLastError`,
-`ExitThread`, `GetTickCount` and `GetCommandLineA`, and a blocking line-mode
-console `ReadFile`) resolved through a genuine import directory and served by
+and Phase 8 stages 2–3 provide a PE32+ loader and an import mechanism for two
+allowlisted DLLs: fifteen `kernel32.dll`/`advapi32.dll`-shaped services (a
+console surface, program basics such as `WriteFile`, per-thread
+`GetLastError`/`SetLastError`,
+`ExitThread`, `GetTickCount` and `GetCommandLineA`, a blocking line-mode
+console `ReadFile`, and a read-only registry surface
+`RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`) resolved through a genuine
+import directory and served by
 the kernel (`docs/WIN32_CONSOLE.md`, `docs/WIN32_PROGRAM.md`,
-`docs/WIN32_INPUT.md`). There is still no NT system-service layer, no real
+`docs/WIN32_INPUT.md`, `docs/WIN32_REGISTRY.md`). There is still no NT
+system-service layer, no real
 DLL loading, no general Win32 implementation and no Windows driver support.
 This document describes the intended architecture and its strict boundaries
 so future work does not silently reintroduce Wine/Proton or translation.
@@ -55,9 +59,9 @@ This is a target diagram, not an assertion that any layer exists.
 
 | Layer | Needs | Status |
 |---|---|---|
-| PE/PE32+ loader | sections, alignments, imports/exports, base relocations, TLS, bounds checks | partial (stages 1–3 + Phase 8 stage 2): PE32+ parsing/loading, W^X mapping, DIR64 relocations, import directory against a twelve-name `kernel32.dll` allowlist, four- and five-argument stubs, loader-owned command line; no exports, forwarders, ordinals, delay imports, TLS/SEH or PE32 |
+| PE/PE32+ loader | sections, alignments, imports/exports, base relocations, TLS, bounds checks | partial (stages 1–3 + Phase 8 stages 2–3): PE32+ parsing/loading, W^X mapping, DIR64 relocations, import directory against a fifteen-name two-DLL `kernel32.dll`+`advapi32.dll` allowlist, four-, five- and six-argument stubs, loader-owned command line; no exports, forwarders, ordinals, delay imports, TLS/SEH or PE32 |
 | Native execution | user/kernel boundary, per-process address spaces, W^X | partial: ring-3 `int 0x80` boundary, per-program address space with teardown, W^X; one user thread at a time, no process model |
-| Win32 runtime | files, console, process/thread, synchronization, registry-like config, memory | not started; only the twelve allowlisted call shapes above exist (console input fd `2` plus console output fd `1`; the kernel `config` store has no Win32 API surface) |
+| Win32 runtime | files, console, process/thread, synchronization, registry-like config, memory | not started; only the fifteen allowlisted call shapes above exist (console input fd `2` plus console output fd `1`; a read-only registry surface over the kernel `config` store) |
 | NT-style services | handles/objects, waitable objects, events/semaphores/mutexes, IPC, tokens/ACLs | not started |
 | GUI layer | window manager, messages, text/font, input, GDI-like drawing | not started |
 | Direct3D/DXGI | device/resources/command submission/fences | not started |
@@ -102,12 +106,15 @@ Running a console program is not GUI, Direct3D or driver compatibility.
   isolation. (Ring-3 execution with our own `int 0x80` syscalls, a kernel
   thread table and a checkpoint VFS exist; none of them are NT-shaped.)
 - PE32+ parsing/loading exists, but not exports, real DLL loading, SEH/TLS,
-  PE32 or imports beyond the twelve-name allowlist.
+  PE32 or imports beyond the fifteen-name two-DLL allowlist.
 - No Win32/COM/DXGI/Direct3D runtime.
-- No Windows registry API: a native registry-like key/value store now exists
-  in the kernel (`docs/CONFIG.md`, `os_core::config`, ADR-0022), but there is
-  no `advapi32`/`HKEY_*` surface, no hives and no typed (DWORD/binary/
-  multi-string) values.
+- No Windows registry API: a native registry-like key/value store exists in
+  the kernel and a read-only registry-shaped surface (`advapi32.dll`
+  `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, four-slot `HKLM` handle
+  table, REG_SZ only; `docs/WIN32_REGISTRY.md`, ADR-0024) reads it, but there
+  are no hives, no write APIs (`RegCreateKeyEx`/`RegSetValueEx`), no
+  enumeration, no ACLs/transactions/redirection, no default values, no other
+  roots and no typed (DWORD/binary/multi-string) values.
 - No audio, printing or installers (networking is a single polled e1000 with
   static addressing, Phase 6).
 - No Windows kernel-driver environment.

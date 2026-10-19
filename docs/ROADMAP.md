@@ -13,7 +13,7 @@ were run and observed. No dates or completion percentages are implied.
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
-| 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–2, 2026-10-19)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, and a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023); larger Win32 surface, GUI and the compatibility matrix not started |
+| 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–3, 2026-10-19)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), and a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024); larger Win32 surface, GUI and the compatibility matrix not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
@@ -274,6 +274,30 @@ unit tests). Limits: line mode with echo only; no `ReadConsole`,
 Unicode/W variants, redirected stdin, overlapped/async I/O or multiple
 readers; CRLF inclusion is a project contract, not vendor-verified
 (`docs/WIN32_INPUT.md` §1/§7). No compatibility claim is made.
+
+## Phase 8 stage 3 (2026-10-19): Win32 registry read surface (`advapi32.dll`)
+
+Implemented and verified: the import allowlist becomes two DLLs
+(`kernel32.dll` + `advapi32.dll`, fifteen names) and services 15–17
+(`RegOpenKeyExA`, `RegQueryValueExA` with the first six-argument stub
+forwarding `lpcbData` through `r11`, `RegCloseKey`) serve a case-insensitive,
+read-only registry-shaped view over the config store: `HKLM` is the only root,
+a key is a store prefix with children, a value is one store entry as
+`bytes + NUL` REG_SZ, and a four-slot handle table (`0x1000 + slot`) returns
+the documented error values (2/4/6/87/234) without killing the thread
+(`docs/WIN32_REGISTRY.md`, ADR-0024, R-017). The `pereg.exe` fixture ships
+only on `artifacts/project-os-registry.iso` (`make_iso.sh --registry-fixture`);
+default ISOs, module counts and markers are unchanged. Evidence:
+`scripts/test_registry_qemu.sh` PASS (session log 10,420 bytes, sha256
+`02180701…`; handles 4096–4099, size query 11, `ERROR_MORE_DATA`,
+`"PROJECT_OS"`/`"classic"` reads, double close, slot reuse, 33-byte summary,
+QEMU exit 33), `pe`/`input`/shell/persistence/boot regressions unchanged,
+`scripts/test_all.sh` PASS=24 FAIL=0 SKIP=4 (269 host unit tests, build id
+`0.1.0-b1b8542c`). Limits: read-only; no hives, ACLs, transactions,
+redirection, enumeration, write APIs, default/unnamed values, per-user or
+class namespaces, typed values beyond REG_SZ, `W`/Unicode variants or remote
+registry; four concurrent handles and always-NUL-terminated values are
+project contracts, not vendor-verified. No compatibility claim is made.
 
 ## Phase 8 acceptance (planned)
 

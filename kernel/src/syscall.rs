@@ -1,12 +1,14 @@
 //! The ring-3 syscall boundary (`int 0x80`) and user-fault handling (Phase 5b;
-//! Win32 console services Phase 7, stages 2–3).
+//! Win32 console services Phase 7, stages 2–3; Phase 8, stages 2–3).
 //!
 //! ABI (Windows-style argument registers chosen so the later PE compatibility
 //! layer can reuse the same gate):
 //!
 //! * `rax` — service number
 //! * `rcx`, `rdx`, `r8`, `r9` — arguments
-//! * `r10` — fifth argument (`WriteFile`'s `lpOverlapped`)
+//! * `r10` — fifth argument (`WriteFile`'s `lpOverlapped`,
+//!   `RegQueryValueExA`'s `lpData`)
+//! * `r11` — sixth argument (`RegQueryValueExA`'s `lpcbData`)
 //! * `rax` — return value / status after the call
 //!
 //! Services:
@@ -36,6 +38,18 @@
 //!   wrapping 32-bit value, 10 ms resolution).
 //! * `13 GetCommandLineA()` → the loader-owned NUL-terminated module path
 //!   in the stub page tail.
+//! * `14 ReadFile(rcx = handle, rdx = buffer, r8 = length, r9 = read,
+//!   r10 = overlapped)` → `1`/`0`; native `kernel32!ReadFile` for the console
+//!   input handle (blocking line mode, `docs/WIN32_INPUT.md`).
+//! * `15 RegOpenKeyExA(rcx = hKey, rdx = subkey, r8 = options,
+//!   r9 = samDesired, r10 = result)` → `0`/WinError; native
+//!   `advapi32!RegOpenKeyExA` over the config store (`docs/WIN32_REGISTRY.md`).
+//! * `16 RegQueryValueExA(rcx = hKey, rdx = value name, r8 = reserved,
+//!   r9 = type, r10 = data, r11 = size)` → `0`/WinError; native
+//!   `advapi32!RegQueryValueExA` (REG_SZ reads, size queries,
+//!   `ERROR_MORE_DATA`).
+//! * `17 RegCloseKey(rcx = hKey)` → `0`/`6`; native `advapi32!RegCloseKey`
+//!   over the four-slot key-handle table.
 //!
 //! Every user pointer is validated against the live page tables before the
 //! kernel reads it (mapped, user-accessible, canonical, bounded span). A
@@ -45,10 +59,14 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::arch::x86_64::idt::InterruptFrame;
 use crate::arch::x86_64::{halt, interrupts_enable, read_cr2};
 use crate::console;
 use crate::pe_loader::COMMAND_LINE_VA;
+use crate::registry;
 use crate::sched;
 use crate::serial;
 use crate::vm;
@@ -67,6 +85,9 @@ pub const SYS_GET_CURRENT_THREAD_ID: u64 = 11;
 pub const SYS_GET_TICK_COUNT: u64 = 12;
 pub const SYS_GET_COMMAND_LINE: u64 = 13;
 pub const SYS_READFILE: u64 = 14;
+pub const SYS_REG_OPEN_KEY_EX: u64 = 15;
+pub const SYS_REG_QUERY_VALUE_EX: u64 = 16;
+pub const SYS_REG_CLOSE_KEY: u64 = 17;
 
 /// Maximum accepted console write, small enough to bound the kernel copy.
 pub const MAX_WRITE: u64 = 4096;
@@ -85,6 +106,16 @@ const INPUT_HANDLE: u64 = 2;
 const ERROR_INVALID_HANDLE: u32 = 6;
 /// WinError.h `ERROR_INVALID_PARAMETER`.
 const ERROR_INVALID_PARAMETER: u32 = 87;
+/// WinError.h `ERROR_FILE_NOT_FOUND`.
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+/// WinError.h `ERROR_TOO_MANY_OPEN_FILES`.
+const ERROR_TOO_MANY_OPEN_FILES: u32 = 4;
+/// WinError.h `ERROR_MORE_DATA`.
+const ERROR_MORE_DATA: u32 = 234;
+/// Registry value type `REG_SZ`; every value in this stage has this type.
+const REG_SZ: u32 = 1;
+/// Maximum registry subkey or value-name length including the NUL.
+const MAX_REG_NAME: usize = 128;
 
 /// Highest address the kernel accepts from user space (canonical user half:
 /// PML4 entries 0..256).
@@ -121,6 +152,12 @@ pub static WIN32_GET_TICK_COUNT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static WIN32_GET_COMMAND_LINE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// `SYS_READFILE` calls (successful and failing alike).
 pub static WIN32_READFILE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_OPEN_KEY_EX` calls (successful and failing alike).
+pub static WIN32_REG_OPEN_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_QUERY_VALUE_EX` calls (successful and failing alike).
+pub static WIN32_REG_QUERY_VALUE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_CLOSE_KEY` calls (successful and failing alike).
+pub static WIN32_REG_CLOSE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Faults taken from CPL3 and isolated (thread killed, kernel alive).
 pub static USER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Repeated `int 0x80` calls made with an invalid pointer or bad service.
@@ -148,6 +185,9 @@ pub fn dispatch(frame: &mut InterruptFrame) {
         SYS_GET_TICK_COUNT => get_tick_count(frame),
         SYS_GET_COMMAND_LINE => get_command_line(frame),
         SYS_READFILE => read_file(frame),
+        SYS_REG_OPEN_KEY_EX => reg_open_key_ex(frame),
+        SYS_REG_QUERY_VALUE_EX => reg_query_value_ex(frame),
+        SYS_REG_CLOSE_KEY => reg_close_key(frame),
         _ => {
             REJECTED_SYSCALLS.fetch_add(1, Ordering::SeqCst);
             serial::force_print(format_args!(
@@ -412,6 +452,362 @@ fn read_file(frame: &mut InterruptFrame) {
         length, count
     ));
     frame.rax = 1;
+}
+
+/// Registry handle rendering for serial lines: `HKLM` as `0x80000002`, slot
+/// handles as plain decimal.
+struct RegHandle(u64);
+
+impl core::fmt::Display for RegHandle {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == registry::HKEY_LOCAL_MACHINE {
+            formatter.write_str("0x80000002")
+        } else {
+            write!(formatter, "{}", self.0)
+        }
+    }
+}
+
+fn reg_error_label(code: u32) -> &'static str {
+    match code {
+        ERROR_FILE_NOT_FOUND => "file not found",
+        ERROR_TOO_MANY_OPEN_FILES => "too many open keys",
+        ERROR_INVALID_HANDLE => "invalid handle",
+        _ => "invalid parameter",
+    }
+}
+
+/// `15 RegOpenKeyExA`: native `advapi32!RegOpenKeyExA` over the config store.
+/// `*phkResult` is zeroed before any work (our contract for failed opens).
+/// Documented argument errors return the WinError value and set the
+/// thread's last-error without killing it; unmapped pointers kill.
+fn reg_open_key_ex(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    let subkey_pointer = frame.rdx;
+    let options = frame.r8;
+    let result_pointer = frame.r10;
+    WIN32_REG_OPEN_KEY_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    let Some(cell) = validated_out_pointer_u64(
+        frame,
+        result_pointer,
+        "RegOpenKeyExA out-pointer is not mapped",
+    ) else {
+        return;
+    };
+    // SAFETY: the out-pointer was validated as a mapped user page with 8
+    // bytes available; the store goes through the HHDM.
+    unsafe { core::ptr::write_volatile(cell, 0) };
+
+    let subkey = match read_user_string(frame, subkey_pointer) {
+        Ok(subkey) => subkey,
+        Err(()) => {
+            reg_open_key_fail(frame, hkey, "<invalid>", ERROR_INVALID_PARAMETER);
+            return;
+        }
+    };
+
+    if options != 0 {
+        reg_open_key_fail(frame, hkey, &subkey, ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    match registry::open(hkey, &subkey) {
+        Ok(handle) => {
+            // SAFETY: the out-pointer was validated earlier in this call.
+            unsafe { core::ptr::write_volatile(cell, handle) };
+            serial::force_print(format_args!(
+                "win32: RegOpenKeyExA({:#x}, \"{}\") -> 0 (handle {})\r\n",
+                hkey,
+                subkey,
+                RegHandle(handle)
+            ));
+            frame.rax = 0;
+        }
+        Err(error) => {
+            let code = match error {
+                registry::KeyError::InvalidHandle => ERROR_INVALID_HANDLE,
+                registry::KeyError::NotFound => ERROR_FILE_NOT_FOUND,
+                registry::KeyError::TooManyKeys => ERROR_TOO_MANY_OPEN_FILES,
+            };
+            reg_open_key_fail(frame, hkey, &subkey, code);
+        }
+    }
+}
+
+fn reg_open_key_fail(frame: &mut InterruptFrame, hkey: u64, subkey: &str, code: u32) {
+    sched::set_current_last_error(code);
+    serial::force_print(format_args!(
+        "win32: RegOpenKeyExA({:#x}, \"{}\") -> {} ({})\r\n",
+        hkey,
+        subkey,
+        code,
+        reg_error_label(code)
+    ));
+    frame.rax = u64::from(code);
+}
+
+/// `16 RegQueryValueExA`: native `advapi32!RegQueryValueExA` over the config
+/// store. Values are REG_SZ by construction (`bytes + NUL`); a NULL-data
+/// query returns the required size, a short buffer returns
+/// `ERROR_MORE_DATA` plus the required size. `*lpType` is filled whenever
+/// the value exists and the pointer is non-NULL.
+fn reg_query_value_ex(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    let name_pointer = frame.rdx;
+    let reserved = frame.r8;
+    let type_pointer = frame.r9;
+    let data_pointer = frame.r10;
+    let size_pointer = frame.r11;
+    WIN32_REG_QUERY_VALUE_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    let name = match read_user_string(frame, name_pointer) {
+        Ok(name) => name,
+        Err(()) => {
+            reg_query_value_fail(frame, hkey, "<invalid>", ERROR_INVALID_PARAMETER);
+            return;
+        }
+    };
+    if name.is_empty() {
+        // The unnamed/default value is not modeled.
+        reg_query_value_fail(frame, hkey, "", ERROR_FILE_NOT_FOUND);
+        return;
+    }
+    if reserved != 0 || size_pointer == 0 {
+        reg_query_value_fail(frame, hkey, &name, ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    let Some(size_cell) = validated_out_pointer(
+        frame,
+        size_pointer,
+        "RegQueryValueExA size pointer is not mapped",
+    ) else {
+        return;
+    };
+    // SAFETY: the size pointer was validated as a mapped user page with 4
+    // bytes available; the read goes through the HHDM.
+    let capacity = unsafe { core::ptr::read_volatile(size_cell) };
+
+    let value = match registry::value(hkey, &name) {
+        Ok(value) => value,
+        Err(registry::KeyError::InvalidHandle) => {
+            reg_query_value_fail(frame, hkey, &name, ERROR_INVALID_HANDLE);
+            return;
+        }
+        Err(_) => {
+            // `NotFound`; `TooManyKeys` cannot occur (no slot is allocated).
+            reg_query_value_fail(frame, hkey, &name, ERROR_FILE_NOT_FOUND);
+            return;
+        }
+    };
+    // REG_SZ data includes the terminating NUL.
+    let required = value.len() as u32 + 1;
+
+    if type_pointer != 0 {
+        let Some(type_cell) = validated_out_pointer(
+            frame,
+            type_pointer,
+            "RegQueryValueExA type pointer is not mapped",
+        ) else {
+            return;
+        };
+        // SAFETY: the type pointer was validated as a mapped user page with
+        // 4 bytes available; the store goes through the HHDM.
+        unsafe { core::ptr::write_volatile(type_cell, REG_SZ) };
+    }
+
+    if data_pointer == 0 {
+        // SAFETY: the size pointer was validated earlier in this call.
+        unsafe { core::ptr::write_volatile(size_cell, required) };
+        serial::force_print(format_args!(
+            "win32: RegQueryValueExA({}, \"{}\") -> 0 (REG_SZ, {} bytes)\r\n",
+            RegHandle(hkey),
+            name,
+            required
+        ));
+        frame.rax = 0;
+        return;
+    }
+    if capacity < required {
+        // SAFETY: the size pointer was validated earlier in this call.
+        unsafe { core::ptr::write_volatile(size_cell, required) };
+        serial::force_print(format_args!(
+            "win32: RegQueryValueExA({}, \"{}\") -> {} (more data, {} bytes needed)\r\n",
+            RegHandle(hkey),
+            name,
+            ERROR_MORE_DATA,
+            required
+        ));
+        frame.rax = u64::from(ERROR_MORE_DATA);
+        return;
+    }
+    if !write_user_bytes(frame, data_pointer, value.as_bytes())
+        || !write_user_bytes(frame, data_pointer + value.len() as u64, &[0])
+    {
+        return;
+    }
+    // SAFETY: the size pointer was validated earlier in this call.
+    unsafe { core::ptr::write_volatile(size_cell, required) };
+    serial::force_print(format_args!(
+        "win32: RegQueryValueExA({}, \"{}\") -> 0 (REG_SZ, {} bytes) \"{}\"\r\n",
+        RegHandle(hkey),
+        name,
+        required,
+        value
+    ));
+    frame.rax = 0;
+}
+
+fn reg_query_value_fail(frame: &mut InterruptFrame, hkey: u64, name: &str, code: u32) {
+    sched::set_current_last_error(code);
+    serial::force_print(format_args!(
+        "win32: RegQueryValueExA({}, \"{}\") -> {} ({})\r\n",
+        RegHandle(hkey),
+        name,
+        code,
+        reg_error_label(code)
+    ));
+    frame.rax = u64::from(code);
+}
+
+/// `17 RegCloseKey`: native `advapi32!RegCloseKey` over the four-slot key
+/// table. `HKLM` closes as a no-op; an already-closed handle stays invalid.
+fn reg_close_key(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    WIN32_REG_CLOSE_KEY_CALLS.fetch_add(1, Ordering::SeqCst);
+    match registry::close(hkey) {
+        Ok(()) => {
+            serial::force_print(format_args!(
+                "win32: RegCloseKey({}) -> 0\r\n",
+                RegHandle(hkey)
+            ));
+            frame.rax = 0;
+        }
+        Err(_) => {
+            sched::set_current_last_error(ERROR_INVALID_HANDLE);
+            serial::force_print(format_args!(
+                "win32: RegCloseKey({}) -> {} (invalid handle)\r\n",
+                RegHandle(hkey),
+                ERROR_INVALID_HANDLE
+            ));
+            frame.rax = u64::from(ERROR_INVALID_HANDLE);
+        }
+    }
+}
+
+/// Read a NUL-terminated user string (at most [`MAX_REG_NAME`] bytes
+/// including the terminator) through the live page tables. A NULL pointer is
+/// the empty string; an unmapped page kills the thread; a mapped span with
+/// no terminator or with invalid UTF-8 is an argument error (`Err(())`).
+fn read_user_string(frame: &InterruptFrame, pointer: u64) -> Result<String, ()> {
+    if pointer == 0 {
+        return Ok(String::new());
+    }
+    if !(0x1000..USER_LIMIT).contains(&pointer) {
+        kill(
+            frame,
+            "registry string pointer is outside the user address space",
+        );
+        return Err(());
+    }
+    let Some(hhdm) = vm::hhdm_offset() else {
+        kill(frame, "HHDM offset is unknown");
+        return Err(());
+    };
+    let mut bytes = Vec::new();
+    for offset in 0..MAX_REG_NAME as u64 {
+        let address = pointer + offset;
+        let physical = match vm::translate_live(address) {
+            Some((physical, flags)) if flags & os_core::paging::USER != 0 => physical,
+            _ => {
+                kill(frame, "registry string is not mapped for user access");
+                return Err(());
+            }
+        };
+        let Some(cell) = hhdm.checked_add(physical) else {
+            kill(frame, "registry string HHDM overflow");
+            return Err(());
+        };
+        // SAFETY: the page is mapped user-accessible in the live address
+        // space; the kernel reads it through the HHDM.
+        let byte = unsafe { core::ptr::read_volatile(cell as *const u8) };
+        if byte == 0 {
+            return core::str::from_utf8(&bytes)
+                .map(String::from)
+                .map_err(|_| ());
+        }
+        bytes.push(byte);
+    }
+    Err(())
+}
+
+/// Write `bytes` to a user buffer through the HHDM after proving the span is
+/// inside the user half and every touched page is mapped user-accessible;
+/// any violation kills the thread. Returns false when the caller must stop.
+fn write_user_bytes(frame: &InterruptFrame, pointer: u64, bytes: &[u8]) -> bool {
+    let Some(end) = pointer.checked_add(bytes.len() as u64) else {
+        kill(frame, "registry buffer overflows the address space");
+        return false;
+    };
+    if pointer < 0x1000 || end > USER_LIMIT {
+        kill(frame, "registry buffer is outside the user address space");
+        return false;
+    }
+    let Some(hhdm) = vm::hhdm_offset() else {
+        kill(frame, "HHDM offset is unknown");
+        return false;
+    };
+    for (offset, byte) in bytes.iter().copied().enumerate() {
+        let address = pointer + offset as u64;
+        let physical = match vm::translate_live(address) {
+            Some((physical, flags)) if flags & os_core::paging::USER != 0 => physical,
+            _ => {
+                kill(frame, "registry buffer is not mapped for user access");
+                return false;
+            }
+        };
+        let Some(cell) = hhdm.checked_add(physical) else {
+            kill(frame, "registry buffer HHDM overflow");
+            return false;
+        };
+        // SAFETY: the page is mapped user-accessible in the live address
+        // space; the kernel writes it through the HHDM.
+        unsafe { core::ptr::write_volatile(cell as *mut u8, byte) };
+    }
+    true
+}
+
+/// Like [`validated_out_pointer`] for 8-byte handle out-parameters.
+fn validated_out_pointer_u64(
+    frame: &InterruptFrame,
+    pointer: u64,
+    reason: &'static str,
+) -> Option<*mut u64> {
+    let Some(hhdm) = vm::hhdm_offset() else {
+        kill(frame, reason);
+        return None;
+    };
+    if pointer < 0x1000
+        || pointer.checked_add(8).is_none_or(|end| end > USER_LIMIT)
+        || pointer % 4096 > 4088
+    {
+        kill(frame, reason);
+        return None;
+    }
+    let Some((physical, flags)) = vm::translate_live(pointer) else {
+        kill(frame, reason);
+        return None;
+    };
+    if flags & os_core::paging::USER == 0 {
+        kill(frame, reason);
+        return None;
+    }
+    let Some(cell) = hhdm.checked_add(physical) else {
+        kill(frame, reason);
+        return None;
+    };
+    Some(cell as *mut u64)
 }
 
 /// `7 GetLastError`: the calling thread's last-error value.

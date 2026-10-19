@@ -27,6 +27,7 @@ mod panic;
 mod pci;
 mod pe_loader;
 mod persist;
+mod registry;
 mod sched;
 mod serial;
 mod shell;

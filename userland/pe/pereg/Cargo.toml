@@ -1,0 +1,11 @@
+[package]
+name = "pereg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PROJECT_OS PE32+ Win32 registry-read fixture (raw-dylib RegOpenKeyExA/RegQueryValueExA/RegCloseKey)"
+
+[[bin]]
+name = "pereg"
+path = "src/main.rs"

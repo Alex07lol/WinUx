@@ -13,10 +13,11 @@ section and do not cross a page boundary.
 
 Usage: check_user_pe.py <file> [--imports <spec>]
   --imports -             the import directory must be empty (default)
-  --imports dll:fn,fn,... every import must be by name, from that exact DLL,
-                          with that exact function-name set (order-insensitive);
-                          ILT entries must be ordinal-free, and each IAT slot
-                          must sit inside a readable section inside the window.
+  --imports dll:fn,fn[;dll:fn,fn]  every import must be by name, from exactly
+                          those DLLs, with exactly that function-name set per
+                          DLL (order-insensitive); ILT entries must be
+                          ordinal-free, and each IAT slot must sit inside a
+                          readable section inside the window.
 
 Exit status: 0 on pass (prints a one-line summary), 1 on any violation.
 """
@@ -61,15 +62,18 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
-def parse_import_spec(spec: str) -> tuple[str, list[str]] | None:
+def parse_import_spec(spec: str) -> list[tuple[str, list[str]]] | None:
     if spec == "-":
         return None
-    if ":" not in spec:
-        fail(f"bad --imports spec (expected dll:fn,fn,...): {spec}")
-    dll, functions = spec.split(":", 1)
-    if not dll or not functions:
-        fail(f"bad --imports spec (expected dll:fn,fn,...): {spec}")
-    return dll, functions.split(",")
+    groups = []
+    for group in spec.split(";"):
+        if ":" not in group:
+            fail(f"bad --imports spec (expected dll:fn,fn,...[;dll:fn,...]): {spec}")
+        dll, functions = group.split(":", 1)
+        if not dll or not functions:
+            fail(f"bad --imports spec (expected dll:fn,fn,...[;dll:fn,...]): {spec}")
+        groups.append((dll, functions.split(",")))
+    return groups
 
 
 def main() -> None:
@@ -220,14 +224,15 @@ def main() -> None:
             fail("unterminated string in import data")
         return image[start:end].decode("ascii", "replace")
 
-    imported_dll = None
-    imported_functions: list[str] = []
+    imported: dict[str, list[str]] = {}
     (import_rva, import_size) = directory(DIR_IMPORT)
     if expected_imports is None:
         if (import_rva, import_size) != (0, 0):
             fail("import directory is not empty")
     else:
-        expected_dll, expected_functions = expected_imports
+        expected_dlls = dict(expected_imports)
+        if len(expected_dlls) != len(expected_imports):
+            fail("duplicate dll in --imports spec")
         if (
             import_rva == 0
             or import_size < IMPORT_DESCRIPTOR_SIZE
@@ -252,56 +257,67 @@ def main() -> None:
             cursor += IMPORT_DESCRIPTOR_SIZE
         else:
             fail("import descriptor table has no terminator")
-        if len(descriptors) != 1:
-            fail(f"expected exactly one import descriptor, found {len(descriptors)}")
-        (ilt_rva, _timestamp, _forwarder, name_rva, iat_rva) = descriptors[0]
-        if ilt_rva == 0:
-            fail("import descriptor has no lookup table (OriginalFirstThunk = 0)")
-        name_section = section_for_rva(name_rva)
-        if name_section is None or not name_section["raw_size"]:
-            fail("dll name outside section raw data")
-        imported_dll = read_c_string(
-            name_section["raw_offset"] + (name_rva - name_section["va"]),
-            name_section["raw_offset"] + name_section["raw_size"],
-        )
-        if imported_dll != expected_dll:
-            fail(f"import dll {imported_dll!r} != expected {expected_dll!r}")
-        ilt_section = section_for_rva(ilt_rva)
-        if ilt_section is None or not ilt_section["raw_size"]:
-            fail("ILT outside section raw data")
-        index = 0
-        while True:
-            relative = ilt_rva + index * 8 - ilt_section["va"]
-            if relative < 0 or relative + 8 > ilt_section["raw_size"]:
-                fail("ILT is not terminated inside its section raw data")
-            (thunk,) = struct.unpack_from("<Q", image, ilt_section["raw_offset"] + relative)
-            if thunk == 0:
-                break
-            if thunk & ORDINAL_FLAG64:
-                fail(f"import by ordinal (index {index})")
-            hint_name_rva = thunk & 0x7FFFFFFF
-            entry_section = section_for_rva(hint_name_rva)
-            if entry_section is None or not entry_section["raw_size"]:
-                fail(f"import name {index} outside section raw data")
-            entry_offset = entry_section["raw_offset"] + (hint_name_rva - entry_section["va"])
-            imported_functions.append(
-                read_c_string(entry_offset + 2, entry_section["raw_offset"] + entry_section["raw_size"])
+        if len(descriptors) != len(expected_imports):
+            fail(f"expected {len(expected_imports)} import descriptors, found {len(descriptors)}")
+        for (ilt_rva, _timestamp, _forwarder, name_rva, iat_rva) in descriptors:
+            if ilt_rva == 0:
+                fail("import descriptor has no lookup table (OriginalFirstThunk = 0)")
+            name_section = section_for_rva(name_rva)
+            if name_section is None or not name_section["raw_size"]:
+                fail("dll name outside section raw data")
+            dll = read_c_string(
+                name_section["raw_offset"] + (name_rva - name_section["va"]),
+                name_section["raw_offset"] + name_section["raw_size"],
             )
-            slot_rva = iat_rva + index * 8
-            slot_section = section_for_rva(slot_rva)
-            if (
-                slot_section is None
-                or not slot_section["chars"] & IMAGE_SCN_MEM_READ
-                or slot_rva % PAGE_SIZE + 8 > PAGE_SIZE
-                or CODE_BASE + slot_rva + 8 > CODE_END
-            ):
-                fail(f"IAT slot {index} ({slot_rva:#x}) is not patchable inside a readable section")
-            index += 1
-        if sorted(imported_functions) != sorted(expected_functions):
-            fail(
-                f"import function set {sorted(imported_functions)} "
-                f"!= expected {sorted(expected_functions)}"
-            )
+            if dll not in expected_dlls:
+                fail(f"unexpected import dll {dll!r}")
+            if dll in imported:
+                fail(f"duplicate import descriptor for {dll!r}")
+            ilt_section = section_for_rva(ilt_rva)
+            if ilt_section is None or not ilt_section["raw_size"]:
+                fail("ILT outside section raw data")
+            functions: list[str] = []
+            index = 0
+            while True:
+                relative = ilt_rva + index * 8 - ilt_section["va"]
+                if relative < 0 or relative + 8 > ilt_section["raw_size"]:
+                    fail("ILT is not terminated inside its section raw data")
+                (thunk,) = struct.unpack_from("<Q", image, ilt_section["raw_offset"] + relative)
+                if thunk == 0:
+                    break
+                if thunk & ORDINAL_FLAG64:
+                    fail(f"import by ordinal (index {index})")
+                hint_name_rva = thunk & 0x7FFFFFFF
+                entry_section = section_for_rva(hint_name_rva)
+                if entry_section is None or not entry_section["raw_size"]:
+                    fail(f"import name {index} outside section raw data")
+                entry_offset = entry_section["raw_offset"] + (hint_name_rva - entry_section["va"])
+                functions.append(
+                    read_c_string(
+                        entry_offset + 2, entry_section["raw_offset"] + entry_section["raw_size"]
+                    )
+                )
+                slot_rva = iat_rva + index * 8
+                slot_section = section_for_rva(slot_rva)
+                if (
+                    slot_section is None
+                    or not slot_section["chars"] & IMAGE_SCN_MEM_READ
+                    or slot_rva % PAGE_SIZE + 8 > PAGE_SIZE
+                    or CODE_BASE + slot_rva + 8 > CODE_END
+                ):
+                    fail(
+                        f"IAT slot {index} ({slot_rva:#x}) is not patchable inside a readable section"
+                    )
+                index += 1
+            imported[dll] = functions
+        for dll, functions in expected_dlls.items():
+            if dll not in imported:
+                fail(f"missing import descriptor for {dll!r}")
+            if sorted(imported[dll]) != sorted(functions):
+                fail(
+                    f"{dll} import function set {sorted(imported[dll])} "
+                    f"!= expected {sorted(functions)}"
+                )
 
     if characteristics & IMAGE_FILE_RELOCS_STRIPPED:
         fail("relocations stripped")
@@ -338,8 +354,10 @@ def main() -> None:
                 relocations.append(target)
             offset += block_size
 
-    if imported_functions:
-        imports_summary = f"{imported_dll}:{','.join(sorted(imported_functions))}"
+    if imported:
+        imports_summary = ";".join(
+            f"{dll}:{','.join(sorted(functions))}" for dll, functions in sorted(imported.items())
+        )
     else:
         imports_summary = "none"
     print(

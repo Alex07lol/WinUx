@@ -30,15 +30,15 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 
 | Command | Proves | Recorded result |
 |---|---|---|
-| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 23 PASS, 0 FAIL, 4 SKIP |
+| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 24 PASS, 0 FAIL, 4 SKIP |
 | `scripts/bootstrap.sh` | required tools and Rust targets (incl. `x86_64-pc-windows-msvc` and `rust-lld`) exist | PASS |
 | `scripts/format.sh` | `rustfmt --check` clean (kernel workspace, userland, `userland/pe`) | PASS |
 | `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland, `userland/pe` | PASS |
 | `scripts/test_unit.sh` | 269 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), configuration store codec (POCF incl. all rejection vectors), ELF64 parser incl. all rejection vectors, PE32+ parser incl. all rejection vectors, relocation walk and import directory (descriptors, ILT/IAT fallback, names, ordinals, caps), PCI config/BAR math, Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (269/269) |
 | `scripts/build.sh` | kernel builds; ELF entry and Limine requests verified | PASS |
 | `scripts/build_user.sh` | userland workspace builds; `hello`/`fault` pass the header checker; `bad.elf` fails with `bad magic` | PASS |
-| `scripts/build_user_pe.sh` | `userland/pe` builds via rust-lld; `pehello.exe`/`peconsole.exe`/`pebasics.exe`/`peinput.exe` (Phase 8 stage 2, `ReadFile` imports) pass `check_user_pe.py` (imports included); `pebad.exe` fails with `bad signature`; the `pebadimp`/`pebadfn`/`pebadfn2` mutants patch a unique byte pattern each and stay structurally valid | PASS (8 artifacts) |
-| `scripts/make_iso.sh` | ISO built (kernel + three ELF modules + seven PE modules); both El Torito entries verified; `--input-fixture` variant adds `peinput.exe` as an eighth PE module (`project-os-input.iso`) | PASS |
+| `scripts/build_user_pe.sh` | `userland/pe` builds via rust-lld; `pehello.exe`/`peconsole.exe`/`pebasics.exe`/`peinput.exe` (Phase 8 stage 2, `ReadFile` imports) and `pereg.exe` (Phase 8 stage 3, `advapi32.dll`+`kernel32.dll` imports) pass `check_user_pe.py` (imports included); `pebad.exe` fails with `bad signature`; the `pebadimp`/`pebadfn`/`pebadfn2` mutants patch a unique byte pattern each and stay structurally valid | PASS (9 artifacts) |
+| `scripts/make_iso.sh` | ISO built (kernel + three ELF modules + seven PE modules); both El Torito entries verified; `--input-fixture` variant adds `peinput.exe` as an eighth PE module (`project-os-input.iso`); `--registry-fixture` adds `pereg.exe` instead (`project-os-registry.iso`) | PASS |
 | `scripts/test_boot_qemu.sh` | BIOS boot at 256 MiB, 512 MiB and 1 GiB; marker; no panic; debug-exit 33 | PASS (all three) |
 | `scripts/test_boot_qemu.sh --firmware uefi` | UEFI boot | SKIP (no `OVMF_FD`) |
 | `scripts/test_elf_qemu.sh` | ELF64 module self-test: 3 modules present, ring-3 greeting from the ELF, exit 0, one isolated fault, `bad.elf` rejected, `,elf` marker | PASS |
@@ -47,6 +47,7 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_vfs.sh` | host path tests + in-VM VFS self-test | PASS (both) |
 | `scripts/test_shell_qemu.sh` | scripted interactive shell session over a paced TCP serial chardev | PASS (25 commands) |
 | `scripts/test_input_qemu.sh` | Win32 console-input self-test (Phase 8 stage 2, `project-os-input.iso`): `pe: peinput.exe loaded ... 5 sections, 1 relocation applied`, `GetStdHandle(-10) -> 2`, `ReadFile(1) -> 0` + `GetLastError() -> 6`, overlapped read `-> 0 (invalid parameter)` + `GetLastError() -> 87`, `ReadFile(2, 64 bytes) waiting for input`, harness line echoed and played back, `ReadFile(2, 64 bytes) -> 1 (14 bytes)`, `input surface verified`, `win32 input selftest: passed`, marker `win32,vfs`, QEMU exit 33 | PASS |
+| `scripts/test_registry_qemu.sh` | Win32 registry read-surface self-test (Phase 8 stage 3, `project-os-registry.iso`): `pe: pereg.exe loaded ... 5 sections, 1 relocation applied`, `RegOpenKeyExA(0x1, "System") -> 6`, `-> 87` (nonzero options), `-> 2` (missing key), handles 4096–4099 with slot reuse after close, `-> 4 (too many open keys)`, size query `-> 0 (REG_SZ, 11 bytes)`, `-> 234 (more data, 11 bytes needed)`, `"PROJECT_OS"` and `"classic"` full reads, NULL-subkey → `0x80000002`, `RegCloseKey` 0/6, `registry surface verified` (33 bytes), `win32 registry selftest: passed`, marker `win32,vfs`, QEMU exit 33 | PASS |
 | `scripts/test_console_qemu.sh` | framebuffer console: pinned `fbcon:` lines, selftest, shell output mirror and a validated QEMU screendump | PASS (106x50 at scale 2; screendump matches) |
 | `scripts/test_persistence_qemu.sh` | four-boot durability on a raw 8 MiB disk (format/save, reboot load, CRC fallback incl. configuration rollback, fresh format with defaults reseeded) | PASS (4 boots) |
 | `scripts/test_net_qemu.sh` | e1000 end-to-end on q35 with a pinned `model=e1000` slirp NIC: pinned `net:` lines, `,net` marker, `net` counters, `ping 10.0.2.2 -c 3` (3/3), host-forwarded 19-byte UDP echo round trip | PASS (reproduced twice) |

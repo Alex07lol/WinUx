@@ -1069,3 +1069,94 @@ ordinary data to this model (Ctrl+C is ignored as a control byte, Ctrl+Z is
 not EOF); there is one reader and one console. Those limits must be restated
 whenever this stage is cited.
 
+## ADR-0024 – A read-only registry-shaped view over the config store (Phase 8, stage 3)
+
+**Context.** Phase 8 stage 1 added the config store; stages 2–3 added console
+output, program basics and blocking input — all resolved against a single
+`kernel32.dll` allowlist. The next Win32-shaped capability that a program
+needs before anything GUI-like is configuration data, which on Windows is the
+registry. Building a real registry (hives, ACLs, transactions) is far beyond
+this stage; building nothing would leave the config store unusable from ring
+3. The full contract (argument order, pinned serial lines, fixture sequence,
+call deltas) lives in `docs/WIN32_REGISTRY.md`; primary sources are in R-017.
+
+**Decision.**
+
+- **Registry-shaped read-only view over the existing store.** `HKLM` is the
+  only backed root; a "key" is a path prefix with children in the store, a
+  "value" is one store entry mapped to REG_SZ. No new storage, no format
+  change, no write path. Rejected alternatives: a new in-memory registry
+  namespace (duplicates the store and invents persistence), real hives
+  (documented multi-month scope), write APIs first (a read surface is the
+  smaller honest step and proves the second-DLL machinery).
+- **A second DLL, byte-exact.** The allowlist becomes
+  `kernel32.dll` + `advapi32.dll` with fifteen names; the three `Reg*`
+  functions map to services 15–17. Rejected: exporting `Reg*` from
+  `kernel32.dll` (contradicts the fetched requirements table) and a generic
+  "any DLL" policy (destroys the allowlist property the loader tests prove).
+- **First six-argument stub (`Args6`).** `RegQueryValueExA` needs the sixth
+  integer argument; the stub forwards it through `r11` (`mov r11,
+  [rsp+0x30]`), which `isr_common` already saves, so the entry stub is
+  untouched; the fixed stride grows 16 → 24 bytes with a compile-time
+  assertion against the command-line region. Rejected: passing the sixth
+  argument through memory (an ABI split), or truncating to five arguments
+  (would silently mis-read `lpcbData`).
+- **Four-slot handle table with synthetic handles.** Handles are
+  `0x1000 + slot`; exhaustion returns `ERROR_TOO_MANY_OPEN_FILES` (4);
+  close frees the slot; `HKLM` close is a no-op; the table resets after each
+  program's teardown, so handles die with the process. Rejected: unbounded
+  allocation (no evidence of need), returning predefined-key values for opens
+  (collides with the root and hides slot accounting), and leaving slots open
+  across programs (breaks the isolation property every earlier stage
+  maintains).
+- **ASCII case-insensitive lookups.** The fetched docs state key names are
+  not case sensitive, so open-existence and value lookup compare
+  case-insensitively against the byte-exact store; the store keeps its POCF
+  rules. Rejected: byte-exact lookups (a documented, easily avoided
+  divergence) and normalizing writes (no write path exists here).
+- **Documented errors without killing for argument problems; kills only for
+  memory-safety violations.** Bad handles → 6; missing keys/values and
+  unbacked predefined roots → 2; bad options/reserved/lpcbData/strings → 87;
+  short buffer → 234 with the required size; unmapped pointers kill the
+  thread like every other service. A failed open zeroes `*phkResult`, and a
+  missing value name or NULL/empty name means "default value", which is not
+  modeled → 2. Rejected: silent truncation on short buffers (contradicts the
+  documented `ERROR_MORE_DATA` contract) and returning values without NUL
+  (the docs warn real Windows does not guarantee termination; we always
+  terminate, which is stronger and testable).
+- **The fixture is isolated in a dedicated ISO variant.**
+  `pereg.exe` is copied only by `make_iso.sh --registry-fixture`
+  (`artifacts/project-os-registry.iso`); default and interactive ISOs,
+  pinned module counts, serial lines and markers stay byte-identical. The
+  phase is probed by module presence like the other fixture stages.
+- **No new marker token.** The registry surface belongs to the existing
+  `win32` check; no `checks` string in any existing test changes.
+
+**Alternatives considered.** A host-side test of the handle-table logic
+(the kernel table is thin and the real risk is the import/stub path, which
+only a PE image exercises); reusing the shell `config` builtin as the only
+consumer (proves nothing about ring-3 imports); `RegGetValueA` first (a
+strictly larger surface built on the same primitives); enumeration APIs
+(premature before a consumer exists).
+
+**Evidence.** `scripts/test_registry_qemu.sh` → `PASS: Win32 registry read
+surface verified`; `artifacts/qemu-registry-session.log` (10,420 B, sha256
+`021807014f814d557227c3774d7231a3d47386ec33b023f843b72d736a8e5945`) asserts
+every pinned line plus the counted duplicates (`RegOpenKeyExA … handle 4096`
+twice, the 87 line twice, `RegCloseKey(4096) -> 0` twice). `pereg.exe`
+(5,120 B, sha256 `0ca37e2e762035bc98729b102d3a1d53340214e67365eba91daa72866fd3b3d4`,
+imports `advapi32.dll:RegCloseKey,RegOpenKeyExA,RegQueryValueExA;kernel32.dll:ExitThread,WriteFile`)
+exited 0 with exactly 10/7/7 calls and one 33-byte write. The default ISO
+(no `pereg.exe`) prints both registry skip lines; `scripts/test_pe_qemu.sh`
+and `scripts/test_input_qemu.sh` stayed PASS; `scripts/test_all.sh` reported
+`PASS=24 FAIL=0 SKIP=4` at build id `0.1.0-b1b8542c` (kernel.elf 1,817,664 B,
+sha256 `6c26d6cce01f4457405554071b550542a7bd3e49e52c7755922ba01368f706bf`).
+
+**Consequences.** PROJECT_OS has a second-DLL import surface and a
+registry-shaped, read-only mapping of the config store, plus the first
+six-argument service. It is not a Windows registry: no hives, ACLs, access
+checks, transactions, redirection, enumeration, write paths, typed values
+beyond REG_SZ, default values, per-user namespaces, `W`/Unicode variants or
+remote registry; four concurrent key handles is a stage limit. Those limits
+must be restated whenever this stage is cited.
+

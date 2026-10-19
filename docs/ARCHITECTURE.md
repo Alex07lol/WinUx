@@ -82,15 +82,16 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/heap.rs` | fixed 8 MiB kernel heap, `#[global_allocator]`, stats/validate | working |
 | `kernel/src/vm.rs` | own 4-level PML4, map/unmap/translate, W^X, user-half teardown | working |
 | `kernel/src/sched.rs` | 16 kernel threads, round-robin yield + timer preemption, per-thread `last_error`; `wait_all_finished` bounded by PIT ticks (TSC budget removed in stage 3 after Limine's reported frequency disagreed with real `rdtsc` under QEMU) | working |
-| `kernel/src/syscall.rs` | `int 0x80` dispatch, pointer validation, user-fault kill path; services 3–14 are the Win32-shaped surface (`GetStdHandle`/`WriteConsoleA`/`ExitProcess` plus the program basics `WriteFile`/`GetLastError`/`SetLastError`/`ExitThread`/`GetCurrentProcessId`/`GetCurrentThreadId`/`GetTickCount`/`GetCommandLineA` and the Phase 8 stage-2 blocking console `ReadFile`) | working |
+| `kernel/src/syscall.rs` | `int 0x80` dispatch, pointer validation, user-fault kill path; services 3–17 are the Win32-shaped surface (`GetStdHandle`/`WriteConsoleA`/`ExitProcess` plus the program basics `WriteFile`/`GetLastError`/`SetLastError`/`ExitThread`/`GetCurrentProcessId`/`GetCurrentThreadId`/`GetTickCount`/`GetCommandLineA`, the Phase 8 stage-2 blocking console `ReadFile`, and the stage-3 read-only registry surface `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey` over the config store) | working |
 | `kernel/src/user.rs` | ring-3 module life cycle (ELF and PE), iretq trampoline, teardown | working (ELF + PE32+ modules, Win32 console + program-basics + console-input phases) |
 | `kernel/src/loader.rs` | two-phase ELF64 module loader (`inspect`/`map`), code window, rollback | working (ADR-0017) |
-| `kernel/src/pe_loader.rs` | two-phase PE32+ loader: window/W^X policy, DIR64 base relocations, twelve-name `kernel32.dll` allowlist, 4-/5-argument stub page, command-line tail + HHDM IAT patch | working (stages 1–3 + Phase 8 stage 2, ADR-0019/0020/0021/0023) |
+| `kernel/src/pe_loader.rs` | two-phase PE32+ loader: window/W^X policy, DIR64 base relocations, fifteen-name two-DLL allowlist (`kernel32.dll`, `advapi32.dll`), 4-/5-/6-argument stub page (24-byte stride), command-line tail + HHDM IAT patch | working (stages 1–3 + Phase 8 stages 2–3, ADR-0019/0020/0021/0023/0024) |
 | `kernel/src/console.rs` | IRQ4 receive ring, echo and line editing | working (serial only) |
 | `kernel/src/vfs.rs` | in-memory arena VFS, boot self-test, dirty tracking, export/replace for checkpoints | working |
 | `kernel/src/blk.rs` | ATA PIO block device (PIIX primary master, LBA28, polled) | working (QEMU `-machine pc`) |
 | `kernel/src/persist.rs` | double-buffered checkpoint slots, CRC-verified load/save | working |
 | `kernel/src/config.rs` | registry-like configuration store: `/etc/config` load or in-memory defaults, lazy save via the VFS dirty bit, boot self-test | working (ADR-0022) |
+| `kernel/src/registry.rs` | read-only Win32 registry-shaped view over the config store: four-slot `HKLM` handle table (`0x1000 + slot`), case-insensitive prefix/value lookups, per-program reset | working (Phase 8 stage 3, ADR-0024) |
 | `kernel/src/pci.rs` | PCI config mechanism #1: bus-0 scan for the e1000 NIC, BAR0 sizing, command-register enable | working (e1000 only) |
 | `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, polled, counters | working (QEMU/VirtualBox) |
 | `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch, `ping`, `udpecho`, status | working (static config) |
@@ -105,7 +106,7 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/sync.rs` | `SpinLock` and RFLAGS-saving `IrqSpinLock` | working |
 | `kernel/src/panic.rs` | panic report and halt | working |
 | `userland/` | independent no_std cargo workspace: syscall runtime plus the `hello`/`fault` ELF programs | working (ADR-0017) |
-| `userland/pe/` | separate workspace: `pehello` (stage 1), `peconsole` (stage 2), `pebasics` (stage 3) and `peinput` (Phase 8 stage 2) `raw-dylib` import fixtures plus the negative mutants, linked by rust-lld without an SDK | working (ADR-0019/0020/0021/0023) |
+| `userland/pe/` | separate workspace: `pehello` (stage 1), `peconsole` (stage 2), `pebasics` (stage 3), `peinput` (Phase 8 stage 2) and `pereg` (Phase 8 stage 3, `advapi32.dll`) `raw-dylib` import fixtures plus the negative mutants, linked by rust-lld without an SDK | working (ADR-0019/0020/0021/0023/0024) |
 | `os_core::memmap` | classification/accounting/validation | host-tested |
 | `os_core::fb` | geometry, pixel format, bounds, colour packing | host-tested |
 | `os_core::frame` | bitmap frame allocator | host- and in-VM-tested |
@@ -188,12 +189,14 @@ as well (ADR-0014).
 - The framebuffer log console is a debugging/UI aid, not a graphics driver. No GPU
   acceleration, command submission or display-driver interface exists.
 - Windows/NT compatibility code is limited to what Phase 7 stages 1–3 and
-  Phase 8 stage 2 implement: the PE32+ loader and twelve `kernel32.dll`-shaped
-  services (console surface plus program basics: `WriteFile`, per-thread
-  `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`,
-  `GetCommandLineA`, and a blocking line-mode console `ReadFile`) resolved
+  Phase 8 stages 2–3 implement: the PE32+ loader and fifteen
+  `kernel32.dll`/`advapi32.dll`-shaped services (console surface plus program
+  basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`,
+  synthetic IDs, `GetTickCount`, `GetCommandLineA`, a blocking line-mode
+  console `ReadFile`, and the read-only registry surface) resolved
   through a real import table (`docs/WIN32_CONSOLE.md`,
-  `docs/WIN32_PROGRAM.md`, `docs/WIN32_INPUT.md`). Everything beyond that
+  `docs/WIN32_PROGRAM.md`, `docs/WIN32_INPUT.md`, `docs/WIN32_REGISTRY.md`).
+  Everything beyond that
   is unimplemented; `docs/WINDOWS_COMPATIBILITY.md` describes the intended
   path.
 
@@ -209,12 +212,13 @@ as well (ADR-0014).
   ELF64 `ET_EXEC` modules and PE32+ images loaded from Limine, with no
   PIE/dynamic linking, no ASLR, no filesystem-backed exec and no process model
   (ADR-0017, ADR-0019). The PE path resolves imports only against a fixed
-  twelve-name `kernel32.dll` allowlist (stub page + `int 0x80` dispatch,
-  ADR-0020/0021/0023): no real DLL loading, exports, forwarders, ordinals,
-  delay imports, SEH/unwind, TLS, CLR, resources, PE32 or general Win32 API
-  surface exists, and console input is line-mode-only with echo and no
-  console modes, so it is not Windows application compatibility (Phase 7
-  stages 1–3 and Phase 8 stage 2 of the roadmap).
+  fifteen-name `kernel32.dll`+`advapi32.dll` allowlist (stub page + `int 0x80`
+  dispatch, ADR-0020/0021/0023/0024): no real DLL loading, exports,
+  forwarders, ordinals, delay imports, SEH/unwind, TLS, CLR, resources, PE32
+  or general Win32 API surface exists, and console input is line-mode-only
+  with echo and no console modes, so it is not Windows application
+  compatibility (Phase 7
+  stages 1–3 and Phase 8 stages 2–3 of the roadmap).
 - The filesystem is a whole-tree checkpoint image: two 1 MiB slots on a
   PIIX-legacy ATA disk, flushed write-through at shell-command boundaries
   (ADR-0016). No journal, no AHCI/virtio, no DMA or IRQ14, and the disk path

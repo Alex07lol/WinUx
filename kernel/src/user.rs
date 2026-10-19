@@ -35,12 +35,20 @@
 //!   and exits through `ExitThread`. It exists only on the dedicated input
 //!   ISO (`make_iso.sh --input-fixture`); without the module the phase is
 //!   skipped with an explicit line.
+//! * `pereg.exe` (Phase 8, stage 3) imports `RegOpenKeyExA`,
+//!   `RegQueryValueExA` and `RegCloseKey` from `advapi32.dll` — the first
+//!   second-DLL allowlist entries and the first six-argument stub — and
+//!   exercises the read-only registry view over the config store: handle
+//!   validation, size queries, `ERROR_MORE_DATA`, REG_SZ reads, slot
+//!   exhaustion/reuse and double close. It exists only on the dedicated
+//!   registry ISO (`make_iso.sh --registry-fixture`); without the module the
+//!   phase is skipped with an explicit line.
 //!
 //! Each program runs one at a time on its own scheduler thread. The thread
 //! publishes its address space and load plan into a static slot; after the
 //! thread dies the boot context switches CR3 back to the kernel template,
 //! unmaps every page of the load plan (including the import stub page) plus
-//! the stack, and destroys the space.
+//! the stack, destroys the space and resets the registry handle table.
 
 use core::arch::global_asm;
 use core::sync::atomic::Ordering;
@@ -54,6 +62,7 @@ use crate::limine;
 use crate::loader;
 use crate::memory;
 use crate::pe_loader;
+use crate::registry;
 use crate::sched;
 use crate::serial;
 use crate::sync::IrqSpinLock;
@@ -71,6 +80,7 @@ const PEBADFN_PATH: &str = "/boot/pebadfn.exe";
 const PEBASICS_PATH: &str = "/boot/pebasics.exe";
 const PEBADFN2_PATH: &str = "/boot/pebadfn2.exe";
 const PEINPUT_PATH: &str = "/boot/peinput.exe";
+const PEREG_PATH: &str = "/boot/pereg.exe";
 
 /// Single user stack page, at the stage-5b placement just above the code
 /// window (`loader::CODE_END` == `STACK_VA`).
@@ -325,6 +335,10 @@ fn thread_peinput() {
     run_pe(PEINPUT_PATH);
 }
 
+fn thread_pereg() {
+    run_pe(PEREG_PATH);
+}
+
 fn unmap_and_free(space: &mut AddressSpace, virtual_address: u64) -> Result<(), &'static str> {
     if let Ok(physical) = space.unmap_page(virtual_address)
         && let Some(frame) = PhysFrame::from_address(physical)
@@ -338,6 +352,8 @@ fn cleanup_slot() -> Result<(), &'static str> {
     let Some((mut space, plan)) = USER_SLOT.lock().take() else {
         return Ok(());
     };
+    // Key handles die with the program that opened them.
+    registry::reset();
     match plan {
         LoadedPlan::Elf(image) => {
             for segment in image.segments() {
@@ -723,6 +739,59 @@ pub fn demo() -> Result<DemoReport, &'static str> {
             PEINPUT_PATH
         );
         kprintln!("win32 input selftest: skipped (no input fixture present)");
+    }
+
+    // Phase 8, stage 3: the read-only Win32 registry surface. `pereg.exe` is
+    // only present on the dedicated registry ISO, so a missing module skips
+    // the phase like the stages above and every default-boot contract stays
+    // unchanged.
+    if limine::module_by_path(PEREG_PATH).is_some() {
+        let open_before_registry = syscall::WIN32_REG_OPEN_KEY_CALLS.load(Ordering::SeqCst);
+        let query_before_registry = syscall::WIN32_REG_QUERY_VALUE_CALLS.load(Ordering::SeqCst);
+        let close_before_registry = syscall::WIN32_REG_CLOSE_KEY_CALLS.load(Ordering::SeqCst);
+        let writefile_before_registry = syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst);
+        let writes_before_registry = syscall::WRITE_CALLS.load(Ordering::SeqCst);
+        let bytes_before_registry = syscall::BYTES_WRITTEN.load(Ordering::SeqCst);
+        let faults_before_registry = syscall::USER_FAULTS.load(Ordering::SeqCst);
+
+        sched::spawn("user-win32-registry", thread_pereg)?;
+        sched::wait_all_finished(300)?;
+        vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
+        cleanup_slot()?;
+        if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
+            return Err("pereg.exe did not exit with code 0");
+        }
+        if syscall::WIN32_REG_OPEN_KEY_CALLS.load(Ordering::SeqCst) != open_before_registry + 10 {
+            return Err("pereg.exe did not call RegOpenKeyExA exactly ten times");
+        }
+        if syscall::WIN32_REG_QUERY_VALUE_CALLS.load(Ordering::SeqCst) != query_before_registry + 7
+        {
+            return Err("pereg.exe did not call RegQueryValueExA exactly seven times");
+        }
+        if syscall::WIN32_REG_CLOSE_KEY_CALLS.load(Ordering::SeqCst) != close_before_registry + 7 {
+            return Err("pereg.exe did not call RegCloseKey exactly seven times");
+        }
+        if syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst) != writefile_before_registry + 1 {
+            return Err("pereg.exe did not call WriteFile exactly once");
+        }
+        if syscall::WRITE_CALLS.load(Ordering::SeqCst) != writes_before_registry + 1 {
+            return Err("pereg.exe did not perform exactly one console write");
+        }
+        if syscall::BYTES_WRITTEN.load(Ordering::SeqCst) != bytes_before_registry + 33 {
+            return Err("pereg.exe did not write exactly 33 bytes");
+        }
+        if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_before_registry {
+            return Err("pereg.exe produced a user fault");
+        }
+        kprintln!(
+            "win32 registry selftest: passed (advapi32.dll RegOpenKeyExA/RegQueryValueExA/RegCloseKey over the config store; handle validation, size queries, ERROR_MORE_DATA, REG_SZ reads, slot exhaustion/reuse and double close verified)"
+        );
+    } else {
+        kprintln!(
+            "user: Win32 registry self-test skipped (`{}` module missing)",
+            PEREG_PATH
+        );
+        kprintln!("win32 registry selftest: skipped (no registry fixture present)");
     }
 
     sched::set_preemption(false);

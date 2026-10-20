@@ -1006,6 +1006,104 @@ written. Create paths not exercised by the fixture (nonzero `Reserved`/
 `dwOptions`) rest on the fetched statements only. No statement about a real
 Windows registry beyond the fetched ones is claimed.
 
+## R-019 — Registry enumeration and key deletion (`RegEnumKeyExA`, `RegEnumValueA`, `RegDeleteKeyA`)
+
+**Question.** Can the flattened Phase 8 config store back subkey/value
+enumeration and the documented non-recursive deletion rule with the fetched
+Windows argument shapes and error codes — and what deviation does the
+flattened namespace force?
+
+**Sources** (fetched 2026-10-20).
+
+- Microsoft Learn `RegEnumKeyExA` (ms.date 2018-12-05): signature
+  `(hKey, dwIndex, lpName, lpcchName, lpReserved, lpClass, lpcchClass,
+  lpftLastWriteTime)`; "Enumerates the subkeys of the specified open registry
+  key. The function retrieves information about one subkey each time it is
+  called."; "Because subkeys are not ordered, any new subkey will have an
+  arbitrary index."; `lpName` receives "the name of the subkey, including the
+  terminating null character ... only the name of the subkey, not the full key
+  hierarchy"; "If the function fails, no information is copied to this
+  buffer."; `lpcchName`: "specifies the size of the buffer ... in characters.
+  This size should include the terminating null character. If the function
+  succeeds, the variable ... contains the number of characters stored in the
+  buffer, not including the terminating null character."; `lpReserved` "is
+  reserved and must be NULL"; `lpClass` may be NULL; `lpcchClass` "can be NULL
+  only if lpClass is NULL"; `lpftLastWriteTime` optional; returns
+  `ERROR_NO_MORE_ITEMS` when no more subkeys and `ERROR_MORE_DATA` when
+  `lpName` is too small; the handle needs `KEY_ENUMERATE_SUB_KEYS`; the page
+  warns against changing the key during enumeration.
+- Microsoft Learn `RegEnumValueA` (ms.date 2018-12-05): signature
+  `(hKey, dwIndex, lpValueName, lpcchValueName, lpReserved, lpType, lpData,
+  lpcbData)`; "copies one indexed value name and data block"; values are not
+  ordered; `lpValueName` receives "the name of the value as a null-terminated
+  string"; `lpcchValueName` in: buffer size in characters, out: "the number of
+  characters stored in the buffer, not including the terminating null
+  character", and on a too-small buffer "returns ERROR_MORE_DATA and the
+  buffer size ... is not changed. In this case, the contents of
+  lpcchValueName are undefined." (the page names `lpValueName` in that
+  sentence; recorded as fetched); `lpReserved` "must be NULL"; `lpType`
+  optional; `lpData` "can be NULL if the data is not required"; "If lpData is
+  NULL and lpcbData is non-NULL, the function stores the size of the data, in
+  bytes, in the variable pointed to by lpcbData."; `lpcbData` "can be NULL
+  only if lpData is NULL"; for REG_SZ the size "includes any terminating null
+  character"; a too-small data buffer returns `ERROR_MORE_DATA` and stores the
+  required size in `*lpcbData`; `ERROR_NO_MORE_ITEMS` at the end.
+- Microsoft Learn `RegDeleteKeyA` (ms.date 2018-12-05): "Deletes a subkey and
+  its values. Note that key names are not case sensitive."; `lpSubKey` "must
+  be a subkey of the key that hKey identifies, but it cannot have subkeys.
+  This parameter cannot be NULL."; "The access rights of this key do not
+  affect the delete operation."; "A deleted key is not removed until the last
+  handle to it is closed."; "The subkey to be deleted must not have subkeys.
+  To delete a key and all its subkeys, you need to enumerate the subkeys and
+  delete them individually."; the page does not enumerate specific error
+  codes.
+- WinError numeric values: `ERROR_ACCESS_DENIED` 5,
+  `ERROR_MORE_DATA` 234 and `ERROR_NO_MORE_ITEMS` 259 (5 and 259 newly used
+  here; 234 already used in R-017).
+
+**Claim.** Enumeration maps onto the stage-3/4 flattened model: the children
+of a key prefix are the distinct first path components of tails that contain
+a `/`; the values of a prefix are its direct entries (full remaining tail as
+the value name); order is store insertion order, which is a documented
+deviation from the fetched "arbitrary index" (we need deterministic tests).
+The same entry can be visible as a value and as a child key when the value
+name contains `/` — impossible in Windows' separate namespaces, so it is a
+stated consequence of the flattened store. `RegDeleteKeyA` implements the
+fetched non-recursive rule: it removes a key's direct entries only, and
+reports `ERROR_ACCESS_DENIED` (5) when any child key exists (the page says
+"must not have subkeys" but does not name the code; 5 is our contract,
+confidence medium). An empty/NULL subkey is 87 (a subkey cannot be NULL;
+`HKLM` itself is not deletable); invalid joined paths are 87; a missing key is
+2; bad handles 6. The fetch's "not removed until the last handle is closed"
+is **not** modelled: entries disappear immediately and open handles become
+stale (queries 2, enumeration 259) — stated deviation. `RegEnumKeyExA`
+ignores `lpClass`/`lpcchClass`/`lpftLastWriteTime` (never dereferenced; the
+page defines class/time outputs we do not have) and rejects nonzero
+`lpReserved` with 87; `lpcchName` is a mandatory in/out (NULL or size 0 →
+87); too-small names return 234 with the required size including the NUL in
+`*lpcchName` (our contract; the page leaves the failure size undefined) and
+success writes the NUL-terminated name with `*lpcchName = len` excluding it
+(fetched). `RegEnumValueA` mirrors that for the name; `lpType` receives
+REG_SZ (1) when non-NULL; `lpData == NULL` with `lpcbData != NULL` is a
+supported size query (`*lpcbData = len + 1`); NULL `lpData` with NULL
+`lpcbData` returns name/type only; data too small returns 234 with the
+required size (fetched); success writes the payload plus NUL and sets
+`*lpcbData = len + 1`. End-of-enumeration is 259. Both services use new
+eight-argument stubs (`Args8`: `r10`–`r13` forwarded; 27 stub bytes ≤ the
+48-byte fixed stride) and `RegDeleteKeyA` the new two-argument shape
+(`Args2`). Confidence: high for argument shapes, reserved rules, name
+success semantics, the 234/259 conditions and the deletion precondition;
+medium for 5 as the has-subkeys code and our required-size-on-234 contracts.
+
+**Experiment.** PENDING. Planned: `scripts/test_registry_enum_qemu.sh` boots
+`artifacts/project-os-registry-enum.iso` with `peregen.exe` exercising create/
+set/enumerate/delete (including the 5-on-subkeys path, slot reuse, stale
+handles, 234/259 paths) and clean-up back to the seeded defaults;
+`scripts/test_all.sh` expected to report `PASS=26 FAIL=0 SKIP=4`.
+
+**Conclusion.** PENDING until the harness run is recorded in
+`docs/WIN32_REGISTRY_ENUM.md` §14.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

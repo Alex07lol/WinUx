@@ -1264,3 +1264,81 @@ namespaces, `W`/Unicode variants or remote registry; four concurrent key
 handles and a 64-entry store are stage limits. Those limits must be
 restated whenever this stage is cited.
 
+## ADR-0026 – Registry enumeration and non-recursive key deletion over the flattened store (Phase 8, stage 5)
+
+**Context.** Stages 3–4 gave the PE path a read/write registry-shaped view
+over the config store, but a program could neither discover entries nor
+remove a key; Windows' documented way to delete a tree is to enumerate the
+subkeys and delete them individually. The full contract (argument order,
+pinned serial lines, fixture sequence, call deltas) lives in
+`docs/WIN32_REGISTRY_ENUM.md`; primary sources are in R-019.
+
+**Decision.**
+
+- **Three services on the proven machinery.** `RegDeleteKeyA` (21),
+  `RegEnumKeyExA` (22) and `RegEnumValueA` (23) join the two-DLL allowlist
+  (eighteen → twenty-one names). The two enum functions use a new `Args8`
+  stub (`r10`–`r13`; 27 bytes inside the unchanged 48-byte stride), the
+  delete the new `Args2` shape. Rejected: a Windows-style enumeration
+  redirection/`W` variant, and variable-length stubs (breaks the fixed
+  stride invariant the loader tests prove).
+- **Enumeration over the flattened namespace, deterministic order.**
+  Child keys are the distinct first components of entry tails containing
+  `/`; values are the direct entries (full tail as the name); order is store
+  insertion order. One `/`-containing value name can therefore be visible as
+  both a value and a child key — Windows' separate namespaces cannot express
+  this, and it is stated as a consequence of the store, not hidden.
+  Rejected: sorted or hash order (no store basis, unstable across inserts)
+  and restricting value names to one component (would change a verified
+  stage-4 contract).
+- **Non-recursive `RegDeleteKeyA`, per the fetched rule.** A key with child
+  keys returns `ERROR_ACCESS_DENIED` (5); callers enumerate and delete
+  children first, as the page prescribes. The fetched page names no code for
+  the rule, so 5 is our contract (confidence medium, recorded in R-019).
+  Rejected: recursive deletion (contradicts the fetched "must not have
+  subkeys" and would hide the enumerate-then-delete idiom) and inventing
+  `RegDeleteTree`/`RegDeleteKeyEx` (new surface without a consumer).
+- **Immediate removal, stale handles.** Entries disappear at delete time;
+  open handles keep their slot and resolve as missing (queries 2,
+  enumeration 259, close still succeeds). The fetched "not removed until the
+  last handle is closed" is not modelled — our store has no key objects to
+  defer. Rejected: handle pinning/refcounts (a key-object model the store
+  does not have, and no fixture needs it).
+- **Buffer contracts pinned to the fetched pages where stated.** Name
+  success writes NUL-terminated bytes and reports the length excluding the
+  NUL; a too-small name or data buffer returns 234 with the required size
+  including the NUL in the in/out variable (the pages leave the failure
+  sizes undefined; our contract, documented); `lpReserved != 0` → 87;
+  `lpData == NULL` with `lpcbData != NULL` is the fetched size query;
+  NULL/NULL returns name/type only; NULL `lpcData` with non-NULL `lpcbData`
+  → 87. `lpType` receives REG_SZ (1). Rejected: silently accepting nonzero
+  reserved values (contradicts the fetched rule) and dereferencing
+  class/time pointers (no outputs to give).
+- **Class and last-write-time are ignored, never dereferenced.** The fetched
+  outputs (user-defined class, FILETIME) have no representation in the
+  store. Rejected: fabricating zeros/timestamps (would misrepresent
+  capability).
+- **Isolated fixture ISO and no new marker.** `peregen.exe` ships only on
+  `make_iso.sh --registry-enum-fixture`
+  (`artifacts/project-os-registry-enum.iso`, five-way mutual exclusion);
+  default and other variant ISOs, module counts, pinned lines and markers
+  stay byte-identical, so earlier harnesses remain regressions. The boot
+  phase asserts the fixture left the store at the seeded defaults.
+
+**Alternatives considered.** Enumeration-only without deletion (leaves the
+Windows idiom untestable); `RegDeleteValueA`-based cleanup (already exists,
+does not exercise key removal); typed-value enumeration (needs a typed value
+model the store lacks); a `user32.dll`-shaped surface before a window manager
+exists (misrepresents capability).
+
+**Evidence.** PENDING — filled after `scripts/test_registry_enum_qemu.sh`
+and `scripts/test_all.sh` runs are recorded.
+
+**Consequences.** PROJECT_OS can discover and delete registry-shaped
+configuration from ring 3 through allowlisted services, with the fetched
+non-recursive deletion rule and deterministic enumeration. Limits to restate:
+no hives, ACLs, access checks, transactions, class/time outputs, recursion,
+`W`/Unicode variants, typed values, default values, empty keys, remote
+registry or Windows-matching order; four handles and the 64-entry store are
+stage contracts.
+

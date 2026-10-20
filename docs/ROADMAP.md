@@ -13,7 +13,7 @@ were run and observed. No dates or completion percentages are implied.
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
-| 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–4, 2026-10-19)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025); larger Win32 surface, GUI and the compatibility matrix not started |
+| 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–5, 2026-10-20)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025), and a registry enumeration/deletion surface (`RegDeleteKeyA`/`RegEnumKeyExA`/`RegEnumValueA`, services 21–23, first eight- and two-argument stubs, deterministic insertion-order enumeration, non-recursive key deletion with the enumerate-first rule) lets a PE fixture enumerate keys/values and delete keys (`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026); larger Win32 surface, GUI and the compatibility matrix not started |
 | 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
@@ -325,6 +325,28 @@ Limits: no hives, ACLs, access checks, transactions, enumeration, key deletion
 objects, namespace rules or remote registry; four concurrent handles and the
 64-entry store are project contracts, not vendor-verified. No compatibility
 claim is made.
+
+## Phase 8 stage 5 (2026-10-20): Win32 registry enumeration and key deletion (`advapi32.dll`)
+
+Contract and design commit (implementation PENDING): the two-DLL allowlist
+grows to twenty-one names and services 21–23 (`RegDeleteKeyA` via the new
+two-argument stub, `RegEnumKeyExA`/`RegEnumValueA` via the new eight-argument
+stub inside the unchanged 48-byte stride) enumerate and delete keys over the
+same config store. Enumeration is deterministic insertion order over the
+flattened namespace (child keys from tails containing `/`, values as direct
+entries), with the documented consequence that a `/`-containing value name is
+also visible as a child key; `RegDeleteKeyA` follows the fetched
+non-recursive rule (a key with child keys returns 5, so callers enumerate
+and delete children first) and entries disappear immediately (open handles
+become stale) as a stated deviation from Windows' deferred removal. Buffer
+semantics are pinned in `docs/WIN32_REGISTRY_ENUM.md` §6–§8 (234 with the
+required size, 259 at the end, REG_SZ-only value data, ignored class/time
+outputs). The `peregen.exe` fixture will ship only on
+`artifacts/project-os-registry-enum.iso`
+(`make_iso.sh --registry-enum-fixture`); expected evidence is
+`scripts/test_registry_enum_qemu.sh` PASS plus
+`scripts/test_all.sh` PASS=26 FAIL=0 SKIP=4. See ADR-0026 and R-019; limits
+are restated there and in `docs/WINDOWS_COMPATIBILITY.md`.
 
 ## Phase 8 acceptance (planned)
 

@@ -144,6 +144,18 @@ deletion (`RegDeleteKey`), typed values beyond REG_SZ, default/null values or
 namespace rules; four concurrent handles and the 64-entry store remain our
 documented contracts, not vendor-verified (`docs/WIN32_REGISTRY_WRITE.md`
 §14, ADR-0025, research R-018).
+**Phase 8 stage 5** — Win32 registry enumeration and key deletion — has its
+contract and design recorded (2026-10-20) and is **not implemented yet**:
+`docs/WIN32_REGISTRY_ENUM.md` pins services 21–23 (`RegDeleteKeyA` via the
+new two-argument stub, `RegEnumKeyExA`/`RegEnumValueA` via the new
+eight-argument stub inside the unchanged 48-byte stride), deterministic
+insertion-order enumeration over the flattened namespace, the fetched
+non-recursive delete rule (child keys → 5, so callers enumerate and delete
+children first), immediate removal with stale open handles (stated
+deviation) and the buffer contracts (234 with the required size, 259 at the
+end). ADR-0026 and R-019 record the decisions and fetched primary sources;
+the planned `peregen.exe` fixture and `--registry-enum-fixture` ISO are
+specified but not built.
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
@@ -200,6 +212,10 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   stub, peregw fixture and harness)`), 21 files changed; it is pushed
   (`fe3c278..30a7f09`) together with this progress follow-up (this commit),
   same commit-then-record pattern as the earlier stages.
+  The Phase 8 stage-5 design commit is `3686a58` (`docs: phase8 stage 5
+  registry enumeration/deletion contract`), four files changed; it is pushed
+  (`30a7f09..3686a58`) together with this progress follow-up (this commit),
+  same commit-then-record pattern.
   Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
@@ -1680,15 +1696,21 @@ Verified: 25 PASS / 0 FAIL / 4 SKIP; unit suite 269; stage-4 artifacts
 recorded above (kernel `dd468fee…`, `peregw.exe` `3b00b91a…`, registry-write
 session `4c03490b…`). The stage-4 commit `30a7f09` and this progress commit
 will be pushed to `orgin/main` with the usual commit-then-record pattern.
-Single best next action: **choose and implement Phase 8 stage 5 — the next
-scoped Win32 surface on the proven machinery.** Strongest candidates:
-(1) continuing the registry arc with key deletion/enumeration
-(`RegDeleteKey`, `RegEnumKeyExA`/`RegEnumValueA`) over the same store and
-handle table; (2) more process/thread functions (e.g. a wait/sleep pair or
-`QueryPerformanceCounter`) extending the Phase 7 stage-3 program basics;
-(3) a third allowlisted DLL (`user32.dll`-shaped or similar) to prove the
-loader resolves a third DLL name while the runtime stays honest about what
-that means. None are started. Later work
+Phase 8 stage 5 (Win32 registry enumeration and non-recursive key deletion)
+has its contract committed (`3686a58`; `docs/WIN32_REGISTRY_ENUM.md`,
+ADR-0026, R-019) but is **not implemented**: no services, stub shapes,
+fixture, ISO variant or harness exist yet.
+Single best next action: **implement Phase 8 stage 5 exactly as the committed
+contract specifies.** Order: `kernel/src/registry.rs` (NoMoreItems 259,
+AccessDenied 5, prefix iteration, `delete_key`/`enum_key`/`enum_value`),
+`kernel/src/syscall.rs` (services 21–23, user-buffer helpers, labels),
+`kernel/src/pe_loader.rs` (`Args2`/`Args8`, twenty-one-name allowlist),
+`userland/pe/peregen` + workspace/Cargo/build script (eleven artifacts),
+`make_iso.sh --registry-enum-fixture`, the enum harness and `test_all.sh`
+step, then the `user.rs` phase and defaults assertion. Expected evidence:
+`scripts/test_registry_enum_qemu.sh` PASS and
+`scripts/test_all.sh` PASS=26 FAIL=0 SKIP=4, with every earlier regression
+unchanged. Later work
 candidates: the remaining Phase 2–4 scope gaps (APIC timer/IOAPIC/SMP,
 recoverable exceptions, user address-space hardening, heap growth) and
 Phase 9 (minimal PCI/driver framework — which also unblocks AHCI — plus a

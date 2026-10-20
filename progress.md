@@ -1,6 +1,6 @@
 # Progress
 
-Last updated: **2026-10-19**
+Last updated: **2026-10-20**
 
 ## Current milestone
 
@@ -159,6 +159,18 @@ specified but not built.
 
 This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS.
 
+**Phase 8 stage 5** — Win32 registry enumeration and non-recursive key
+deletion — is implemented and verified: services 21–23 (`RegDeleteKeyA` via a
+two-argument stub, `RegEnumKeyExA`/`RegEnumValueA` via the new eight-argument
+stub loading `r10`–`r13`) enumerate child keys and REG_SZ values of the same
+config store and delete keys under the fetched non-recursive rule
+(234/259/5/6/2/87), with the store's canonical ascending order as the stated
+deterministic deviation from Windows' arbitrary order. A genuine
+`peregen.exe` fixture ships only on
+`artifacts/project-os-registry-enum.iso`; the harness PASS and
+`test_all.sh` PASS=26 FAIL=0 SKIP=4 are recorded below
+(`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026, R-019).
+
 ## Repository state
 
 - Workspace root: this thread's local checkout.
@@ -215,7 +227,11 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   The Phase 8 stage-5 design commit is `3686a58` (`docs: phase8 stage 5
   registry enumeration/deletion contract`), four files changed; it is pushed
   (`30a7f09..3686a58`) together with this progress follow-up (this commit),
-  same commit-then-record pattern.
+  same commit-then-record pattern.  The Phase 8 stage-5 implementation commit is fc09d78 (`phase8: win32 registry
+  enumeration and non-recursive key deletion ...`), pushed together with this
+  progress follow-up (`21bfe98..<PENDING>`), same commit-then-record pattern; the
+  design commit `3686a58` and its progress record `21bfe98` were pushed
+  earlier (`11d4fa6..21bfe98`).
   Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
@@ -829,6 +845,35 @@ This is **not** a Windows-compatible OS, not a desktop, and not a GPU-capable OS
   matched every pinned line. No kernel defect was found; the session passed
   on the fixed fixture with the same kernel build.
 
+- Phase 8 stage 5 — registry backend (`kernel/src/registry.rs`):
+  `KeyError::NoMoreItems`/`AccessDenied`, `entries_under`/`child_names`
+  (canonical store order, case-insensitive dedup), `enum_key`, `enum_value`,
+  `delete_key` (non-recursive; saves through `config::save()`), unit-simple
+  prefix logic exercised by the PE harness.
+- Phase 8 stage 5 — syscall surface (`kernel/src/syscall.rs`): services 21–23,
+  counters, allowlist names, `ERROR_ACCESS_DENIED` (5)/`ERROR_NO_MORE_ITEMS`
+  (259), user-buffer helpers (reserved/size 0 → 87, short → 234 with len+1,
+  success size excl NUL, class/time ignored, REG_SZ enforced), dispatch and
+  labels; `RegSetValueExA` log prints payload length excluding NUL.
+- Phase 8 stage 5 — loader (`kernel/src/pe_loader.rs`): `StubShape::Args2`
+  and `Args8` (r10–r13 from `[rsp+0x28]`–`[rsp+0x40]`), allowlist 21 names.
+- Phase 8 stage 5 — runtime bring-up fixes: `arch::x86_64::enable_sse()`
+  (CR0.EM/TS clear, CR4.OSFXSR|OSXMMEXCPT) before user mode because rustc
+  emits `movaps`; `PE_STACK_TOP = STACK_TOP - 8` so the PE entry observes
+  Win64 `rsp % 16 == 8`. No FXSAVE context switching exists yet.
+- Phase 8 stage 5 — fixture (`userland/pe/peregen`, seventh workspace member,
+  eleven artifacts): 34-step sequence with distinct exit codes, 45-byte
+  summary `win32: registry enumeration surface verified`, handle reuse and
+  stale-handle checks, nine-call delete sequence ending with
+  `DeleteKey(HKLM, "Session/Current") -> 0`, then close/write; kernel phase
+  asserts create +4, set +4, delete-key +9, enum-key +8, enum-value +6,
+  query +1, close +4, WriteFile +1, write +1, 45 bytes, exit 0, no faults,
+  `Session` empty and the persisted config decoded back to defaults.
+- Phase 8 stage 5 — pipeline/harness: `build_user_pe.sh` (peregen import
+  check), `make_iso.sh --registry-enum-fixture` (registry-enum ISO),
+  `scripts/test_registry_enum_qemu.{py,sh}` (pinned transcript, exit 33),
+  `test_all.sh` step `registry-enum`.
+
 ## Exact commands and results
 
 | Command | Result |
@@ -1331,6 +1376,32 @@ inside the recorded `test_all.sh` pass (25 PASS / 0 FAIL / 4 SKIP; unit
 suite 269). No kernel defect was found; the write session passed on the
 fixed fixture with the same kernel build.
 
+Phase 8 stage 5 (final runs, 2026-10-20):
+
+```sh
+scripts/format.sh                    # PASS (rustfmt fix in pe_loader.rs)
+scripts/lint.sh                      # PASS
+scripts/build.sh                     # PASS -> kernel 1,952,160 bytes
+scripts/build_user_pe.sh             # PASS (11 artifacts)
+scripts/make_iso.sh --registry-enum-fixture
+scripts/test_registry_enum_qemu.sh   # PASS (exit 33)
+scripts/test_all.sh                  # PASS=26 FAIL=0 SKIP=4
+```
+
+The enum harness now passes after three fixture-side/latent bring-up fixes,
+each found by a failing run and fixed without weakening an assertion:
+`#UD` on `movaps` (SSE off) → `enable_sse()`; `#GP` on the first fixture
+instruction sequence (entry `rsp % 16 != 8`) → `PE_STACK_TOP`; missing `r11`
+load in `Args8` → stub fixed. Enumeration order was measured and documented
+as the store's canonical ascending order (values under `Session/Current`:
+`Enum/Alpha/Item`, `Enum/Beta/Item`, `Keep`, `Removed`), so the contract's
+"insertion order" wording was corrected in the spec/R-019/ADR-0026 and code
+comments. Lazy-key deletion semantics then required a nine-call sequence
+(values are not keys; `Session` is denied while `Current` exists).
+Final artifacts: kernel `9d3d7354…` 1,952,160 B; `peregen.exe`
+`25ea3d45…` 7,680 B; enum ISO `49af9b59…` 7,997,440 B; enum session log
+`a44687f8…` 11,572 B; default ISO `2bd3b5d0…` 7,989,248 B.
+
 ## Artifact
 
 | Item | Value |
@@ -1469,6 +1540,12 @@ This is a host model, not a kernel or Linux comparison.
   Networking exists as stage 5 (one polled e1000 with static addressing);
   there is no general on-disk filesystem: persistence is the
   whole-tree checkpoint image (stage 2) described above.
+- Phase 8 stage 5 limits: SSE is enabled but there is no FXSAVE/FXRSTOR
+  switching (kernel built without SSE; fixtures run one at a time);
+  enumeration order is the store's canonical order, not Windows' arbitrary
+  order; no recursion (`RegDeleteTree`/`RegDeleteKeyEx`), typed values, hives,
+  ACLs, default values, empty keys, `W` variants or remote registry.
+
 - Phase 7 stage-1 limits (spec: `docs/PE_LOADER.md` §1/§9, ADR-0019): PE32+
   (AMD64) only — no PE32, no DLLs/exports, no delay imports, TLS, CLR,
   resources, SEH/unwind (`.pdata` ignored) or dynamic code; images are Limine
@@ -1680,38 +1757,16 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 8 stage 1 (configuration store), stage 2 (Win32 console input),
-stage 3 (Win32 registry read surface) and stage 4 (Win32 registry write
-surface) are complete: the store rides the existing checkpoint with a
-host-tested `POCF` codec (`docs/CONFIG.md`, ADR-0022); service 14 `ReadFile`
-gives a PE32+ program a blocking, echoing line-mode read from the serial
-console with documented error mapping (`docs/WIN32_INPUT.md`, ADR-0023,
-R-016); services 15–17 expose a read-only `HKLM` view over the store through
-a second allowlisted DLL (`docs/WIN32_REGISTRY.md`, ADR-0024, R-017); and
-services 18–20 add `RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA` with
-lazy children-only keys, `created`/`opened existing` dispositions and
-persistence through the config store's save path
-(`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025, R-018).
-Verified: 25 PASS / 0 FAIL / 4 SKIP; unit suite 269; stage-4 artifacts
-recorded above (kernel `dd468fee…`, `peregw.exe` `3b00b91a…`, registry-write
-session `4c03490b…`). The stage-4 commit `30a7f09` and this progress commit
-will be pushed to `orgin/main` with the usual commit-then-record pattern.
-Phase 8 stage 5 (Win32 registry enumeration and non-recursive key deletion)
-has its contract committed (`3686a58`; `docs/WIN32_REGISTRY_ENUM.md`,
-ADR-0026, R-019) but is **not implemented**: no services, stub shapes,
-fixture, ISO variant or harness exist yet.
-Single best next action: **implement Phase 8 stage 5 exactly as the committed
-contract specifies.** Order: `kernel/src/registry.rs` (NoMoreItems 259,
-AccessDenied 5, prefix iteration, `delete_key`/`enum_key`/`enum_value`),
-`kernel/src/syscall.rs` (services 21–23, user-buffer helpers, labels),
-`kernel/src/pe_loader.rs` (`Args2`/`Args8`, twenty-one-name allowlist),
-`userland/pe/peregen` + workspace/Cargo/build script (eleven artifacts),
-`make_iso.sh --registry-enum-fixture`, the enum harness and `test_all.sh`
-step, then the `user.rs` phase and defaults assertion. Expected evidence:
-`scripts/test_registry_enum_qemu.sh` PASS and
-`scripts/test_all.sh` PASS=26 FAIL=0 SKIP=4, with every earlier regression
-unchanged. Later work
-candidates: the remaining Phase 2–4 scope gaps (APIC timer/IOAPIC/SMP,
-recoverable exceptions, user address-space hardening, heap growth) and
-Phase 9 (minimal PCI/driver framework — which also unblocks AHCI — plus a
-virtual GPU target).
+Phase 8 stages 1–5 are complete: configuration store (ADR-0022), Win32
+console input (ADR-0023, R-016), read-only registry (ADR-0024, R-017),
+registry write (ADR-0025, R-018) and registry enumeration/deletion
+(ADR-0026, R-019). Final verified state: 26 PASS / 0 FAIL / 4 SKIP; unit
+suite 269; kernel `9d3d7354…`, `peregen.exe` `25ea3d45…`, enum session
+`a44687f8…`; the stage-5 implementation commit and this progress commit are
+pushed together to `orgin/main` (`21bfe98..<commit>`).
+Single best next action: **start the next roadmap item**, choosing between
+the remaining Phase 2–4 scope gaps (APIC timer/IOAPIC/SMP, recoverable
+exceptions, user address-space hardening, heap growth) and Phase 9 (minimal
+PCI/driver framework — which also unblocks AHCI — plus a virtual GPU target).
+Phase 8 acceptance (larger Win32/desktop surface, GUI) remains open and is
+not claimed.

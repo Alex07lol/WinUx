@@ -98,23 +98,27 @@ impl Reject {
     }
 }
 
-/// How many integer arguments an import's stub must forward. `Args4` covers
-/// zero to four arguments: the services ignore unused registers. `Args5` and
-/// `Args6` add the fifth (`[rsp+0x28]` → `r10`) and sixth (`[rsp+0x30]` →
-/// `r11`) arguments; `Args9` additionally forwards the seventh, eighth and
-/// ninth (`[rsp+0x38]`/`[rsp+0x40]`/`[rsp+0x48]` → `r12`/`r13`/`r14`).
+/// How many integer arguments an import's stub must forward. `Args2` and
+/// `Args4` cover zero to four arguments: the services ignore unused
+/// registers (stage 5 names the two-argument shape explicitly for
+/// `RegDeleteKeyA`). `Args5` and `Args6` add the fifth (`[rsp+0x28]` → `r10`)
+/// and sixth (`[rsp+0x30]` → `r11`) arguments; `Args8` forwards the fifth to
+/// eighth (`[rsp+0x28]`–`[rsp+0x40]` → `r10`–`r13`); `Args9` additionally
+/// forwards the ninth (`[rsp+0x48]` → `r14`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StubShape {
+    Args2,
     Args4,
     Args5,
     Args6,
+    Args8,
     Args9,
 }
 
 /// The fixed Win32 service table of this stage: DLL and function name
 /// (byte-exact) to `int 0x80` service number and stub shape. This single
 /// table backs both the import policy and the stub bytes.
-const WIN32_SERVICES: [(&[u8], &[u8], u32, StubShape); 18] = [
+const WIN32_SERVICES: [(&[u8], &[u8], u32, StubShape); 21] = [
     (
         b"kernel32.dll",
         b"GetStdHandle",
@@ -222,6 +226,24 @@ const WIN32_SERVICES: [(&[u8], &[u8], u32, StubShape); 18] = [
         b"RegDeleteValueA",
         syscall::SYS_REG_DELETE_VALUE as u32,
         StubShape::Args4,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegDeleteKeyA",
+        syscall::SYS_REG_DELETE_KEY as u32,
+        StubShape::Args2,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegEnumKeyExA",
+        syscall::SYS_REG_ENUM_KEY_EX as u32,
+        StubShape::Args8,
+    ),
+    (
+        b"advapi32.dll",
+        b"RegEnumValueA",
+        syscall::SYS_REG_ENUM_VALUE as u32,
+        StubShape::Args8,
     ),
 ];
 
@@ -517,15 +539,27 @@ pub fn map(
             let shape = stub_shapes[index];
             let mut stub = [STUB_UNUSED; STUB_STRIDE as usize];
             let mut cursor = 0usize;
-            if shape == StubShape::Args5 || shape == StubShape::Args6 || shape == StubShape::Args9 {
+            if shape == StubShape::Args5
+                || shape == StubShape::Args6
+                || shape == StubShape::Args8
+                || shape == StubShape::Args9
+            {
                 // mov r10, [rsp+0x28]: the fifth integer argument at
                 // function entry (32-byte shadow space + return address).
                 stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x54, 0x24, 0x28]);
                 cursor += 5;
             }
-            if shape == StubShape::Args6 || shape == StubShape::Args9 {
+            if shape == StubShape::Args6 || shape == StubShape::Args8 || shape == StubShape::Args9 {
                 // mov r11, [rsp+0x30]: the sixth integer argument.
                 stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x5C, 0x24, 0x30]);
+                cursor += 5;
+            }
+            if shape == StubShape::Args8 {
+                // mov r12, [rsp+0x38]; mov r13, [rsp+0x40]: the seventh and
+                // eighth arguments.
+                stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x64, 0x24, 0x38]);
+                cursor += 5;
+                stub[cursor..cursor + 5].copy_from_slice(&[0x4C, 0x8B, 0x6C, 0x24, 0x40]);
                 cursor += 5;
             }
             if shape == StubShape::Args9 {

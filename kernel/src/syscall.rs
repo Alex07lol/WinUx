@@ -61,6 +61,15 @@
 //!   `config::save()`).
 //! * `20 RegDeleteValueA(rcx = hKey, rdx = value name)` → `0`/WinError;
 //!   native `advapi32!RegDeleteValueA`.
+//! * `21 RegDeleteKeyA(rcx = hKey, rdx = subkey)` → `0`/WinError; native
+//!   `advapi32!RegDeleteKeyA`; non-recursive: child keys yield `5`
+//!   (`docs/WIN32_REGISTRY_ENUM.md`).
+//! * `22 RegEnumKeyExA(rcx = hKey, rdx = index, r8 = name, r9 = name size,
+//!   r10 = reserved, r11 = class, r12 = class size, r13 = last-write)`;
+//!   native `advapi32!RegEnumKeyExA` (second eight-argument service).
+//! * `23 RegEnumValueA(rcx = hKey, rdx = index, r8 = name, r9 = name size,
+//!   r10 = reserved, r11 = type, r12 = data, r13 = data size)`; native
+//!   `advapi32!RegEnumValueA` (third eight-argument service).
 //!
 //! Every user pointer is validated against the live page tables before the
 //! kernel reads it (mapped, user-accessible, canonical, bounded span). A
@@ -102,6 +111,9 @@ pub const SYS_REG_CLOSE_KEY: u64 = 17;
 pub const SYS_REG_CREATE_KEY_EX: u64 = 18;
 pub const SYS_REG_SET_VALUE_EX: u64 = 19;
 pub const SYS_REG_DELETE_VALUE: u64 = 20;
+pub const SYS_REG_DELETE_KEY: u64 = 21;
+pub const SYS_REG_ENUM_KEY_EX: u64 = 22;
+pub const SYS_REG_ENUM_VALUE: u64 = 23;
 
 /// Maximum accepted console write, small enough to bound the kernel copy.
 pub const MAX_WRITE: u64 = 4096;
@@ -128,6 +140,10 @@ const ERROR_TOO_MANY_OPEN_FILES: u32 = 4;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 /// WinError.h `ERROR_MORE_DATA`.
 const ERROR_MORE_DATA: u32 = 234;
+/// WinError.h `ERROR_ACCESS_DENIED`; `RegDeleteKeyA` on a key with children.
+const ERROR_ACCESS_DENIED: u32 = 5;
+/// WinError.h `ERROR_NO_MORE_ITEMS`; enumeration past the last item.
+const ERROR_NO_MORE_ITEMS: u32 = 259;
 /// Registry value type `REG_SZ`; the only value type this stage supports.
 const REG_SZ: u32 = 1;
 /// `RegCreateKeyExA` disposition: the key did not exist and was created.
@@ -187,6 +203,12 @@ pub static WIN32_REG_CREATE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static WIN32_REG_SET_VALUE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// `SYS_REG_DELETE_VALUE` calls (successful and failing alike).
 pub static WIN32_REG_DELETE_VALUE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_DELETE_KEY` calls (successful and failing alike).
+pub static WIN32_REG_DELETE_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_ENUM_KEY_EX` calls (successful and failing alike).
+pub static WIN32_REG_ENUM_KEY_CALLS: AtomicU64 = AtomicU64::new(0);
+/// `SYS_REG_ENUM_VALUE` calls (successful and failing alike).
+pub static WIN32_REG_ENUM_VALUE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Faults taken from CPL3 and isolated (thread killed, kernel alive).
 pub static USER_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Repeated `int 0x80` calls made with an invalid pointer or bad service.
@@ -220,6 +242,9 @@ pub fn dispatch(frame: &mut InterruptFrame) {
         SYS_REG_CREATE_KEY_EX => reg_create_key_ex(frame),
         SYS_REG_SET_VALUE_EX => reg_set_value_ex(frame),
         SYS_REG_DELETE_VALUE => reg_delete_value(frame),
+        SYS_REG_DELETE_KEY => reg_delete_key(frame),
+        SYS_REG_ENUM_KEY_EX => reg_enum_key_ex(frame),
+        SYS_REG_ENUM_VALUE => reg_enum_value(frame),
         _ => {
             REJECTED_SYSCALLS.fetch_add(1, Ordering::SeqCst);
             serial::force_print(format_args!(
@@ -506,6 +531,8 @@ fn reg_error_label(code: u32) -> &'static str {
         ERROR_TOO_MANY_OPEN_FILES => "too many open keys",
         ERROR_INVALID_HANDLE => "invalid handle",
         ERROR_NOT_ENOUGH_MEMORY => "not enough memory",
+        ERROR_ACCESS_DENIED => "access denied",
+        ERROR_NO_MORE_ITEMS => "no more items",
         _ => "invalid parameter",
     }
 }
@@ -518,6 +545,8 @@ fn reg_key_error_code(error: registry::KeyError) -> u32 {
         registry::KeyError::TooManyKeys => ERROR_TOO_MANY_OPEN_FILES,
         registry::KeyError::BadArgument => ERROR_INVALID_PARAMETER,
         registry::KeyError::NoSpace => ERROR_NOT_ENOUGH_MEMORY,
+        registry::KeyError::NoMoreItems => ERROR_NO_MORE_ITEMS,
+        registry::KeyError::AccessDenied => ERROR_ACCESS_DENIED,
     }
 }
 
@@ -946,6 +975,317 @@ fn reg_delete_value_fail(frame: &mut InterruptFrame, hkey: u64, name: &str, code
         "win32: RegDeleteValueA({}, \"{}\") -> {} ({})\r\n",
         RegHandle(hkey),
         name,
+        code,
+        reg_error_label(code)
+    ));
+    frame.rax = u64::from(code);
+}
+
+/// `21 RegDeleteKeyA`: native `advapi32!RegDeleteKeyA`. Non-recursive: a key
+/// with child keys is `ERROR_ACCESS_DENIED`, a missing key is
+/// `ERROR_FILE_NOT_FOUND`; open handles to the removed prefix stay valid but
+/// return no items (stated deviation, `docs/WIN32_REGISTRY_ENUM.md`).
+fn reg_delete_key(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    let subkey_pointer = frame.rdx;
+    WIN32_REG_DELETE_KEY_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    let subkey = match read_user_string(frame, subkey_pointer) {
+        Ok(subkey) => subkey,
+        Err(()) => {
+            reg_delete_key_fail(frame, hkey, "<invalid>", ERROR_INVALID_PARAMETER);
+            return;
+        }
+    };
+
+    match registry::delete_key(hkey, &subkey) {
+        Ok(()) => {
+            serial::force_print(format_args!(
+                "win32: RegDeleteKeyA({}, \"{}\") -> 0\r\n",
+                RegHandle(hkey),
+                subkey
+            ));
+            frame.rax = 0;
+        }
+        Err(error) => {
+            reg_delete_key_fail(frame, hkey, &subkey, reg_key_error_code(error));
+        }
+    }
+}
+
+fn reg_delete_key_fail(frame: &mut InterruptFrame, hkey: u64, subkey: &str, code: u32) {
+    sched::set_current_last_error(code);
+    serial::force_print(format_args!(
+        "win32: RegDeleteKeyA({}, \"{}\") -> {} ({})\r\n",
+        RegHandle(hkey),
+        subkey,
+        code,
+        reg_error_label(code)
+    ));
+    frame.rax = u64::from(code);
+}
+
+/// `22 RegEnumKeyExA`: enumerates immediate child keys in the store's
+/// canonical ascending order (stated deviation: Windows documents arbitrary
+/// order).
+/// `lpReserved` must be zero; `lpClass`/`lpcchClass`/`lpftLastWriteTime` are
+/// ignored and never dereferenced. A short buffer is `ERROR_MORE_DATA` with
+/// the required size (name length including NUL); success stores the
+/// NUL-terminated name and the length excluding the NUL.
+fn reg_enum_key_ex(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    let index = frame.rdx as u32;
+    let name_pointer = frame.r8;
+    let size_pointer = frame.r9;
+    let reserved = frame.r10;
+    WIN32_REG_ENUM_KEY_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    if reserved != 0 || name_pointer == 0 || size_pointer == 0 {
+        reg_enum_key_fail(frame, hkey, index, ERROR_INVALID_PARAMETER);
+        return;
+    }
+    let Some(size_cell) = validated_out_pointer(
+        frame,
+        size_pointer,
+        "RegEnumKeyExA name size pointer is not mapped",
+    ) else {
+        return;
+    };
+    // SAFETY: the size pointer was validated as a mapped user page with 4
+    // bytes available; the read goes through the HHDM.
+    let capacity = unsafe { core::ptr::read_volatile(size_cell) };
+    if capacity == 0 {
+        reg_enum_key_fail(frame, hkey, index, ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    let name = match registry::enum_key(hkey, index) {
+        Ok(name) => name,
+        Err(error) => {
+            reg_enum_key_fail(frame, hkey, index, reg_key_error_code(error));
+            return;
+        }
+    };
+    let required = name.len() as u32 + 1;
+    if capacity < required {
+        // SAFETY: the size pointer was validated earlier in this call.
+        unsafe { core::ptr::write_volatile(size_cell, required) };
+        sched::set_current_last_error(ERROR_MORE_DATA);
+        serial::force_print(format_args!(
+            "win32: RegEnumKeyExA({}, {}) -> {} (more data, {} bytes needed)\r\n",
+            RegHandle(hkey),
+            index,
+            ERROR_MORE_DATA,
+            required
+        ));
+        frame.rax = u64::from(ERROR_MORE_DATA);
+        return;
+    }
+    if !write_user_bytes(frame, name_pointer, name.as_bytes())
+        || !write_user_bytes(frame, name_pointer + name.len() as u64, &[0])
+    {
+        return;
+    }
+    // SAFETY: the size pointer was validated earlier in this call.
+    unsafe { core::ptr::write_volatile(size_cell, name.len() as u32) };
+    serial::force_print(format_args!(
+        "win32: RegEnumKeyExA({}, {}) -> 0 (\"{}\")\r\n",
+        RegHandle(hkey),
+        index,
+        name
+    ));
+    frame.rax = 0;
+}
+
+fn reg_enum_key_fail(frame: &mut InterruptFrame, hkey: u64, index: u32, code: u32) {
+    sched::set_current_last_error(code);
+    serial::force_print(format_args!(
+        "win32: RegEnumKeyExA({}, {}) -> {} ({})\r\n",
+        RegHandle(hkey),
+        index,
+        code,
+        reg_error_label(code)
+    ));
+    frame.rax = u64::from(code);
+}
+
+/// `23 RegEnumValueA`: enumerates values of a key in the store's canonical
+/// ascending order; every value is REG_SZ. `lpReserved` must be zero.
+/// A NULL `lpData` with a non-NULL `lpcbData` is a size query (size includes
+/// the NUL); a NULL `lpData` and NULL `lpcbData` returns name/type only;
+/// a short data buffer is `ERROR_MORE_DATA` with the required size.
+fn reg_enum_value(frame: &mut InterruptFrame) {
+    let hkey = frame.rcx;
+    let index = frame.rdx as u32;
+    let name_pointer = frame.r8;
+    let name_size_pointer = frame.r9;
+    let reserved = frame.r10;
+    let type_pointer = frame.r11;
+    let data_pointer = frame.r12;
+    let data_size_pointer = frame.r13;
+    WIN32_REG_ENUM_VALUE_CALLS.fetch_add(1, Ordering::SeqCst);
+
+    if reserved != 0 || name_pointer == 0 || name_size_pointer == 0 {
+        reg_enum_value_fail(frame, hkey, index, ERROR_INVALID_PARAMETER);
+        return;
+    }
+    if data_pointer != 0 && data_size_pointer == 0 {
+        reg_enum_value_fail(frame, hkey, index, ERROR_INVALID_PARAMETER);
+        return;
+    }
+    let Some(name_size_cell) = validated_out_pointer(
+        frame,
+        name_size_pointer,
+        "RegEnumValueA name size pointer is not mapped",
+    ) else {
+        return;
+    };
+    // SAFETY: the name size pointer was validated as a mapped user page with
+    // 4 bytes available; the read goes through the HHDM.
+    let name_capacity = unsafe { core::ptr::read_volatile(name_size_cell) };
+    if name_capacity == 0 {
+        reg_enum_value_fail(frame, hkey, index, ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    let (name, value) = match registry::enum_value(hkey, index) {
+        Ok(entry) => entry,
+        Err(error) => {
+            reg_enum_value_fail(frame, hkey, index, reg_key_error_code(error));
+            return;
+        }
+    };
+    let name_required = name.len() as u32 + 1;
+    if name_capacity < name_required {
+        // SAFETY: the name size pointer was validated earlier in this call.
+        unsafe { core::ptr::write_volatile(name_size_cell, name_required) };
+        sched::set_current_last_error(ERROR_MORE_DATA);
+        serial::force_print(format_args!(
+            "win32: RegEnumValueA({}, {}) -> {} (more data, {} name bytes needed)\r\n",
+            RegHandle(hkey),
+            index,
+            ERROR_MORE_DATA,
+            name_required
+        ));
+        frame.rax = u64::from(ERROR_MORE_DATA);
+        return;
+    }
+
+    let data_required = value.len() as u32 + 1;
+    let data_cell = if data_size_pointer == 0 {
+        None
+    } else {
+        let Some(cell) = validated_out_pointer(
+            frame,
+            data_size_pointer,
+            "RegEnumValueA data size pointer is not mapped",
+        ) else {
+            return;
+        };
+        // SAFETY: the data size pointer was validated as a mapped user page
+        // with 4 bytes available; the read goes through the HHDM.
+        Some((cell, unsafe { core::ptr::read_volatile(cell) }))
+    };
+    if let Some((cell, capacity)) = data_cell {
+        if data_pointer == 0 {
+            // SAFETY: the data size pointer was validated earlier.
+            unsafe { core::ptr::write_volatile(cell, data_required) };
+            if !write_enum_name(frame, name_pointer, name_size_cell, &name)
+                || !write_enum_type(frame, type_pointer)
+            {
+                return;
+            }
+            serial::force_print(format_args!(
+                "win32: RegEnumValueA({}, {}) -> 0 (size query, \"{}\", {} bytes)\r\n",
+                RegHandle(hkey),
+                index,
+                name,
+                data_required
+            ));
+            frame.rax = 0;
+            return;
+        }
+        if capacity < data_required {
+            if !write_enum_name(frame, name_pointer, name_size_cell, &name)
+                || !write_enum_type(frame, type_pointer)
+            {
+                return;
+            }
+            // SAFETY: the data size pointer was validated earlier.
+            unsafe { core::ptr::write_volatile(cell, data_required) };
+            sched::set_current_last_error(ERROR_MORE_DATA);
+            serial::force_print(format_args!(
+                "win32: RegEnumValueA({}, {}) -> {} (more data, {} bytes needed)\r\n",
+                RegHandle(hkey),
+                index,
+                ERROR_MORE_DATA,
+                data_required
+            ));
+            frame.rax = u64::from(ERROR_MORE_DATA);
+            return;
+        }
+        // SAFETY: the data size pointer was validated earlier.
+        unsafe { core::ptr::write_volatile(cell, data_required) };
+        if !write_user_bytes(frame, data_pointer, value.as_bytes())
+            || !write_user_bytes(frame, data_pointer + value.len() as u64, &[0])
+        {
+            return;
+        }
+    }
+    if !write_enum_name(frame, name_pointer, name_size_cell, &name)
+        || !write_enum_type(frame, type_pointer)
+    {
+        return;
+    }
+    serial::force_print(format_args!(
+        "win32: RegEnumValueA({}, {}) -> 0 (\"{}\", REG_SZ, {} bytes)\r\n",
+        RegHandle(hkey),
+        index,
+        name,
+        data_required
+    ));
+    frame.rax = 0;
+}
+
+fn write_enum_name(
+    frame: &InterruptFrame,
+    name_pointer: u64,
+    size_cell: *mut u32,
+    name: &str,
+) -> bool {
+    if !write_user_bytes(frame, name_pointer, name.as_bytes())
+        || !write_user_bytes(frame, name_pointer + name.len() as u64, &[0])
+    {
+        return false;
+    }
+    // SAFETY: the size pointer was validated earlier in this call.
+    unsafe { core::ptr::write_volatile(size_cell, name.len() as u32) };
+    true
+}
+
+fn write_enum_type(frame: &InterruptFrame, type_pointer: u64) -> bool {
+    if type_pointer == 0 {
+        return true;
+    }
+    let Some(type_cell) = validated_out_pointer(
+        frame,
+        type_pointer,
+        "RegEnumValueA type pointer is not mapped",
+    ) else {
+        return false;
+    };
+    // SAFETY: the type pointer was validated as a mapped user page with 4
+    // bytes available; the store goes through the HHDM.
+    unsafe { core::ptr::write_volatile(type_cell, REG_SZ) };
+    true
+}
+
+fn reg_enum_value_fail(frame: &mut InterruptFrame, hkey: u64, index: u32, code: u32) {
+    sched::set_current_last_error(code);
+    serial::force_print(format_args!(
+        "win32: RegEnumValueA({}, {}) -> {} ({})\r\n",
+        RegHandle(hkey),
+        index,
         code,
         reg_error_label(code)
     ));

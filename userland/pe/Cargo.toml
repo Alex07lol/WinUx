@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pehello", "peconsole", "pebasics", "peinput", "pereg", "peregw"]
+members = ["pehello", "peconsole", "pebasics", "peinput", "pereg", "peregw", "peregen"]
 
 [workspace.package]
 version = "0.1.0"

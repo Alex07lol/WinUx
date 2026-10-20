@@ -411,6 +411,10 @@ pub extern "C" fn kmain() -> ! {
         Err(error) => fatal(format_args!("vfs selftest failed: {}", error)),
     }
 
+    // Windows x64 binaries assume the SSE/SSE2 baseline; rustc-generated PE
+    // prologues spill xmm6, which faults with #UD until SIMD is enabled.
+    arch::x86_64::enable_sse();
+    kprintln!("cpu: SSE/SSE2 enabled for user-mode code");
     arch::x86_64::gdt::init();
     kprintln!("gdt: loaded (kernel code/data, TSS, IST1 double-fault stack)");
     idt::init();

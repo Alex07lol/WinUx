@@ -23,5 +23,9 @@ name = "pereg"
 version = "0.1.0"
 
 [[package]]
+name = "peregen"
+version = "0.1.0"
+
+[[package]]
 name = "peregw"
 version = "0.1.0"

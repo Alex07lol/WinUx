@@ -1,4 +1,4 @@
-//! Win32 registry-shaped view over the config store (Phase 8, stages 3–4).
+//! Win32 registry-shaped view over the config store (Phase 8, stages 3–5).
 //!
 //! `HKLM` is the only backed root; a "key" is a store path prefix with
 //! children, a "value" is one store entry mapped to REG_SZ. Handles are four
@@ -8,10 +8,15 @@
 //! while the store itself stays byte-exact (POCF). Stage 4 adds mutations:
 //! `create` (lazy — keys exist only while entries live under them),
 //! `set_value` and `delete_value`, both persisted through `config::save()`.
-//! The full contracts are `docs/WIN32_REGISTRY.md` and
-//! `docs/WIN32_REGISTRY_WRITE.md`; primary sources are R-017/R-018.
+//! Stage 5 adds deterministic insertion-order enumeration (`enum_key`,
+//! `enum_value`) and non-recursive `delete_key` (child keys block deletion
+//! with `AccessDenied`; callers delete children first, as Windows
+//! prescribes). The full contracts are `docs/WIN32_REGISTRY.md`,
+//! `docs/WIN32_REGISTRY_WRITE.md` and `docs/WIN32_REGISTRY_ENUM.md`; primary
+//! sources are R-017/R-018/R-019.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use os_core::config::key_is_valid;
 
@@ -46,6 +51,11 @@ pub enum KeyError {
     BadArgument,
     /// The store or its serialised file could not take the write.
     NoSpace,
+    /// The enumeration index is past the last entry (`ERROR_NO_MORE_ITEMS`).
+    NoMoreItems,
+    /// `RegDeleteKeyA` on a key that still has child keys (our contract for
+    /// the fetched "must not have subkeys" rule; code 5).
+    AccessDenied,
 }
 
 static KEYS: IrqSpinLock<[Option<String>; MAX_KEYS]> = IrqSpinLock::new([None, None, None, None]);
@@ -224,6 +234,109 @@ pub fn delete_value(parent: u64, name: &str) -> Result<(), KeyError> {
     }
     let removed = config::with(|store| store.remove(&joined)).map_err(|_| KeyError::NoSpace)?;
     removed.map_err(write_error)?;
+    config::save().map_err(|_| KeyError::NoSpace)
+}
+
+/// Store entries under `prefix` (case-insensitively) in the store's
+/// canonical ascending byte order, each with the tail after the `prefix/`
+/// separator. The root (`""`) yields every entry with its full path as the
+/// tail.
+fn entries_under(prefix: &str) -> Vec<(String, String)> {
+    let Ok(entries) = config::list(None) else {
+        return Vec::new();
+    };
+    let mut matched = Vec::new();
+    for (key, value) in entries {
+        if prefix.is_empty() {
+            matched.push((key, value));
+            continue;
+        }
+        let bytes = key.as_bytes();
+        if bytes.len() > prefix.len()
+            && bytes[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+            && bytes[prefix.len()] == b'/'
+        {
+            matched.push((String::from(&key[prefix.len() + 1..]), value));
+        }
+    }
+    matched
+}
+
+/// Distinct immediate child-key names of `prefix`, in the store's canonical
+/// order with the stored spelling; a tail counts as a child key when it
+/// contains a `/` (the flattened model's rule,
+/// `docs/WIN32_REGISTRY_ENUM.md` §5).
+fn child_names(prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (tail, _) in entries_under(prefix) {
+        let Some((first, _)) = tail.split_once('/') else {
+            continue;
+        };
+        if first.is_empty() {
+            continue;
+        }
+        if !names.iter().any(|name| name.eq_ignore_ascii_case(first)) {
+            names.push(String::from(first));
+        }
+    }
+    names
+}
+
+/// `RegEnumKeyExA` backend: the child key name at `index`, or
+/// `NoMoreItems` past the end. Handles resolve to their prefix as usual.
+pub fn enum_key(parent: u64, index: u32) -> Result<String, KeyError> {
+    let prefix = prefix_of(parent)?;
+    let names = child_names(&prefix);
+    names
+        .get(index as usize)
+        .cloned()
+        .ok_or(KeyError::NoMoreItems)
+}
+
+/// `RegEnumValueA` backend: the `(name, REG_SZ payload)` at `index`, or
+/// `NoMoreItems` past the end. Names are the full remaining tail, so a
+/// `/`-containing value name is also visible as a child key (stated
+/// consequence of the flattened store).
+pub fn enum_value(parent: u64, index: u32) -> Result<(String, String), KeyError> {
+    let prefix = prefix_of(parent)?;
+    let entries = entries_under(&prefix);
+    entries
+        .get(index as usize)
+        .cloned()
+        .ok_or(KeyError::NoMoreItems)
+}
+
+/// `RegDeleteKeyA` backend: non-recursive key removal. The key must exist
+/// and have no child keys (`AccessDenied` otherwise, per the fetched rule);
+/// its direct entries are removed and the store is persisted. Open handles
+/// to the deleted prefix stay valid but stale (queries miss, enumeration
+/// ends), a stated deviation from Windows' deferred removal.
+pub fn delete_key(parent: u64, subkey: &str) -> Result<(), KeyError> {
+    if subkey.is_empty() {
+        return Err(KeyError::BadArgument);
+    }
+    let prefix = prefix_of(parent)?;
+    let target = if prefix.is_empty() {
+        String::from(subkey)
+    } else {
+        let mut joined = prefix;
+        joined.push('/');
+        joined.push_str(subkey);
+        joined
+    };
+    if !key_is_valid(&target) {
+        return Err(KeyError::BadArgument);
+    }
+    let entries = entries_under(&target);
+    if entries.is_empty() {
+        return Err(KeyError::NotFound);
+    }
+    if entries.iter().any(|(tail, _)| tail.contains('/')) {
+        return Err(KeyError::AccessDenied);
+    }
+    for (tail, _) in &entries {
+        config::remove(&joined_entry(&target, tail)).map_err(|_| KeyError::NoSpace)?;
+    }
     config::save().map_err(|_| KeyError::NoSpace)
 }
 

@@ -37,7 +37,7 @@ log "  linker: $RUST_LLD"
 (cd "$ROOT_DIR/userland/pe" && RUSTFLAGS="-C linker=$RUST_LLD -C link-arg=/nodefaultlib -C link-arg=/entry:_start -C link-arg=/subsystem:console" cargo build --release --target "$PE_TARGET")
 
 mkdir -p "$ROOT_DIR/artifacts"
-for fixture in pehello peconsole pebasics peinput pereg peregw; do
+for fixture in pehello peconsole pebasics peinput pereg peregw peregen; do
     [ -f "$PE_TARGET_DIR/$fixture.exe" ] || die "cargo did not produce $PE_TARGET_DIR/$fixture.exe"
     cp "$PE_TARGET_DIR/$fixture.exe" "$ROOT_DIR/artifacts/$fixture.exe"
 done
@@ -110,6 +110,8 @@ python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pereg.exe" \
     --imports 'advapi32.dll:RegCloseKey,RegOpenKeyExA,RegQueryValueExA;kernel32.dll:ExitThread,WriteFile'
 python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/peregw.exe" \
     --imports 'advapi32.dll:RegCloseKey,RegCreateKeyExA,RegDeleteValueA,RegQueryValueExA,RegSetValueExA;kernel32.dll:ExitThread,WriteFile'
+python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/peregen.exe" \
+    --imports 'advapi32.dll:RegCloseKey,RegCreateKeyExA,RegDeleteKeyA,RegEnumKeyExA,RegEnumValueA,RegQueryValueExA,RegSetValueExA;kernel32.dll:ExitThread,WriteFile'
 if CHECK_OUT=$(python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pebad.exe" 2>&1); then
     die "pebad.exe passed the header checker; it must be rejected"
 fi
@@ -122,7 +124,7 @@ python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pebadfn.exe" \
 python "$ROOT_DIR/scripts/check_user_pe.py" "$ROOT_DIR/artifacts/pebadfn2.exe" \
     --imports 'kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,Sleep,SetLastError,WriteFile'
 
-for artifact in pehello.exe peconsole.exe pebasics.exe peinput.exe pereg.exe peregw.exe pebad.exe pebadimp.exe pebadfn.exe pebadfn2.exe; do
+for artifact in pehello.exe peconsole.exe pebasics.exe peinput.exe pereg.exe peregw.exe peregen.exe pebad.exe pebadimp.exe pebadfn.exe pebadfn2.exe; do
     log "  $artifact: $(wc -c <"$ROOT_DIR/artifacts/$artifact") bytes, sha256 $(sha256sum "$ROOT_DIR/artifacts/$artifact" | awk '{print $1}')"
 done
 log "PASS: PE fixtures built and checked"

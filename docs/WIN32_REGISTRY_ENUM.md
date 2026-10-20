@@ -1,8 +1,9 @@
 # Win32 registry enumeration and key deletion — `advapi32.dll` (Phase 8, stage 5)
 
-Status: contract written before implementation (2026-10-20). Evidence is
+Status: implemented and verified (2026-10-20). The contract was written
 appended only after the harness runs; the experiment section in
-`docs/RESEARCH.md` R-019 and the Evidence section here start as PENDING.
+before implementation; `docs/RESEARCH.md` R-019 and §14 below record the
+observed evidence.
 
 ## 1. Goal and non-goals
 
@@ -87,14 +88,15 @@ prefix `P`:
 
 - **Child keys** are the distinct first components `c` of entry paths whose
   tail after `P/` contains a `/` (an entry `P/c/...`); comparison is ASCII
-  case-insensitive and the first-seen spelling wins.
+  case-insensitive and the stored spelling wins.
 - **Values** are the entries exactly under `P` — the full remaining tail is
   the value name. A value name may contain `/` (stage-4 joined-path rule), so
   one entry can appear both as a value of `P` and as part of the child key
   `P/c`; Windows' separate key/value namespaces cannot represent this. The
   overlap is a stated consequence of the flattened store, not hidden.
-- **Order** is store insertion order (the order returned by
-  `os_core::config::Config::list`), stable while the store is unchanged.
+- **Order** is the store's canonical ascending byte order (the order
+  returned by `os_core::config::Config::list`, which keeps entries sorted),
+  stable while the store is unchanged.
   The fetched pages say enumeration order is arbitrary; deterministic order
   is our contract so fixtures and hashes can pin it.
 - **Exhaustion** is index ≥ count → `ERROR_NO_MORE_ITEMS` (259). The index
@@ -206,7 +208,7 @@ boot runs no shell commands, so no disk blocks are written.
 
 - `kernel/src/registry.rs`: `KeyError` gains `NoMoreItems` (259) and
   `AccessDenied` (5). New helpers for prefix-scoped entry iteration and
-  child-name collection (case-insensitive dedup, insertion order). New
+  child-name collection (case-insensitive dedup, canonical store order). New
   `delete_key(parent, subkey)`, `enum_key(parent, index) -> String` and
   `enum_value(parent, index) -> (String, String)`; delete removes the direct
   entries and calls `config::save()` after the store lock is released.
@@ -309,13 +311,13 @@ gaps), `docs/PE_LOADER.md` (allowlist, stub shapes), `progress.md`.
 
 ## 14. Evidence and limits (claims this stage may and may not make)
 
-Status: PENDING. Filled after the harness and `test_all.sh` runs.
+Status: filled after the harness and `test_all.sh` runs (2026-10-20).
 
 May claim (with the logs): a genuine PE32+ image enumerates subkeys and
 REG_SZ values of the config store and deletes keys under the fetched
 non-recursive rule through native, allowlisted `advapi32.dll` services
 (including new eight- and two-argument stub forms), with documented
-234/259/5/6/2/87 results, deterministic insertion-order enumeration, and
+234/259/5/6/2/87 results, deterministic canonical-order enumeration, and
 persistence through the same `/etc/config` codec. The flattened-namespace
 overlap (a `/`-containing value name is also visible as a child key) and the
 immediate-removal deviation are stated.
@@ -323,11 +325,11 @@ immediate-removal deviation are stated.
 May **not** claim: general registry compatibility, hives, security/access
 rights, transactions, class or last-write-time outputs, recursion
 (`RegDeleteTree`/`RegDeleteKeyEx`), typed values beyond REG_SZ, default
-values, empty key objects, ordering guarantees matching Windows (ours is
-insertion order), or namespace rules such as the direct-HKLM-child
+values, empty key objects, ordering guarantees matching Windows (ours is the
+store's canonical order), or namespace rules such as the direct-HKLM-child
 prohibition.
 
-## 15. Verification plan (to be executed)
+## 15. Verification plan (executed 2026-10-20)
 
 1. `scripts/format.sh`, `scripts/lint.sh`.
 2. `scripts/test_unit.sh`: 269/269 expected (no new `os_core` code; registry

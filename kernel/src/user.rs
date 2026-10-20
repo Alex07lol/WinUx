@@ -51,6 +51,14 @@
 //!   exists only on the dedicated registry-write ISO
 //!   (`make_iso.sh --registry-write-fixture`); without the module the phase
 //!   is skipped with an explicit line.
+//! * `peregen.exe` (Phase 8, stage 5) imports `RegDeleteKeyA` (the first
+//!   two-argument stub) plus `RegEnumKeyExA`/`RegEnumValueA` (the first
+//!   eight-argument stubs) and exercises deterministic enumeration and
+//!   non-recursive deletion: canonical-order children/values, size queries,
+//!   `ERROR_MORE_DATA`, `ERROR_NO_MORE_ITEMS`, the child-keys
+//!   `ERROR_ACCESS_DENIED` rule and post-delete staleness. It exists only on
+//!   the dedicated registry-enum ISO (`make_iso.sh --registry-enum-fixture`);
+//!   without the module the phase is skipped with an explicit line.
 //!
 //! Each program runs one at a time on its own scheduler thread. The thread
 //! publishes its address space and load plan into a static slot; after the
@@ -92,11 +100,18 @@ const PEBADFN2_PATH: &str = "/boot/pebadfn2.exe";
 const PEINPUT_PATH: &str = "/boot/peinput.exe";
 const PEREG_PATH: &str = "/boot/pereg.exe";
 const PEREGW_PATH: &str = "/boot/peregw.exe";
+const PEREGEN_PATH: &str = "/boot/peregen.exe";
 
 /// Single user stack page, at the stage-5b placement just above the code
 /// window (`loader::CODE_END` == `STACK_VA`).
 const STACK_VA: u64 = 0x50_0000;
 const STACK_TOP: u64 = STACK_VA + 0x1000;
+
+/// Win64 entry alignment: a process entry function is reached by `call`, so
+/// `rsp % 16 == 8` at its first instruction (the caller's return address sits
+/// at `[rsp]`). MSVC-shaped prologues spill `xmm` registers with aligned
+/// `movaps`, which raises `#GP` if the entry is given a 16-aligned stack.
+const PE_STACK_TOP: u64 = STACK_TOP - 8;
 
 global_asm!(
     r#"
@@ -319,11 +334,12 @@ fn run_pe(path: &'static str) -> ! {
 
     set_tss_rsp0(kernel_stack_top);
     // SAFETY: `entry` points into a mapped executable section of the
-    // now-active address space and STACK_VA is its mapped, zeroed user page.
+    // now-active address space and PE_STACK_TOP lies inside its mapped,
+    // zeroed user stack page (the slot at `[rsp]` is the fake return address).
     unsafe {
         project_os_enter_user_mode(
             entry,
-            STACK_TOP,
+            PE_STACK_TOP,
             u64::from(USER_CODE_SELECTOR),
             u64::from(USER_DATA_SELECTOR),
         )
@@ -352,6 +368,10 @@ fn thread_pereg() {
 
 fn thread_peregw() {
     run_pe(PEREGW_PATH);
+}
+
+fn thread_peregen() {
+    run_pe(PEREGEN_PATH);
 }
 
 fn unmap_and_free(space: &mut AddressSpace, virtual_address: u64) -> Result<(), &'static str> {
@@ -892,6 +912,88 @@ pub fn demo() -> Result<DemoReport, &'static str> {
             PEREGW_PATH
         );
         kprintln!("win32 registry write selftest: skipped (no registry write fixture present)");
+    }
+
+    // Phase 8, stage 5: the Win32 registry enumeration/deletion surface.
+    // `peregen.exe` is only present on the dedicated registry-enum ISO.
+    if limine::module_by_path(PEREGEN_PATH).is_some() {
+        let create_before_re = syscall::WIN32_REG_CREATE_KEY_CALLS.load(Ordering::SeqCst);
+        let set_before_re = syscall::WIN32_REG_SET_VALUE_CALLS.load(Ordering::SeqCst);
+        let delete_key_before_re = syscall::WIN32_REG_DELETE_KEY_CALLS.load(Ordering::SeqCst);
+        let enum_key_before_re = syscall::WIN32_REG_ENUM_KEY_CALLS.load(Ordering::SeqCst);
+        let enum_value_before_re = syscall::WIN32_REG_ENUM_VALUE_CALLS.load(Ordering::SeqCst);
+        let query_before_re = syscall::WIN32_REG_QUERY_VALUE_CALLS.load(Ordering::SeqCst);
+        let close_before_re = syscall::WIN32_REG_CLOSE_KEY_CALLS.load(Ordering::SeqCst);
+        let writefile_before_re = syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst);
+        let writes_before_re = syscall::WRITE_CALLS.load(Ordering::SeqCst);
+        let bytes_before_re = syscall::BYTES_WRITTEN.load(Ordering::SeqCst);
+        let faults_before_re = syscall::USER_FAULTS.load(Ordering::SeqCst);
+
+        sched::spawn("user-win32-registry-enum", thread_peregen)?;
+        sched::wait_all_finished(300)?;
+        vm::activate_kernel().map_err(|_| "returning to the kernel address space failed")?;
+        cleanup_slot()?;
+        if syscall::LAST_EXIT_CODE.load(Ordering::SeqCst) != 0 {
+            return Err("peregen.exe did not exit with code 0");
+        }
+        if syscall::WIN32_REG_CREATE_KEY_CALLS.load(Ordering::SeqCst) != create_before_re + 4 {
+            return Err("peregen.exe did not call RegCreateKeyExA exactly four times");
+        }
+        if syscall::WIN32_REG_SET_VALUE_CALLS.load(Ordering::SeqCst) != set_before_re + 4 {
+            return Err("peregen.exe did not call RegSetValueExA exactly four times");
+        }
+        if syscall::WIN32_REG_DELETE_KEY_CALLS.load(Ordering::SeqCst) != delete_key_before_re + 9 {
+            return Err("peregen.exe did not call RegDeleteKeyA exactly nine times");
+        }
+        if syscall::WIN32_REG_ENUM_KEY_CALLS.load(Ordering::SeqCst) != enum_key_before_re + 8 {
+            return Err("peregen.exe did not call RegEnumKeyExA exactly eight times");
+        }
+        if syscall::WIN32_REG_ENUM_VALUE_CALLS.load(Ordering::SeqCst) != enum_value_before_re + 6 {
+            return Err("peregen.exe did not call RegEnumValueA exactly six times");
+        }
+        if syscall::WIN32_REG_QUERY_VALUE_CALLS.load(Ordering::SeqCst) != query_before_re + 1 {
+            return Err("peregen.exe did not call RegQueryValueExA exactly once");
+        }
+        if syscall::WIN32_REG_CLOSE_KEY_CALLS.load(Ordering::SeqCst) != close_before_re + 4 {
+            return Err("peregen.exe did not call RegCloseKey exactly four times");
+        }
+        if syscall::WIN32_WRITEFILE_CALLS.load(Ordering::SeqCst) != writefile_before_re + 1 {
+            return Err("peregen.exe did not call WriteFile exactly once");
+        }
+        if syscall::WRITE_CALLS.load(Ordering::SeqCst) != writes_before_re + 1 {
+            return Err("peregen.exe did not perform exactly one console write");
+        }
+        if syscall::BYTES_WRITTEN.load(Ordering::SeqCst) != bytes_before_re + 45 {
+            return Err("peregen.exe did not write exactly 45 bytes");
+        }
+        if syscall::USER_FAULTS.load(Ordering::SeqCst) != faults_before_re {
+            return Err("peregen.exe produced a user fault");
+        }
+
+        // The fixture deletes everything it created and persists the result,
+        // so the store is back to the three seeded defaults and survives a
+        // decode round trip.
+        if !config::list(Some("Session"))?.is_empty() {
+            return Err("peregen.exe left its registry keys behind");
+        }
+        config::save()?;
+        let read = vfs::with(|vfs| vfs.read_file(config::CONFIG_PATH).map(|data| data.to_vec()))
+            .map_err(|_| "reading /etc/config failed")?;
+        let blob = read.map_err(|_| "reading /etc/config failed")?;
+        let decoded = os_core::config::Config::decode(&blob)
+            .map_err(|_| "the persisted /etc/config did not decode")?;
+        if decoded.len() != 3 || !decoded.list(Some("Session")).is_empty() {
+            return Err("the persisted /etc/config is not back to the seeded defaults");
+        }
+        kprintln!(
+            "win32 registry enum selftest: passed (advapi32.dll RegDeleteKeyA/RegEnumKeyExA/RegEnumValueA over the config store; canonical-order children and values, size queries, ERROR_MORE_DATA/ERROR_NO_MORE_ITEMS, child-key ERROR_ACCESS_DENIED and stale-handle behavior verified)"
+        );
+    } else {
+        kprintln!(
+            "user: Win32 registry enum self-test skipped (`{}` module missing)",
+            PEREGEN_PATH
+        );
+        kprintln!("win32 registry enum selftest: skipped (no registry enum fixture present)");
     }
 
     sched::set_preemption(false);

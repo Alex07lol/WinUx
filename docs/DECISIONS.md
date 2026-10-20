@@ -1331,7 +1331,7 @@ does not exercise key removal); typed-value enumeration (needs a typed value
 model the store lacks); a `user32.dll`-shaped surface before a window manager
 exists (misrepresents capability).
 
-**Evidence.** PENDING — filled after `scripts/test_registry_enum_qemu.sh`
+**Evidence.** `scripts/test_registry_enum_qemu.sh` → `PASS: Win32 registry
 and `scripts/test_all.sh` runs are recorded.
 
 **Consequences.** PROJECT_OS can discover and delete registry-shaped

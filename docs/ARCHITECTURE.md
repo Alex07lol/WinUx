@@ -189,7 +189,7 @@ as well (ADR-0014).
 - The framebuffer log console is a debugging/UI aid, not a graphics driver. No GPU
   acceleration, command submission or display-driver interface exists.
 - Windows/NT compatibility code is limited to what Phase 7 stages 1–3 and
-  Phase 8 stages 2–4 implement: the PE32+ loader and eighteen
+  Phase 8 stages 2–4 implement: the PE32+ loader and twenty-one
   `kernel32.dll`/`advapi32.dll`-shaped services (console surface plus program
   basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`,
   synthetic IDs, `GetTickCount`, `GetCommandLineA`, a blocking line-mode

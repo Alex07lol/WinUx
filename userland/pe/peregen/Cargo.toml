@@ -1,0 +1,11 @@
+[package]
+name = "peregen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PROJECT_OS PE32+ Win32 registry enumeration/deletion fixture (raw-dylib RegDeleteKeyA/RegEnumKeyExA/RegEnumValueA over the config store)"
+
+[[bin]]
+name = "peregen"
+path = "src/main.rs"

@@ -1064,7 +1064,8 @@ flattened namespace force?
 **Claim.** Enumeration maps onto the stage-3/4 flattened model: the children
 of a key prefix are the distinct first path components of tails that contain
 a `/`; the values of a prefix are its direct entries (full remaining tail as
-the value name); order is store insertion order, which is a documented
+the value name); order is the store's canonical ascending byte order
+(`os_core::config::Config::list`), which is a documented
 deviation from the fetched "arbitrary index" (we need deterministic tests).
 The same entry can be visible as a value and as a child key when the value
 name contains `/` — impossible in Windows' separate namespaces, so it is a
@@ -1095,14 +1096,14 @@ eight-argument stubs (`Args8`: `r10`–`r13` forwarded; 27 stub bytes ≤ the
 success semantics, the 234/259 conditions and the deletion precondition;
 medium for 5 as the has-subkeys code and our required-size-on-234 contracts.
 
-**Experiment.** PENDING. Planned: `scripts/test_registry_enum_qemu.sh` boots
+**Experiment.** `scripts/test_registry_enum_qemu.sh` booted
 `artifacts/project-os-registry-enum.iso` with `peregen.exe` exercising create/
 set/enumerate/delete (including the 5-on-subkeys path, slot reuse, stale
 handles, 234/259 paths) and clean-up back to the seeded defaults;
 `scripts/test_all.sh` expected to report `PASS=26 FAIL=0 SKIP=4`.
 
-**Conclusion.** PENDING until the harness run is recorded in
-`docs/WIN32_REGISTRY_ENUM.md` §14.
+**Conclusion.** Confirmed: the harness PASS and `test_all.sh`
+PASS=26/FAIL=0/SKIP=4 are recorded in `docs/WIN32_REGISTRY_ENUM.md` §14.
 
 ## Open questions / BLOCKED items
 

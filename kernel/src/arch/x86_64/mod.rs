@@ -44,6 +44,27 @@ pub fn halt() {
     unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Enable the x86-64 SSE/SSE2 baseline for ring 3 (Windows x64 requires it).
+/// The MSVC-targeted fixtures save `xmm6` in their prologues, which faults
+/// with `#UD` while `CR0.EM`/`CR4.OSFXSR` keep SIMD disabled. The kernel
+/// itself is built for `x86_64-unknown-none` without SSE, so it does not
+/// clobber the registers between user entries.
+pub fn enable_sse() {
+    // SAFETY: CR0/CR4 are writable in ring 0. Clearing EM/TS and setting
+    // OSFXSR/OSXMMEXCPT is the described sequence for enabling SSE.
+    unsafe {
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        cr0 &= !((1 << 2) | (1 << 3));
+        cr0 |= 1 << 1;
+        asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        cr4 |= (1 << 9) | (1 << 10);
+        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Serialise prior stores. Used before reading back framebuffer bytes that
 /// this CPU wrote through a possibly write-combining mapping: Intel SDM
 /// Vol 3A states write-combining buffers are flushed by a serialising

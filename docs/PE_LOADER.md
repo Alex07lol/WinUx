@@ -359,7 +359,7 @@ pub fn map(space: &mut AddressSpace, module: &limine::File, image: &Inspection)
   `advapi32.dll` (`UnknownImportDll`, two-DLL allowlist since Phase 8
   stage 3) or whose function name is not in the fixed service table
   (`UnknownImportFunction`) — three entries at Phase 7 stage 2, eleven at
-  Phase 7 stage 3, eighteen across two DLLs at Phase 8 stage 4 — and any IAT
+  Phase 7 stage 3, eighteen across two DLLs at Phase 8 stage 4, twenty-one at stage 5 — and any IAT
   slot that is not an 8-byte, in-page
   location inside a readable section of the window (`ImportTarget`). No
   allocation happens before these checks, so the negative fixtures are
@@ -368,7 +368,9 @@ pub fn map(space: &mut AddressSpace, module: &limine::File, image: &Inspection)
   (first-occurrence order) is written as fixed-stride records into a single
   read+execute page mapped at `WIN32_STUB_VA = 0x51_0000`, and every IAT slot
   is patched to the stub address. The stride started at 16 bytes and grew to
-  24 with `Args6` (Phase 8 stage 3) and 48 with `Args9` (stage 4), all
+  24 with `Args6` (Phase 8 stage 3) and 48 with `Args9` (stage 4); stage 5 adds the 28-byte `Args8` shape
+  (`r10`–`r13` from `[rsp+0x28]`–`[rsp+0x40]`) and reuses the stack-less
+  two-argument `Args2` form, all
   `int3`-padded to the stride. The 4-argument stub form is
   `mov eax, imm32; int 0x80; ret; nop*5`; the 5-argument form (stage 3, for
   `WriteFile`) is `mov r10, [rsp+0x28]; mov eax, imm32; int 0x80; ret`

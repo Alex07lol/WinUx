@@ -30,7 +30,7 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 
 | Command | Proves | Recorded result |
 |---|---|---|
-| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 25 PASS, 0 FAIL, 4 SKIP |
+| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 26 PASS, 0 FAIL, 4 SKIP |
 | `scripts/bootstrap.sh` | required tools and Rust targets (incl. `x86_64-pc-windows-msvc` and `rust-lld`) exist | PASS |
 | `scripts/format.sh` | `rustfmt --check` clean (kernel workspace, userland, `userland/pe`) | PASS |
 | `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland, `userland/pe` | PASS |

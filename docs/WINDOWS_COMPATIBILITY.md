@@ -2,7 +2,7 @@
 
 Status: **not implemented** as application compatibility. Phase 7 stages 1–3
 and Phase 8 stages 2–4 provide a PE32+ loader and an import mechanism for two
-allowlisted DLLs: eighteen `kernel32.dll`/`advapi32.dll`-shaped services (a
+allowlisted DLLs: twenty-one `kernel32.dll`/`advapi32.dll`-shaped services (a
 console surface, program basics such as `WriteFile`, per-thread
 `GetLastError`/`SetLastError`,
 `ExitThread`, `GetTickCount` and `GetCommandLineA`, a blocking line-mode
@@ -62,7 +62,7 @@ This is a target diagram, not an assertion that any layer exists.
 
 | Layer | Needs | Status |
 |---|---|---|
-| PE/PE32+ loader | sections, alignments, imports/exports, base relocations, TLS, bounds checks | partial (stages 1–3 + Phase 8 stages 2–4): PE32+ parsing/loading, W^X mapping, DIR64 relocations, import directory against an eighteen-name two-DLL `kernel32.dll`+`advapi32.dll` allowlist, four-, five-, six- and nine-argument stubs, loader-owned command line; no exports, forwarders, ordinals, delay imports, TLS/SEH or PE32 |
+| PE/PE32+ loader | sections, alignments, imports/exports, base relocations, TLS, bounds checks | partial (stages 1–3 + Phase 8 stages 2–4): PE32+ parsing/loading, W^X mapping, DIR64 relocations, import directory against an twenty-one-name two-DLL `kernel32.dll`+`advapi32.dll` allowlist, two-, four-, five-, six-, eight- and nine-argument stubs, loader-owned command line; no exports, forwarders, ordinals, delay imports, TLS/SEH or PE32 |
 | Native execution | user/kernel boundary, per-process address spaces, W^X | partial: ring-3 `int 0x80` boundary, per-program address space with teardown, W^X; one user thread at a time, no process model |
 | Win32 runtime | files, console, process/thread, synchronization, registry-like config, memory | not started; only the eighteen allowlisted call shapes above exist (console input fd `2` plus console output fd `1`; a registry-shaped read/write surface over the kernel `config` store, writes persisted) |
 | NT-style services | handles/objects, waitable objects, events/semaphores/mutexes, IPC, tokens/ACLs | not started |
@@ -109,7 +109,7 @@ Running a console program is not GUI, Direct3D or driver compatibility.
   isolation. (Ring-3 execution with our own `int 0x80` syscalls, a kernel
   thread table and a checkpoint VFS exist; none of them are NT-shaped.)
 - PE32+ parsing/loading exists, but not exports, real DLL loading, SEH/TLS,
-  PE32 or imports beyond the eighteen-name two-DLL allowlist.
+  PE32 or imports beyond the twenty-one-name two-DLL allowlist.
 - No Win32/COM/DXGI/Direct3D runtime.
 - No Windows registry API: a native registry-like key/value store exists in
   the kernel and a registry-shaped surface (`advapi32.dll`

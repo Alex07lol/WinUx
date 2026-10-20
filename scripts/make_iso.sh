@@ -8,6 +8,7 @@ INTERACTIVE=0
 INPUT_FIXTURE=0
 REGISTRY_FIXTURE=0
 REGISTRY_WRITE_FIXTURE=0
+REGISTRY_ENUM_FIXTURE=0
 for argument in "$@"; do
     case "$argument" in
         --no-build) BUILD=0 ;;
@@ -32,13 +33,19 @@ for argument in "$@"; do
             # The ISO keeps debug_exit: the fixture runs without harness input.
             REGISTRY_WRITE_FIXTURE=1
             ;;
+        --registry-enum-fixture)
+            # Add the registry enumeration/deletion fixture module
+            # (`peregen.exe`). The ISO keeps debug_exit: the fixture runs
+            # without harness input.
+            REGISTRY_ENUM_FIXTURE=1
+            ;;
         *)
-            die "unknown argument: $argument (use --no-build, --interactive, --input-fixture, --registry-fixture and/or --registry-write-fixture)"
+            die "unknown argument: $argument (use --no-build, --interactive, --input-fixture, --registry-fixture, --registry-write-fixture and/or --registry-enum-fixture)"
             ;;
     esac
 done
-if [ $((INTERACTIVE + INPUT_FIXTURE + REGISTRY_FIXTURE + REGISTRY_WRITE_FIXTURE)) -gt 1 ]; then
-    die "--interactive, --input-fixture, --registry-fixture and --registry-write-fixture are separate ISO variants; pick one"
+if [ $((INTERACTIVE + INPUT_FIXTURE + REGISTRY_FIXTURE + REGISTRY_WRITE_FIXTURE + REGISTRY_ENUM_FIXTURE)) -gt 1 ]; then
+    die "--interactive, --input-fixture, --registry-fixture, --registry-write-fixture and --registry-enum-fixture are separate ISO variants; pick one"
 fi
 
 OUT_ISO="$ISO_PATH"
@@ -50,6 +57,8 @@ elif [ "$REGISTRY_FIXTURE" -eq 1 ]; then
     OUT_ISO="$ROOT_DIR/artifacts/project-os-registry.iso"
 elif [ "$REGISTRY_WRITE_FIXTURE" -eq 1 ]; then
     OUT_ISO="$ROOT_DIR/artifacts/project-os-registry-write.iso"
+elif [ "$REGISTRY_ENUM_FIXTURE" -eq 1 ]; then
+    OUT_ISO="$ROOT_DIR/artifacts/project-os-registry-enum.iso"
 fi
 
 have mkisofs || die "mkisofs not found (scoop install cdrtools / apt install genisoimage or xorriso)"
@@ -89,6 +98,9 @@ if [ "$REGISTRY_FIXTURE" -eq 1 ]; then
 fi
 if [ "$REGISTRY_WRITE_FIXTURE" -eq 1 ]; then
     PE_NAMES="$PE_NAMES peregw"
+fi
+if [ "$REGISTRY_ENUM_FIXTURE" -eq 1 ]; then
+    PE_NAMES="$PE_NAMES peregen"
 fi
 USER_PES=""
 for name in $PE_NAMES; do
@@ -141,6 +153,11 @@ if [ "$REGISTRY_WRITE_FIXTURE" -eq 1 ]; then
     grep -q 'module_path: boot():/boot/peregw.exe' "$STAGE/limine.conf" ||
         die "failed to add the peregw.exe module to limine.conf"
 fi
+if [ "$REGISTRY_ENUM_FIXTURE" -eq 1 ]; then
+    sed -i 's|    module_path: boot():/boot/pebadfn2.exe|    module_path: boot():/boot/pebadfn2.exe\n    module_path: boot():/boot/peregen.exe|' "$STAGE/limine.conf"
+    grep -q 'module_path: boot():/boot/peregen.exe' "$STAGE/limine.conf" ||
+        die "failed to add the peregen.exe module to limine.conf"
+fi
 cp "$ROOT_DIR/boot/limine/limine-bios.sys" "$STAGE/"
 cp "$ROOT_DIR/boot/limine/limine-bios-cd.bin" "$STAGE/"
 cp "$ROOT_DIR/boot/limine/limine-uefi-cd.bin" "$STAGE/"
@@ -172,6 +189,8 @@ elif [ "$REGISTRY_FIXTURE" -eq 1 ]; then
     VARIANT_NOTE=" (registry fixture build)"
 elif [ "$REGISTRY_WRITE_FIXTURE" -eq 1 ]; then
     VARIANT_NOTE=" (registry write fixture build)"
+elif [ "$REGISTRY_ENUM_FIXTURE" -eq 1 ]; then
+    VARIANT_NOTE=" (registry enum fixture build)"
 fi
 log "creating ISO with BIOS + UEFI El Torito entries${VARIANT_NOTE}"
 # cdrtools mkisofs spells the EFI platform id numerically (0xef = 239); it does

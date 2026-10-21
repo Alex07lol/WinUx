@@ -303,6 +303,12 @@ pub fn selftest_passed() -> bool {
     SELFTEST_PASSED.load(Ordering::SeqCst)
 }
 
+/// Copy of the boot inventory for consumers that must not hold the lock
+/// (currently the driver model).
+pub fn snapshot() -> Vec<Function> {
+    INVENTORY.lock().clone()
+}
+
 fn bar_kind_name(kind: pci::BarKind) -> &'static str {
     match kind {
         pci::BarKind::Memory32 => "mem32",

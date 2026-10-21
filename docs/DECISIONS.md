@@ -1381,3 +1381,40 @@ boot-time snapshot, no resource assignment, no IRQ/MSI, no hotplug, no
 driver matching, no GPU. The next stage (driver registration/lifecycle with
 mock devices) is not claimed.
 
+
+## ADR-0028 – A project-owned, host-tested driver binding model with no hardware start yet (Phase 9, stage 2)
+
+**Context.** Phase 9 stage 1 gives a PCI inventory but no way to express
+which code owns which device. The roadmap requires driver lifecycle tests
+with mock devices before physical GPUs. The e1000 already works through a
+direct bring-up path, and rewriting it in the same stage would mix matching
+evidence with untested start/stop ownership.
+
+**Decision.** Add `os_core::driver`: exact vendor/device and class match
+rules, compile-time descriptors, first-match binding in descriptor order,
+optional single-instance drivers, bounded tables (8 descriptors, 64
+bindings), and an explicit state machine (`Bound`, `Running`,
+`Failed(reason)`, `Stopped`) in which every illegal transition is an error.
+Register the real e1000 descriptor and report the binding at boot (`Bound`
+only), expose `drivers` in the shell, and add `,driver` to the boot marker
+only when the structural self-test passes. Do **not** start or stop hardware
+through the model, add IRPs/device stacks, or claim WDM compatibility.
+
+**Alternatives considered.** Direct e1000 rewrite behind a callback trait
+(risks the verified network path without a hardware-level interface test);
+a fully dynamic registry with allocation and names (unneeded at 8
+descriptors); copying a Linux/Windows driver core design (licensing and
+scope risk, no need for the early state machine); skipping the model until
+the GPU stage (loses mock-testable lifecycle evidence).
+
+**Evidence.** 10 new host tests (suite 280/280); `scripts/test_driver_model_qemu.sh`
+PASS with the pinned e1000 binding, unmatched count, self-test and marker;
+`scripts/test_all.sh` PASS=28 FAIL=0 SKIP=2. Transcripts and limits are in
+`docs/DRIVER_MODEL.md` section 6 and R-021.
+
+**Consequences.** Stage 3 can implement resource ownership and move the
+e1000 behind the model with the network harness as a regression gate. Limits
+to restate: bindings are `Bound` only, no probe/start callback is invoked by
+the kernel, no MMIO/DMA/IRQ ownership, no stop/restart, no hotplug, no power
+management, no WDM/driver-stack claim.
+

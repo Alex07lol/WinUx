@@ -1156,6 +1156,53 @@ questions remain open.
 **Conclusion.** Keep bus-0 enumeration with the recorded constraints; add
 bridge traversal and a driver lifecycle model only when a stage needs them.
 
+
+## R-021 — Driver registration, deterministic matching and lifecycle transitions
+
+**Question.** What is the smallest honest driver model that can sit over the
+PCI inventory and later own real devices, without copying an existing driver
+framework or claiming lifecycle behavior that has not been tested?
+
+**Sources.**
+- Microsoft Learn *Introduction to Driver Objects* (fetched 2026-10-20,
+  ms.date 2017-06-16): the I/O manager creates a driver object per loaded
+  driver; `DriverEntry` supplies it and the driver fills standard entry
+  points; dispatch routines receive IRPs and a target device object.
+- Microsoft Learn *Introduction to Device Objects* (fetched 2026-10-20,
+  ms.date 2017-06-16): devices are represented by device objects, usually
+  several per device in a device stack; operations target the top device
+  object and may be passed down; device extensions are per-device storage.
+- PCI Local Bus Specification 3.0 (reused from R-012/R-020): device identity
+  (vendor/device, class/subclass) is the stable match key available before
+  any driver code runs.
+- Our Phase 9 stage-1 inventory (R-020) provides exactly those fields for
+  every present bus-0 function.
+
+**Claim.** A project-owned model needs only four pieces to be useful now:
+(1) descriptors with exact vendor/device or class rules and an optional
+single-instance flag, (2) deterministic first-match binding in descriptor
+order, (3) explicit `Bound -> Running -> Stopped` and `-> Failed(reason)`
+transitions with illegal transitions rejected, and (4) structural invariants
+(no duplicate bindings, rules must hold, caps enforced). A Windows-style
+driver/device object stack, IRPs, extensions, power states and PnP are out of
+scope and are **not** claimed; this is not WDM compatibility.
+
+**Experiment.** PASSED (2026-10-20). Ten host tests in `os_core::driver`
+cover matching, priority, single-instance, validation, caps, determinism and
+all transitions (host suite 280/280). `scripts/test_driver_model_qemu.sh`
+booted q35 with a pinned e1000 and observed
+`driver: registered 1 descriptor(s)`,
+`driver: e1000 matched 00:02.0 8086:100e (state Bound)`,
+`driver: 5 function(s) unmatched (no registered driver)` and
+`driver selftest: passed (1 binding(s), 5 unmatched; ...)`, with the
+`,driver` boot check and QEMU exit 33. `scripts/test_all.sh` reports
+`PASS=28 FAIL=0 SKIP=2`. No hardware start/stop runs through the model in
+this stage.
+
+**Conclusion.** Keep the model; make stage 3 move the e1000 start/stop behind
+it with an explicit resource-ownership contract (MMIO, DMA frames, polled vs
+interrupt-driven) and mock failure tests before any virtual-GPU claim.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

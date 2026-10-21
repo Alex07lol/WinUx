@@ -30,7 +30,7 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 
 | Command | Proves | Recorded result |
 |---|---|---|
-| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 27 PASS, 0 FAIL, 3 SKIP |
+| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 28 PASS, 0 FAIL, 2 SKIP |
 | `scripts/bootstrap.sh` | required tools and Rust targets (incl. `x86_64-pc-windows-msvc` and `rust-lld`) exist | PASS |
 | `scripts/format.sh` | `rustfmt --check` clean (kernel workspace, userland, `userland/pe`) | PASS |
 | `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland, `userland/pe` | PASS |
@@ -55,7 +55,7 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_graphics_host.sh` | framebuffer geometry/colour tests | PASS |
 | `scripts/test_virtualbox.sh` | VirtualBox BIOS boot with an Intel 82540EM NAT NIC attached; kernel detects the NIC (`net: e1000 at 00:03.0`), loopback `unsupported`, gateway ARP unanswered — non-fatal | PASS (7.2.20; marker + 5 ticks) |
 | `scripts/test_pci_qemu.sh` | PCI bus-0 inventory (Phase 9 stage 1): 6 functions/7 BARs on q35 with a pinned e1000, host-bridge/LPC/e1000+BAR0 lines, power-of-two BAR invariants, `pci selftest: passed`, marker `pci`, QEMU exit 33 | PASS |
-| `scripts/test_driver_model.sh` | driver lifecycle model | SKIP (not implemented, Phase 9) |
+| `scripts/test_driver_model_qemu.sh` | driver registration/binding model (Phase 9 stage 2): one descriptor registered, e1000 `Bound` at 00:02.0, five unmatched functions, structural self-test, marker `driver`, QEMU exit 33 | PASS |
 | `scripts/test_gpu_vm.sh` | virtual GPU driver | SKIP (framebuffer only) |
 | `scripts/bench_graphics.sh` | accelerated graphics benchmark | SKIP (no implementation) |
 | `scripts/bench_memory.sh` | host allocator performance | PASS (measurement, not a correctness gate) |

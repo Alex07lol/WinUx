@@ -16,6 +16,7 @@ mod arch;
 mod blk;
 mod config;
 mod console;
+mod driver;
 mod e1000;
 mod fbcon;
 mod heap;
@@ -484,6 +485,7 @@ pub extern "C" fn kmain() -> ! {
     // recorded functions. A failure is logged, not fatal; the boot marker
     // records whether the self-test passed.
     pci::init();
+    driver::init();
 
     // Network bring-up (Phase 6, stage 5). Runs with interrupts enabled and
     // the PIT ticking (before the scheduler exists), so the driver's poll
@@ -590,6 +592,9 @@ pub extern "C" fn kmain() -> ! {
     }
     if pci::selftest_passed() {
         checks.push_str(",pci");
+    }
+    if driver::selftest_passed() {
+        checks.push_str(",driver");
     }
     if net::selftest_passed() {
         checks.push_str(",net");

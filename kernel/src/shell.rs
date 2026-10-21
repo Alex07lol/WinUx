@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::x86_64::{pit, read_tsc};
 use crate::sync::IrqSpinLock;
-use crate::{blk, config, console, heap, memory, net, pci, persist, sched, serial, vfs};
+use crate::{blk, config, console, driver, heap, memory, net, pci, persist, sched, serial, vfs};
 
 static BUILD_ID: IrqSpinLock<&'static str> = IrqSpinLock::new("dev");
 static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
@@ -80,6 +80,7 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
             crate::kprintln!("  blk               ATA device information");
             crate::kprintln!("  persist           checkpoint image status");
             crate::kprintln!("  pci               PCI bus-0 inventory");
+            crate::kprintln!("  drivers           driver descriptors and binding plan");
             crate::kprintln!("  net               network interface status");
             crate::kprintln!("  ping <ip> [-c n]  ICMP echo request (default 3, max 10)");
             crate::kprintln!("  udpecho <port>    echo one UDP datagram back to its sender");
@@ -306,6 +307,7 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
             }
         }
         "pci" => pci::print_devices(),
+        "drivers" => driver::print_report(),
         "net" => match net::status() {
             Some(line) => crate::kprintln!("{}", line),
             None => crate::kprintln!("net: inactive (no supported e1000 NIC)"),

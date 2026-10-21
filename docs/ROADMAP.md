@@ -14,7 +14,7 @@ were run and observed. No dates or completion percentages are implied.
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–5, 2026-10-20)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025), and a registry enumeration/deletion surface (`RegDeleteKeyA`/`RegEnumKeyExA`/`RegEnumValueA`, services 21–23, first eight- and two-argument stubs, deterministic canonical-order enumeration, non-recursive key deletion with the enumerate-first rule) lets a PE fixture enumerate keys/values and delete keys (`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026); larger Win32 surface, GUI and the compatibility matrix not started |
-| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stage 1: PCI bus-0 inventory, 2026-10-20) — driver lifecycle, MMIO/DMA/IRQ ownership and VM display not started |
+| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–2: PCI inventory + driver binding model, 2026-10-20) — hardware start/stop, MMIO/DMA/IRQ ownership and VM display not started |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
 
@@ -363,6 +363,24 @@ e1000, six functions/seven BARs, host bridge/LPC/e1000+BAR0 lines, exit 33),
 270/270 host tests, `scripts/test_all.sh` PASS=27 FAIL=0 SKIP=3. No bridge
 traversal, resource assignment, IRQ routing, driver lifecycle or GPU claim.
 See `docs/PCI.md`, ADR-0027, R-020.
+
+
+## Phase 9 stage 2 (2026-10-20): driver registration and binding model
+
+Implemented and verified: `os_core::driver` adds exact vendor/device and
+class match rules, compile-time descriptors, deterministic first-match
+binding in descriptor order, single-instance drivers, 8-descriptor/64-binding
+caps, and an explicit `Bound -> Running -> Stopped` / `-> Failed(reason)`
+state machine whose illegal transitions are errors (10 host tests; suite
+280/280). The kernel registers the real e1000 descriptor, binds it against the
+PCI inventory and prints `Bound` with the unmatched count plus a structural
+self-test; `drivers` is a shell diagnostic and `,driver` joins the boot
+checks. No hardware is started or stopped through the model yet: e1000
+bring-up remains in `net::init`, and MMIO/DMA/IRQ ownership, stop/restart,
+hotplug and WDM compatibility are explicitly not claimed. Evidence:
+`scripts/test_driver_model_qemu.sh` PASS on q35 with a pinned e1000,
+`scripts/test_all.sh` PASS=28 FAIL=0 SKIP=2. See `docs/DRIVER_MODEL.md`,
+ADR-0028, R-021.
 
 ## Phase 8 acceptance (planned)
 

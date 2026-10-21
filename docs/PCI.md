@@ -41,7 +41,7 @@ the following entry `None`. A function is present iff its vendor is not
 
 The inventory lives in a `SpinLock<Vec<Function>>`, is rebuilt only by
 `pci::init()` at boot, and is read by the self-test, the boot printer, the
-shell command and `find_e1000`. Capacity is 64; exceeding it sets a
+shell command and the driver model. Capacity is 64; exceeding it sets a
 truncation flag and the self-test fails instead of silently dropping data.
 
 ## 3. Enumeration and BAR sizing
@@ -86,10 +86,12 @@ interactive editing or resource assignment.
 
 ## 5. e1000 integration
 
-`find_e1000()` searches the inventory for `8086:100E` and uses BAR0 from
-the recorded function. The previous direct bus-0 scan remains as a fallback
-when the inventory is empty, so a failed enumeration cannot silently break
-networking. No other driver uses the inventory yet.
+Phase 9 stage 3 removed the separate e1000 locator. `kernel/src/driver.rs`
+matches the inventory function (`8086:100E`), claims its BAR0 MMIO range and
+DMA frame budget, and passes the matched `PciDevice` to `net::init`. There is
+no direct-scan fallback anymore: if enumeration misses the NIC, the model
+reports it unmatched and networking stays inactive instead of bypassing the
+inventory. No other driver uses the inventory yet.
 
 ## 6. Constraints and honesty
 

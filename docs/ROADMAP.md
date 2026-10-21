@@ -14,7 +14,7 @@ were run and observed. No dates or completion percentages are implied.
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–5, 2026-10-20)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025), and a registry enumeration/deletion surface (`RegDeleteKeyA`/`RegEnumKeyExA`/`RegEnumValueA`, services 21–23, first eight- and two-argument stubs, deterministic canonical-order enumeration, non-recursive key deletion with the enumerate-first rule) lets a PE fixture enumerate keys/values and delete keys (`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026); larger Win32 surface, GUI and the compatibility matrix not started |
-| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–2: PCI inventory + driver binding model, 2026-10-20) — hardware start/stop, MMIO/DMA/IRQ ownership and VM display not started |
+| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–3: PCI inventory, driver model, e1000 start + MMIO/DMA claim, 2026-10-21) — stop/restart, real DMA page/IRQ ownership and VM display not started |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
 
@@ -357,8 +357,9 @@ the standard all-ones write-back with immediate restore; header types 0/1/2
 have 6/2/1 BAR slots, 64-bit BARs consume two dwords, and a 64-function cap
 fails the self-test instead of dropping data. Boot prints the summary and
 per-function lines, the shell gains `pci`, and the boot marker gains `,pci`
-only on a passing self-test. The e1000 locator uses the inventory with a
-direct-scan fallback. Evidence: `scripts/test_pci_qemu.sh` PASS (q35, pinned
+only on a passing self-test. The e1000 locator used the inventory with a
+direct-scan fallback in this stage; stage 3 removed the fallback when the
+driver model began passing the matched device to `net::init`. Evidence: `scripts/test_pci_qemu.sh` PASS (q35, pinned
 e1000, six functions/seven BARs, host bridge/LPC/e1000+BAR0 lines, exit 33),
 270/270 host tests, `scripts/test_all.sh` PASS=27 FAIL=0 SKIP=3. No bridge
 traversal, resource assignment, IRQ routing, driver lifecycle or GPU claim.
@@ -381,6 +382,24 @@ hotplug and WDM compatibility are explicitly not claimed. Evidence:
 `scripts/test_driver_model_qemu.sh` PASS on q35 with a pinned e1000,
 `scripts/test_all.sh` PASS=28 FAIL=0 SKIP=2. See `docs/DRIVER_MODEL.md`,
 ADR-0028, R-021.
+
+
+## Phase 9 stage 3 (2026-10-21): start and resource ownership
+
+The e1000 now starts behind the driver model. `os_core::driver::Ledger` tracks
+exclusive MMIO ranges, exclusive IRQ lines and per-owner DMA frame budgets
+(16 claims, overlap/duplicate rejection, release); the kernel claims BAR0
+(`0xfebc0000`, 128 KiB) and a 19-frame DMA budget **before** `net::init`,
+moves the binding to `Running` on success, and releases claims with a
+`Failed(reason)` binding on any failure. The model self-test cross-checks
+that Running bindings own their MMIO and Failed bindings own nothing.
+`net::init` accepts the matched `PciDevice` and returns a stable error reason.
+Stop/restart is deliberately **not** implemented: unmapping, frame
+reclamation and NET teardown do not exist, so only the host-tested state
+machine covers `Stopped`/`release`. Evidence: 16 driver host tests (suite
+286), `scripts/test_driver_model_qemu.sh` PASS (state Running, resources,
+`,driver`, exit 33), `scripts/test_net_qemu.sh` PASS, `scripts/test_all.sh`
+PASS=28 FAIL=0 SKIP=2. See `docs/DRIVER_MODEL.md`, ADR-0029, R-022.
 
 ## Phase 8 acceptance (planned)
 

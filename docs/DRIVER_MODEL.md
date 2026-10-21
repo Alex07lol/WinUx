@@ -1,111 +1,134 @@
-# Driver registration and binding model (Phase 9, stage 2)
+# Driver registration, matching, lifecycle and resource ownership
 
-Status: implemented and verified (2026-10-20). Contract for
-`os_core::driver`, `kernel/src/driver.rs`, the shell `drivers` command and
-`scripts/test_driver_model_qemu.sh`. Evidence is in section 6; ADR-0028 and
-R-021 record the decision and research.
+Status: stages 2–3 implemented and verified (2026-10-21). Contract for
+`os_core::driver`, `kernel/src/driver.rs`, `kernel/src/net.rs`, the shell
+`drivers` command and `scripts/test_driver_model_qemu.sh`. Evidence is in
+section 7; ADR-0028/0029 and R-021/022 record the decisions and research.
 
 ## 1. Scope and non-claims
 
-This stage adds a deterministic **registration, matching and lifecycle state
-machine** over the PCI inventory from stage 1. It does **not** start any
-driver through the model: bindings stay in state `Bound`, and the e1000
-bring-up still runs directly in `net::init`. There is no MMIO/DMA/IRQ
-ownership, no device reset through a driver interface, no teardown path, no
-hotplug and no virtual GPU.
+The model registers compile-time descriptors, matches them against the PCI
+inventory, binds deterministically, starts the matched e1000 through
+`net::init`, records the resources the binding owns, and exposes explicit
+`Bound -> Running -> Failed(reason)` transitions. A later stage may add
+`Stopped` in the kernel.
 
-The model exists so later stages can move real drivers onto explicit
-`Bound -> Running -> Stopped`/`Failed` transitions with host-tested rules
-instead of ad-hoc bring-up code.
+Not claimed: stop/restart in the kernel, device teardown, MMIO unmapping,
+DMA frame reclamation, hotplug, interrupts/MSI (the driver is polled), power
+management, IRPs, device stacks, WDM compatibility, dynamic driver loading,
+class filters, multiple NICs (the ledger and boot state track one e1000),
+and any virtual GPU.
 
-## 2. Model
-
-`os_core::driver` is pure host-testable logic:
+## 2. Model (`os_core::driver`)
 
 - `Device`: bus/device/function, vendor, device ID, class, subclass.
-- `Match::VendorDevice` or `Match::Class`: exact match rules.
-- `Descriptor`: stable `name`, one or more `Match` rules, and a
-  `single_instance` flag.
-- `Binding`: device, descriptor index and `State`.
+- `Match::VendorDevice` or `Match::Class`: exact rules.
+- `Descriptor`: stable `name`, one or more rules, `single_instance`.
+- `Binding`: device, descriptor index, `State`.
 - `State`: `Bound`, `Running`, `Failed(reason)`, `Stopped`.
-- `bind(descriptors, devices)`: validates descriptors (non-empty unique
-  names, at least one rule, at most 8 descriptors), then binds every device
-  to the first matching descriptor in registration order. A single-instance
-  descriptor binds at most one device per call. Output is deterministic;
+- `bind`: validates descriptors (unique non-empty names, at least one rule,
+  at most 8 descriptors), binds every device to the first matching
+  descriptor in registration order, honors single-instance, deterministic,
   at most 64 bindings.
-- Explicit transitions: `start` (`Bound -> Running`), `stop`
-  (`Running -> Stopped`), `fail` (`Bound|Running -> Failed(reason)`). Every
-  other transition returns `InvalidTransition`; there are no silent no-ops.
+- Transitions: `start` (`Bound -> Running`), `stop` (`Running -> Stopped`),
+  `fail` (`Bound|Running -> Failed(reason)`); illegal transitions are
+  `InvalidTransition`, never no-ops.
+- `Ledger`: allocation-free resource ownership. `Mmio { base, len }` ranges
+  are exclusive and overlap-checked; `Irq { line }` is exclusive; `DmaFrames
+  { count }` is an accounting budget owned by the allocator. 16 claims max;
+  MMIO zero/overflow/overlap and IRQ reuse are errors; `release(owner)`
+  drops all of a binding's claims and returns the count; `mmio_owner(addr)`
+  and `irq_owner(line)` resolve ownership.
 - `unmatched(devices, bindings)` reports unclaimed functions.
 
-Limits are project contracts: 8 descriptors and 64 bindings. The host tests
-cover matching, priority order, single-instance behavior, validation errors,
-caps, deterministic binding and all lifecycle transitions including illegal
-ones.
+The host tests cover matching, priority, single-instance, validation, caps,
+determinism, all lifecycle transitions, ledger claims, overlap, IRQ
+exclusivity, invalid resources, caps, release and DMA accounting.
 
-## 3. Kernel integration
+## 3. Kernel lifecycle
 
-`kernel/src/driver.rs` declares the only descriptor table:
+Boot order: `pci::init()` records bus-0 functions; `driver::init(hhdm, tsc)`
+then:
 
-| Driver | Match | Instances |
-|---|---|---|
-| `e1000` | vendor `8086`, device `100E` | single |
+1. converts the snapshot to model devices and binds them;
+2. for each binding, finds the PCI function and claims BAR0's MMIO range and
+   the e1000 DMA frame budget (`3` descriptor/buffer frames + `RX_PAGES`
+   buffer pages = 19 frames) in the ledger **before** touching hardware;
+3. calls `net::init(&PciDevice, ...)`, which enables memory/bus-master,
+   resets/configures the e1000, allocates the rings, reads the MAC, runs the
+   polled loopback selftest and installs the network state;
+4. on success moves the binding to `Running`; on any failure releases the
+   claims and moves it to `Failed(reason)`;
+5. logs the binding, final state, resources, unmatched count and a
+   structural self-test: descriptor indices, one binding per device, rules
+   hold, single-instance honored, every matched device reached Running or
+   Failed, Running bindings own their BAR0 MMIO range, Failed bindings own
+   nothing, and rebinding produces the same plan.
 
-At boot, after the PCI inventory is recorded, `driver::init()` converts the
-inventory snapshot into model devices, binds, prints each binding with its
-state (always `Bound` in this stage), prints the unmatched count, and runs a
-structural self-test: descriptor indices valid, no device bound twice, every
-binding satisfies its descriptor's rules, single-instance honored, and a
-second bind produces an identical result. A failure is logged but not fatal
-and omits the `,driver` boot check.
+A device is never started without a successful claim, and a failed start
+leaves no ledger entry. MMIO access is HHDM-mapped for the kernel lifetime;
+the e1000 uses polled I/O with no IRQ claim. `net::selftest()` still runs
+after driver init and reports the gateway/ARP/ICMP outcome independently.
 
-Boot lines (pinned by the harness on q35 with a pinned e1000):
+Pinned q35 boot lines (pinned e1000 at 00:02.0):
 
 ```text
 driver: registered 1 descriptor(s)
-driver: e1000 matched 00:02.0 8086:100e (state Bound)
+driver: e1000 matched 00:02.0 8086:100e
+driver: e1000 state Running
+driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 19 DMA frame(s), polled
 driver: 5 function(s) unmatched (no registered driver)
-driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness and single-instance verified)
+driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness, single-instance and resource ownership verified)
 ```
 
-The shell command `drivers` reprints the descriptor table and the current
-binding plan. It is diagnostic only.
+On a machine with no supported e1000 (e.g. QEMU's default `e1000e`) there
+are no bindings, the unmatched count equals the inventory size, the model
+self-test still passes and the marker has no `,net`. Shell `drivers`
+reprints the descriptor table, binding state, resources and claim count.
 
-## 4. Why no e1000 rewrite yet
+## 4. Stop/restart and why it is absent
 
-`net::init` already owns the NIC state (`NET`), ring allocation, MAC read,
-loopback self-test and every polled operation. Moving that into a generic
-driver interface in the same stage would mix "matching works" with
-"start/stop ownership works" and would risk the verified network path with
-no hardware-level test for the new interface. Stage 3 should define the
-resource ownership contract (BAR mapping, DMA frames, IRQ vs polled mode,
-stop/restart) and then move the e1000 path behind it with the network
-harness as the regression gate. This stage claims only the host-tested
-model and its kernel-side binding report.
+`E1000` owns rings allocated from the global frame allocator, a device
+mapping obtained through the HHDM and global `NET` state. A correct stop
+needs an unmap API, frame reclamation, NET teardown and a way to re-enable
+the device without leaking or double-freeing; none exist yet. Implementing
+those in the same stage as the first start would mix claims with untested
+teardown. `State::Stopped` and `Ledger::release` are host-tested but unused
+in the kernel; that limit is stated in the boot report and tests. A future
+stage must add mock teardown tests, then a QEMU stop/restart harness, before
+claiming it.
 
 ## 5. Constraints
 
-- Descriptor identity is compile-time; there is no dynamic loading.
+- Compile-time descriptor identity; no dynamic loading.
 - One device gets one descriptor; no driver stacks or class filters.
-- `Bound` is not "working": no probe callback runs in the kernel yet.
-- Failure reasons are static strings; no allocation or error codes.
-- The model is not a Windows driver model or WDM claim; names are ours.
+- One global NIC state; a second e1000 is intentionally unbound
+  (single-instance) and tracked as unmatched, not hidden.
+- Failure reasons are static strings; no allocation in the model.
+- This is not WDM and makes no Windows-driver compatibility claim.
 
-## 6. Evidence
+## 6. Why the e1000 moved behind the model now
 
-- `os_core::driver` unit tests (10 new tests; host suite 280/280): exact
-  match rules, priority order, single-instance, no-match, duplicate/empty/
-  ruleless descriptors, caps, deterministic binding, valid and invalid
-  transitions, failure from bound/running.
+Start is the first lifecycle transition that can fail in real hardware code,
+and the network path already had a strong regression gate
+(`test_net_qemu.sh`). Passing the matched `PciDevice` into `net::init`
+removes a second PCI scan, makes ownership explicit (BAR0 claim before
+start), and keeps the existing network selftest as an independent check.
+Stop remains out of scope (section 4).
+
+## 7. Evidence
+
+- Host suite 286 tests (280 + 6 ledger tests); `os_core::driver` now has 16
+  tests covering binding and ownership.
 - `scripts/test_driver_model_qemu.sh` PASS on q35 with a pinned e1000: the
-  four boot lines above, the `,driver` marker check and no panic; QEMU exit
-  via isa-debug-exit (33).
-- `scripts/test_all.sh` reports `PASS=28 FAIL=0 SKIP=2`.
+  six lines above, `,driver`, no panic, QEMU exit 33.
+- `scripts/test_net_qemu.sh` PASS: `state Running` did not regress ARP/ICMP
+  or the loopback selftest.
+- `scripts/test_all.sh` PASS=28 FAIL=0 SKIP=2.
 - Recorded session: `artifacts/qemu-driver-session.log`.
 
-## 7. Next stage (not claimed)
+## 8. Next stage (not claimed)
 
-Phase 9 stage 3 should add the resource-ownership contract and the first
-real lifecycle-managed driver (e1000 start/stop behind the model), with mock
-device tests for MMIO/DMA/IRQ ownership and failures; only then should a
+Add kernel stop/restart with mock teardown tests, then extend the ledger to
+real DMA page ownership and IRQ allocation. Only after that should a
 virtual GPU target be attempted.

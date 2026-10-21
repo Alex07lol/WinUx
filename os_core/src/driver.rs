@@ -118,6 +118,9 @@ pub enum Error {
     DuplicateName,
     NoMatchRules,
     InvalidTransition,
+    TooManyResources,
+    InvalidResource,
+    ResourceConflict,
 }
 
 impl Error {
@@ -129,6 +132,9 @@ impl Error {
             Error::DuplicateName => "duplicate driver name",
             Error::NoMatchRules => "driver has no match rules",
             Error::InvalidTransition => "invalid lifecycle transition",
+            Error::TooManyResources => "too many resource claims",
+            Error::InvalidResource => "invalid resource",
+            Error::ResourceConflict => "resource conflict",
         }
     }
 }
@@ -182,6 +188,135 @@ pub fn bind(descriptors: &[Descriptor], devices: &[Device]) -> Result<Vec<Bindin
 /// unique per device by construction).
 pub fn unmatched(devices: usize, bindings: usize) -> usize {
     devices.saturating_sub(bindings)
+}
+
+/// Maximum resource claims tracked at once.
+pub const MAX_RESOURCES: usize = 16;
+
+/// A resource a running driver owns. MMIO and IRQ claims are exclusive;
+/// DMA frames are an accounting budget (the allocator owns the actual
+/// frames, the ledger records how many a driver may hold).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Resource {
+    Mmio { base: u64, len: u64 },
+    DmaFrames { count: u32 },
+    Irq { line: u8 },
+}
+
+/// One ledger entry. `owner` is the binding index.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Claim {
+    pub owner: usize,
+    pub resource: Resource,
+}
+
+/// Bounded, allocation-free ownership ledger. The kernel keeps one under a
+/// spinlock; host tests exercise conflicts and release directly.
+#[derive(Clone, Copy)]
+pub struct Ledger {
+    claims: [Option<Claim>; MAX_RESOURCES],
+    used: usize,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ledger {
+    pub const fn new() -> Self {
+        Self {
+            claims: [None; MAX_RESOURCES],
+            used: 0,
+        }
+    }
+
+    /// Claim one resource for a binding. MMIO ranges may not overlap any
+    /// existing MMIO claim; IRQ lines are exclusive. Retrying the same
+    /// owner/resource pair is a conflict, not a silent success.
+    pub fn claim(&mut self, owner: usize, resource: Resource) -> Result<(), Error> {
+        match resource {
+            Resource::Mmio { base, len } => {
+                if len == 0 || base.checked_add(len).is_none() {
+                    return Err(Error::InvalidResource);
+                }
+                if self.claims.iter().flatten().any(|claim| {
+                    matches!(
+                        claim.resource,
+                        Resource::Mmio { base: other, len: other_len }
+                            if ranges_overlap(base, len, other, other_len)
+                    )
+                }) {
+                    return Err(Error::ResourceConflict);
+                }
+            }
+            Resource::DmaFrames { count } => {
+                if count == 0 {
+                    return Err(Error::InvalidResource);
+                }
+            }
+            Resource::Irq { line } => {
+                if self.irq_owner(line).is_some() {
+                    return Err(Error::ResourceConflict);
+                }
+            }
+        }
+        let Some(slot) = self.claims.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(Error::TooManyResources);
+        };
+        *slot = Some(Claim { owner, resource });
+        self.used += 1;
+        Ok(())
+    }
+
+    /// Drop every claim by `owner`; returns the number released.
+    pub fn release(&mut self, owner: usize) -> usize {
+        let mut released = 0;
+        for slot in &mut self.claims {
+            if slot.is_some_and(|claim| claim.owner == owner) {
+                *slot = None;
+                released += 1;
+            }
+        }
+        self.used -= released;
+        released
+    }
+
+    /// Binding that owns the MMIO range containing `address`, if any.
+    pub fn mmio_owner(&self, address: u64) -> Option<usize> {
+        self.claims
+            .iter()
+            .flatten()
+            .find_map(|claim| match claim.resource {
+                Resource::Mmio { base, len } if address >= base && address < base + len => {
+                    Some(claim.owner)
+                }
+                _ => None,
+            })
+    }
+
+    pub fn irq_owner(&self, line: u8) -> Option<usize> {
+        self.claims
+            .iter()
+            .flatten()
+            .find_map(|claim| match claim.resource {
+                Resource::Irq { line: claimed } if claimed == line => Some(claim.owner),
+                _ => None,
+            })
+    }
+
+    pub fn len(&self) -> usize {
+        self.used
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.used == 0
+    }
+}
+
+fn ranges_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {
+    a_base < b_base + b_len && b_base < a_base + a_len
 }
 
 #[cfg(test)]
@@ -362,5 +497,161 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first[0].driver, 0);
         assert_eq!(first[1].driver, 1);
+    }
+
+    #[test]
+    fn ledger_claims_mmio_and_finds_owner() {
+        let mut ledger = Ledger::new();
+        ledger
+            .claim(
+                1,
+                Resource::Mmio {
+                    base: 0x1000,
+                    len: 0x2000,
+                },
+            )
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.mmio_owner(0x1000), Some(1));
+        assert_eq!(ledger.mmio_owner(0x2FFF), Some(1));
+        assert_eq!(ledger.mmio_owner(0x3000), None);
+        assert_eq!(ledger.mmio_owner(0x0FFF), None);
+    }
+
+    #[test]
+    fn overlapping_mmio_is_rejected_even_for_the_same_owner() {
+        let mut ledger = Ledger::new();
+        ledger
+            .claim(
+                1,
+                Resource::Mmio {
+                    base: 0x1000,
+                    len: 0x1000,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.claim(
+                2,
+                Resource::Mmio {
+                    base: 0x1800,
+                    len: 0x10
+                }
+            ),
+            Err(Error::ResourceConflict)
+        );
+        assert_eq!(
+            ledger.claim(
+                1,
+                Resource::Mmio {
+                    base: 0x1000,
+                    len: 0x10
+                }
+            ),
+            Err(Error::ResourceConflict)
+        );
+        ledger
+            .claim(
+                2,
+                Resource::Mmio {
+                    base: 0x2000,
+                    len: 0x100,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn irq_lines_are_exclusive_and_released() {
+        let mut ledger = Ledger::new();
+        ledger.claim(0, Resource::Irq { line: 11 }).unwrap();
+        assert_eq!(ledger.irq_owner(11), Some(0));
+        assert_eq!(
+            ledger.claim(1, Resource::Irq { line: 11 }),
+            Err(Error::ResourceConflict)
+        );
+        assert_eq!(ledger.release(0), 1);
+        assert!(ledger.is_empty());
+        ledger.claim(1, Resource::Irq { line: 11 }).unwrap();
+        assert_eq!(ledger.irq_owner(11), Some(1));
+    }
+
+    #[test]
+    fn invalid_and_duplicate_resources_are_rejected() {
+        let mut ledger = Ledger::new();
+        assert_eq!(
+            ledger.claim(0, Resource::Mmio { base: 0, len: 0 }),
+            Err(Error::InvalidResource)
+        );
+        assert_eq!(
+            ledger.claim(
+                0,
+                Resource::Mmio {
+                    base: u64::MAX,
+                    len: 2
+                }
+            ),
+            Err(Error::InvalidResource)
+        );
+        assert_eq!(
+            ledger.claim(0, Resource::DmaFrames { count: 0 }),
+            Err(Error::InvalidResource)
+        );
+        assert_eq!(
+            ledger.claim(
+                0,
+                Resource::Mmio {
+                    base: 0x10,
+                    len: 0x10
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            ledger.claim(
+                0,
+                Resource::Mmio {
+                    base: 0x10,
+                    len: 0x10
+                }
+            ),
+            Err(Error::ResourceConflict)
+        );
+    }
+
+    #[test]
+    fn ledger_cap_and_release_are_bounded() {
+        let mut ledger = Ledger::new();
+        for index in 0..MAX_RESOURCES {
+            ledger
+                .claim(
+                    index,
+                    Resource::Mmio {
+                        base: index as u64 * 0x100,
+                        len: 0x10,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            ledger.claim(MAX_RESOURCES, Resource::Irq { line: 1 }),
+            Err(Error::TooManyResources)
+        );
+        assert_eq!(ledger.release(0), 1);
+        assert_eq!(ledger.len(), MAX_RESOURCES - 1);
+        assert_eq!(ledger.release(0), 0);
+        ledger
+            .claim(MAX_RESOURCES, Resource::Irq { line: 1 })
+            .unwrap();
+    }
+
+    #[test]
+    fn dma_budget_is_accounted_per_owner() {
+        let mut ledger = Ledger::new();
+        ledger.claim(0, Resource::DmaFrames { count: 19 }).unwrap();
+        ledger.claim(1, Resource::DmaFrames { count: 4 }).unwrap();
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(ledger.release(0), 1);
+        assert_eq!(ledger.len(), 1);
     }
 }

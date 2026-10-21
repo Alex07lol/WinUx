@@ -1418,3 +1418,41 @@ to restate: bindings are `Bound` only, no probe/start callback is invoked by
 the kernel, no MMIO/DMA/IRQ ownership, no stop/restart, no hotplug, no power
 management, no WDM/driver-stack claim.
 
+
+## ADR-0029 – Claim resources before start; move e1000 start behind the driver model; defer stop
+
+**Context.** Stage 2 binds descriptors to PCI functions but leaves bindings
+`Bound` and e1000 bring-up in `net::init`. Starting hardware without an
+explicit ownership record would make later stop/restart and failure handling
+guesswork. The network path already works and must not regress.
+
+**Decision.** Extend `os_core::driver` with a bounded ledger for exclusive
+MMIO ranges, exclusive IRQ lines and per-owner DMA frame budgets, including
+overlap rejection and release. In the kernel, the driver model claims BAR0
+and a 19-frame DMA budget before calling `net::init(&PciDevice, ...)`; on
+success the binding becomes `Running`, on failure the claims are released
+and it becomes `Failed(reason)`. The model self-test verifies Running
+bindings own their MMIO and Failed bindings own nothing. `net::init` accepts
+the already-matched device and returns a stable error reason instead of
+scanning PCI again. Do **not** implement kernel stop/restart in this stage;
+keep `Stopped`/`release` host-tested and state their kernel-unused status in
+the boot report, docs and progress file.
+
+**Alternatives considered.** Start first and claim after (leaves hardware
+running without recorded ownership on claim failure); claim inside
+`net::init` (mixes device matching with resource policy); implement stop now
+(no unmap/frame-reclamation/teardown APIs, so it would be untestable and
+risk the network path); allocate a separate per-driver frame pool (not
+needed for one NIC and would duplicate the allocator).
+
+**Evidence.** 6 new host ledger tests (suite 286); `scripts/test_driver_model_qemu.sh`
+PASS with `state Running`, the exact BAR0 range, 19-frame budget, `,driver`
+and exit 33; `scripts/test_net_qemu.sh` PASS; `scripts/test_all.sh`
+PASS=28 FAIL=0 SKIP=2. See `docs/DRIVER_MODEL.md` and R-022.
+
+**Consequences.** Start failures now have defined ownership and state.
+Kernel stop/restart, MMIO unmapping, DMA reclamation, IRQs and a second NIC
+remain unimplemented and unclaimed; the next stage should add mock teardown
+tests first, then a QEMU stop/restart harness, then extend ownership to real
+DMA pages and IRQ allocation.
+

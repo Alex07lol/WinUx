@@ -1203,6 +1203,46 @@ this stage.
 it with an explicit resource-ownership contract (MMIO, DMA frames, polled vs
 interrupt-driven) and mock failure tests before any virtual-GPU claim.
 
+
+## R-022 — Device resource ownership before first start; why stop is deferred
+
+**Question.** Once a binding names a device, who owns its MMIO range and DMA
+memory, in what order must ownership be established relative to touching
+hardware, and can stop/restart be claimed in the same stage?
+
+**Sources.** PCI Local Bus Specification 3.0 (reused from R-012/R-020): BARs
+describe a function's MMIO/I/O apertures and sizes; the command register's
+memory-space and bus-master enables gate access. Intel 8254x SDM (reused
+from R-012): the device needs its registers mapped, its descriptor rings and
+buffers in memory reachable by DMA, and reset/configuration before use; the
+polled driver path does not require interrupts. Our stage-2 model (R-021)
+supplies binding identity and explicit states. No new external document was
+fetched for this stage; the claims below are limited to these recorded
+primary sources and our own code.
+
+**Claim.** (1) A binding must claim the BAR0 MMIO range before the first
+register write, and a failed start must release the claim so ownership
+matches reality. (2) DMA buffers are allocated by the frame allocator, so
+the driver ledger should record a frame *budget* rather than pretend to own
+physical ranges it did not allocate. (3) Polled operation needs no IRQ
+claim. (4) A correct stop requires an unmap API, frame reclamation, global
+network-state teardown and a re-enable path; without those, claiming
+stop/restart would be untested. The host-tested `Stopped` transition and
+`release` API are necessary but not sufficient evidence.
+
+**Experiment.** PASSED for start/ownership (2026-10-21): the e1000 is bound,
+its BAR0 range (`0xfebc0000`, 128 KiB) and 19-frame DMA budget are claimed
+before `net::init`, the binding reaches `Running`, and the model self-test
+cross-checks that Running bindings own their MMIO while Failed bindings own
+nothing. `scripts/test_driver_model_qemu.sh` PASS (exit 33);
+`scripts/test_net_qemu.sh` PASS; host ledger tests 6 new (suite 286).
+Stop/restart was **not** implemented or exercised in the kernel.
+
+**Conclusion.** Start-before-own ordering and exclusive claims are correct
+for this stage. Do not claim kernel stop/restart until mock teardown tests
+and a QEMU stop/restart harness exist; keep `Stopped`/`release` host-tested
+and mark them unused in the kernel.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

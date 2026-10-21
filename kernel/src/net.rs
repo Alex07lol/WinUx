@@ -62,15 +62,17 @@ static SELFTEST_PASSED: AtomicBool = AtomicBool::new(false);
 static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
 
 /// Probe PCI for the NIC and bring it up. Logs the pinned `net:` lines.
-/// Non-fatal: a machine without the NIC (or with the unsupported `e1000e`)
-/// simply has no network.
-pub fn init(hhdm_offset: u64, tsc_frequency: Option<u64>) {
+/// Start the NIC that the driver model has already matched and claimed.
+/// `Ok` means the MAC is read, the loopback selftest ran and the polled
+/// network state is installed; `Err` carries a stable reason for the driver
+/// binding's `Failed` state. A machine without a NIC never calls this.
+pub fn init(
+    device: &crate::pci::PciDevice,
+    hhdm_offset: u64,
+    tsc_frequency: Option<u64>,
+) -> Result<(), &'static str> {
     TSC_FREQUENCY.store(tsc_frequency.unwrap_or(0), Ordering::SeqCst);
 
-    let Some(device) = crate::pci::find_e1000() else {
-        crate::kprintln!("net: inactive (no supported e1000 NIC)");
-        return;
-    };
     crate::kprintln!(
         "net: e1000 at {:02x}:{:02x}.{} bar0 {:#x} size {} KiB",
         device.bus,
@@ -81,11 +83,11 @@ pub fn init(hhdm_offset: u64, tsc_frequency: Option<u64>) {
     );
     crate::pci::enable_device(device.bus, device.device, device.function);
 
-    let mut nic = match E1000::init(&device, hhdm_offset) {
+    let mut nic = match E1000::init(device, hhdm_offset) {
         Ok(nic) => nic,
         Err(reason) => {
             crate::kprintln!("net: e1000 init failed ({})", reason);
-            return;
+            return Err(reason);
         }
     };
     crate::kprintln!("net: mac {}", nic.mac());
@@ -107,6 +109,7 @@ pub fn init(hhdm_offset: u64, tsc_frequency: Option<u64>) {
         last_echo: None,
         udpecho: None,
     });
+    Ok(())
 }
 
 /// Boot selftest: resolve the gateway with ARP, then one ICMP echo. Logs the

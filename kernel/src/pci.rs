@@ -1,5 +1,7 @@
 //! PCI configuration-space access (mechanism #1), the bus-0 device inventory
-//! and the e1000 locator (Phase 6 stage 5; inventory added in Phase 9 stage 1).
+//! command-register enable (Phase 6 stage 5; inventory added in Phase 9 stage
+//! 1; the e1000 locator was removed in stage 3 when the driver model began
+//! passing the matched function to `net::init`).
 //!
 //! The inventory scans bus 0, honours the multifunction bit and probes BARs
 //! with the standard all-ones write-back (restoring every value immediately).
@@ -351,60 +353,4 @@ pub fn print_devices() {
             .map(|f| f.bar_count as usize)
             .sum::<usize>()
     );
-}
-
-/// Locate the first Intel 82540EM: inventory first, direct bus-0 scan as a
-/// fallback when the inventory is empty.
-pub fn find_e1000() -> Option<PciDevice> {
-    {
-        let inventory = INVENTORY.lock();
-        if let Some(function) = inventory.iter().find(|function| {
-            function.vendor == VENDOR_INTEL && function.device_id == DEVICE_82540EM
-        }) {
-            let bar0 = function.bars[0]?;
-            return Some(PciDevice {
-                bus: function.bus,
-                device: function.device,
-                function: function.function,
-                bar0: bar0.bar,
-                bar0_size: bar0.size,
-            });
-        }
-    }
-    for device in 0..32u8 {
-        let id = read_u32(0, device, 0, 0x00);
-        let (vendor, device_id) = pci::vendor_device(id);
-        if vendor == VENDOR_INTEL && device_id == DEVICE_82540EM {
-            let offset = 0x10;
-            let original_lo = read_u32(0, device, 0, offset);
-            let is_64_bit = pci::decode_bar(original_lo, 0).kind == pci::BarKind::Memory64;
-            let original_hi = if is_64_bit {
-                read_u32(0, device, 0, offset + 4)
-            } else {
-                0
-            };
-            write_u32(0, device, 0, offset, 0xFFFF_FFFF);
-            if is_64_bit {
-                write_u32(0, device, 0, offset + 4, 0xFFFF_FFFF);
-            }
-            let mask_lo = read_u32(0, device, 0, offset);
-            let mask_hi = if is_64_bit {
-                Some(read_u32(0, device, 0, offset + 4))
-            } else {
-                None
-            };
-            write_u32(0, device, 0, offset, original_lo);
-            if is_64_bit {
-                write_u32(0, device, 0, offset + 4, original_hi);
-            }
-            return Some(PciDevice {
-                bus: 0,
-                device,
-                function: 0,
-                bar0: pci::decode_bar(original_lo, original_hi),
-                bar0_size: pci::bar_size(mask_lo, mask_hi),
-            });
-        }
-    }
-    None
 }

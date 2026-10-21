@@ -66,6 +66,10 @@ const DESC_STATUS_EOP: u8 = 0x02;
 const RX_DESCRIPTORS: usize = 32;
 const RX_BUFFER_BYTES: usize = 2048;
 const RX_PAGES: usize = RX_DESCRIPTORS * RX_BUFFER_BYTES / os_core::frame::PAGE_SIZE as usize;
+/// Frames the driver allocates before the device is usable: TX descriptors,
+/// TX buffer, RX descriptors and the RX buffer pages. Recorded in the driver
+/// resource ledger after a successful start.
+pub const DMA_FRAME_BUDGET: u32 = 3 + RX_PAGES as u32;
 const TX_DESCRIPTORS: usize = 8;
 const TX_BUFFER_BYTES: usize = 2048;
 

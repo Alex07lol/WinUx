@@ -485,13 +485,13 @@ pub extern "C" fn kmain() -> ! {
     // recorded functions. A failure is logged, not fatal; the boot marker
     // records whether the self-test passed.
     pci::init();
-    driver::init();
 
-    // Network bring-up (Phase 6, stage 5). Runs with interrupts enabled and
-    // the PIT ticking (before the scheduler exists), so the driver's poll
-    // deadlines are real time. Non-fatal without a supported NIC: the probe
-    // and selftest each log one pinned line and boot continues.
-    net::init(hhdm_offset, tsc_frequency);
+    // Driver bring-up (Phase 9, stage 3). Runs with interrupts enabled and
+    // the PIT ticking (before the scheduler exists), so polled deadlines are
+    // real time. The model binds, starts the e1000, claims resources and
+    // records Running/Failed; a machine without the NIC simply has no
+    // network and the network selftest reports that.
+    driver::init(hhdm_offset, tsc_frequency);
     net::selftest();
 
     if let Err(error) = sched::init(hhdm_offset) {

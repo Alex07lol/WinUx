@@ -93,7 +93,7 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/config.rs` | registry-like configuration store: `/etc/config` load or in-memory defaults, lazy save via the VFS dirty bit, boot self-test | working (ADR-0022) |
 | `kernel/src/registry.rs` | Win32 registry-shaped view over the config store: four-slot `HKLM` handle table (`0x1000 + slot`), case-insensitive prefix/value lookups, write mutations (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`) saved through `config::save()`, per-program reset | working (Phase 8 stages 3–4, ADR-0024/0025) |
 | `kernel/src/pci.rs` | PCI config mechanism #1: bus-0 function inventory (vendor/device/class/header, BAR sizing, multifunction scan), snapshot access, command-register enable | working (Phase 9 stage 1; bus 0 only) |
-| `kernel/src/driver.rs` | driver descriptors over the PCI inventory, deterministic binding, e1000 start/stop/restart through `net`, MMIO/DMA ownership ledger and structural self-test | working (Phase 9 stage 4; e1000 Running/Stopped) |
+| `kernel/src/driver.rs` | driver descriptors over the PCI inventory, deterministic binding, e1000 start/stop/restart through `net`, exact MMIO/DMA-page ownership ledger and structural self-test | working (Phase 9 stage 5; e1000 Running/Stopped) |
 | `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, polled, counters, ring teardown | working (QEMU/VirtualBox) |
 | `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch, `ping`, `udpecho`, status | working (static config) |
 | `kernel/src/shell.rs` | serial shell builtins over kernel services, incl. `config get/set/del/list` | working (serial only) |

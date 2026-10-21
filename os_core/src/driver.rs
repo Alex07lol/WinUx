@@ -193,13 +193,13 @@ pub fn unmatched(devices: usize, bindings: usize) -> usize {
 /// Maximum resource claims tracked at once.
 pub const MAX_RESOURCES: usize = 16;
 
-/// A resource a running driver owns. MMIO and IRQ claims are exclusive;
-/// DMA frames are an accounting budget (the allocator owns the actual
-/// frames, the ledger records how many a driver may hold).
+/// A resource a running driver owns. MMIO ranges and DMA page ranges are
+/// physical address claims and may not overlap each other; IRQ lines are
+/// separate exclusive claims.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Resource {
     Mmio { base: u64, len: u64 },
-    DmaFrames { count: u32 },
+    DmaPages { base: u64, pages: u32 },
     Irq { line: u8 },
 }
 
@@ -232,27 +232,26 @@ impl Ledger {
         }
     }
 
-    /// Claim one resource for a binding. MMIO ranges may not overlap any
-    /// existing MMIO claim; IRQ lines are exclusive. Retrying the same
-    /// owner/resource pair is a conflict, not a silent success.
+    /// Claim one resource for a binding. Physical ranges (MMIO and DMA
+    /// pages) may not overlap any existing physical claim; IRQ lines are
+    /// exclusive. Retrying the same owner/resource pair is a conflict, not a
+    /// silent success.
     pub fn claim(&mut self, owner: usize, resource: Resource) -> Result<(), Error> {
         match resource {
             Resource::Mmio { base, len } => {
                 if len == 0 || base.checked_add(len).is_none() {
                     return Err(Error::InvalidResource);
                 }
-                if self.claims.iter().flatten().any(|claim| {
-                    matches!(
-                        claim.resource,
-                        Resource::Mmio { base: other, len: other_len }
-                            if ranges_overlap(base, len, other, other_len)
-                    )
-                }) {
-                    return Err(Error::ResourceConflict);
-                }
             }
-            Resource::DmaFrames { count } => {
-                if count == 0 {
+            Resource::DmaPages { base, pages } => {
+                let page = crate::frame::PAGE_SIZE;
+                if pages == 0 || !base.is_multiple_of(page) {
+                    return Err(Error::InvalidResource);
+                }
+                let len = (pages as u64)
+                    .checked_mul(page)
+                    .ok_or(Error::InvalidResource)?;
+                if base.checked_add(len).is_none() {
                     return Err(Error::InvalidResource);
                 }
             }
@@ -261,6 +260,16 @@ impl Ledger {
                     return Err(Error::ResourceConflict);
                 }
             }
+        }
+        if let Some((base, len)) = physical_range(&resource)
+            && self
+                .claims
+                .iter()
+                .flatten()
+                .filter_map(|claim| physical_range(&claim.resource))
+                .any(|(other, other_len)| ranges_overlap(base, len, other, other_len))
+        {
+            return Err(Error::ResourceConflict);
         }
         let Some(slot) = self.claims.iter_mut().find(|slot| slot.is_none()) else {
             return Err(Error::TooManyResources);
@@ -296,6 +305,32 @@ impl Ledger {
             })
     }
 
+    /// Binding that owns the DMA page containing `address`, if any.
+    pub fn dma_owner(&self, address: u64) -> Option<usize> {
+        self.claims
+            .iter()
+            .flatten()
+            .find_map(|claim| match claim.resource {
+                Resource::DmaPages { base, pages } => {
+                    let end = base + pages as u64 * crate::frame::PAGE_SIZE;
+                    (address >= base && address < end).then_some(claim.owner)
+                }
+                _ => None,
+            })
+    }
+
+    /// Total DMA pages claimed by owner (0 if none).
+    pub fn dma_pages(&self, owner: usize) -> u32 {
+        self.claims
+            .iter()
+            .flatten()
+            .filter_map(|claim| match claim.resource {
+                Resource::DmaPages { pages, .. } if claim.owner == owner => Some(pages),
+                _ => None,
+            })
+            .sum()
+    }
+
     pub fn irq_owner(&self, line: u8) -> Option<usize> {
         self.claims
             .iter()
@@ -317,6 +352,14 @@ impl Ledger {
 
 fn ranges_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {
     a_base < b_base + b_len && b_base < a_base + a_len
+}
+
+fn physical_range(resource: &Resource) -> Option<(u64, u64)> {
+    match *resource {
+        Resource::Mmio { base, len } => Some((base, len)),
+        Resource::DmaPages { base, pages } => Some((base, pages as u64 * crate::frame::PAGE_SIZE)),
+        Resource::Irq { .. } => None,
+    }
 }
 
 #[cfg(test)]
@@ -595,7 +638,23 @@ mod tests {
             Err(Error::InvalidResource)
         );
         assert_eq!(
-            ledger.claim(0, Resource::DmaFrames { count: 0 }),
+            ledger.claim(
+                0,
+                Resource::DmaPages {
+                    base: 0x1000,
+                    pages: 0
+                }
+            ),
+            Err(Error::InvalidResource)
+        );
+        assert_eq!(
+            ledger.claim(
+                0,
+                Resource::DmaPages {
+                    base: 0x1234,
+                    pages: 1
+                }
+            ),
             Err(Error::InvalidResource)
         );
         assert_eq!(
@@ -647,13 +706,52 @@ mod tests {
     }
 
     #[test]
-    fn dma_budget_is_accounted_per_owner() {
+    fn dma_pages_are_owned_and_overlap_is_rejected() {
         let mut ledger = Ledger::new();
-        ledger.claim(0, Resource::DmaFrames { count: 19 }).unwrap();
-        ledger.claim(1, Resource::DmaFrames { count: 4 }).unwrap();
+        ledger
+            .claim(
+                0,
+                Resource::DmaPages {
+                    base: 0x10000,
+                    pages: 16,
+                },
+            )
+            .unwrap();
+        assert_eq!(ledger.dma_owner(0x10000), Some(0));
+        assert_eq!(ledger.dma_owner(0x1FFFF), Some(0));
+        assert_eq!(ledger.dma_owner(0x20000), None);
+        assert_eq!(
+            ledger.claim(
+                1,
+                Resource::DmaPages {
+                    base: 0x1F000,
+                    pages: 2
+                }
+            ),
+            Err(Error::ResourceConflict)
+        );
+        assert_eq!(
+            ledger.claim(
+                1,
+                Resource::Mmio {
+                    base: 0x10000,
+                    len: 0x1000
+                }
+            ),
+            Err(Error::ResourceConflict)
+        );
+        ledger
+            .claim(
+                1,
+                Resource::DmaPages {
+                    base: 0x20000,
+                    pages: 1,
+                },
+            )
+            .unwrap();
         assert_eq!(ledger.len(), 2);
         assert_eq!(ledger.release(0), 1);
-        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.dma_owner(0x10000), None);
     }
 
     #[test]
@@ -670,7 +768,15 @@ mod tests {
                 },
             )
             .unwrap();
-        ledger.claim(0, Resource::DmaFrames { count: 19 }).unwrap();
+        ledger
+            .claim(
+                0,
+                Resource::DmaPages {
+                    base: 0x10000,
+                    pages: 19,
+                },
+            )
+            .unwrap();
         assert_eq!(ledger.mmio_owner(0x1000), Some(0));
 
         binding.stop().unwrap();
@@ -689,7 +795,15 @@ mod tests {
                 },
             )
             .unwrap();
-        ledger.claim(0, Resource::DmaFrames { count: 19 }).unwrap();
+        ledger
+            .claim(
+                0,
+                Resource::DmaPages {
+                    base: 0x10000,
+                    pages: 19,
+                },
+            )
+            .unwrap();
         assert_eq!(ledger.len(), 2);
     }
 }

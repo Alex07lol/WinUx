@@ -76,28 +76,38 @@ fn find_function<'a>(
     })
 }
 
-/// Claim the matched device's MMIO range and DMA frame budget for the
-/// binding. Partial claims are rolled back on error.
-fn claim_resources(owner: usize, function: &pci::Function) -> Result<(), driver::Error> {
+/// Claim the matched device's MMIO range. The exact DMA page ranges are
+/// claimed later, after the driver allocates them but before the device is
+/// enabled (see `claim_dma` and `E1000::init`).
+fn claim_mmio(owner: usize, function: &pci::Function) -> Result<(), driver::Error> {
     let Some(bar0) = function.bars.iter().flatten().find(|bar| bar.index == 0) else {
         return Err(driver::Error::InvalidResource);
     };
-    let mut ledger = LEDGER.lock();
-    ledger.claim(
+    LEDGER.lock().claim(
         owner,
         Resource::Mmio {
             base: bar0.bar.base,
             len: bar0.size,
         },
-    )?;
-    if let Err(error) = ledger.claim(
-        owner,
-        Resource::DmaFrames {
-            count: crate::e1000::DMA_FRAME_BUDGET,
-        },
-    ) {
+    )
+}
+
+/// Claim the four physical DMA ranges (19 pages total) reported by the
+/// freshly allocated rings. Any partial claim is rolled back.
+fn claim_dma(owner: usize, ranges: [(u64, u32); 4]) -> Result<(), &'static str> {
+    let mut ledger = LEDGER.lock();
+    for (base, pages) in ranges {
+        if ledger
+            .claim(owner, Resource::DmaPages { base, pages })
+            .is_err()
+        {
+            ledger.release(owner);
+            return Err("DMA page claim failed");
+        }
+    }
+    if ledger.dma_pages(owner) != crate::e1000::DMA_PAGE_TOTAL {
         ledger.release(owner);
-        return Err(error);
+        return Err("DMA page accounting mismatch");
     }
     Ok(())
 }
@@ -118,12 +128,12 @@ fn log_resources(name: &str, function: &pci::Function) {
         return;
     };
     crate::kprintln!(
-        "driver: {} resources mmio {:#x}..{:#x} ({} B), {} DMA frame(s), polled",
+        "driver: {} resources mmio {:#x}..{:#x} ({} B), 4 DMA range(s)/{} page(s), polled",
         name,
         bar0.bar.base,
         bar0.bar.base + bar0.size,
         bar0.size,
-        crate::e1000::DMA_FRAME_BUDGET
+        crate::e1000::DMA_PAGE_TOTAL
     );
 }
 
@@ -184,6 +194,9 @@ fn check(
             }
             State::Failed(_) if owner == Some(index) => {
                 return Err("failed binding still owns its MMIO range");
+            }
+            State::Running if LEDGER.lock().dma_pages(index) != crate::e1000::DMA_PAGE_TOTAL => {
+                return Err("running binding does not own its 19 DMA pages");
             }
             _ => {}
         }
@@ -263,11 +276,13 @@ fn start_at(
     let function =
         find_function(functions, binding).ok_or("matched function missing from inventory")?;
     let device = pci_device_of(function).ok_or("matched function has no usable BAR0")?;
-    claim_resources(index, function).map_err(|error| match error {
+    claim_mmio(index, function).map_err(|error| match error {
         driver::Error::InvalidResource => "invalid resource descriptor",
         _ => "resource conflict",
     })?;
-    if let Err(reason) = crate::net::init(&device, hhdm_offset, tsc_frequency) {
+    if let Err(reason) = crate::net::init(&device, hhdm_offset, tsc_frequency, |ranges| {
+        claim_dma(index, ranges)
+    }) {
         LEDGER.lock().release(index);
         return Err(reason);
     }

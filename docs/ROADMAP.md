@@ -420,6 +420,24 @@ reset-timeout recovery, concurrent network use during restart, IRQs, hotplug,
 power management or a virtual GPU. See `docs/DRIVER_MODEL.md`, ADR-0030,
 R-023.
 
+## Phase 9 stage 5 (2026-10-21): exact DMA page ownership and polled IRQ policy
+
+The ledger's count-only DMA budget is replaced by `DmaPages { base, pages }`:
+bases must be page-aligned, ranges must not overflow, and MMIO and DMA claims
+are mutually overlap-checked. The e1000 allocates its rings, reports the four
+real ranges (RX buffer run, TX descriptors, RX descriptors, TX buffer; 19
+pages) to a claim callback, and only then enables RX/TX; a failed claim frees
+the rings. The driver holds five claims (BAR0 plus four ranges), the Running
+self-test requires all 19 pages, and stop/restart releases/reclaims them
+exactly. Interrupts remain explicitly polled with `IMS` masked and no `Irq`
+claim; `Resource::Irq` is modeled and host-tested but unused in the kernel.
+Evidence: host suite 287 (17 driver tests including DMA/MMIO overlap);
+`scripts/test_driver_model_qemu.sh` and `scripts/test_driver_restart_qemu.sh`
+PASS; `scripts/test_net_qemu.sh` PASS; `scripts/test_all.sh` PASS=29 FAIL=0
+SKIP=2. Not claimed: IOMMU isolation, MMIO unmapping, IRQ/MSI delivery,
+allocation-failure injection, hotplug, power management or a virtual GPU. See
+`docs/DRIVER_MODEL.md`, ADR-0031, R-024.
+
 ## Phase 8 acceptance (planned)
 
 Specific published UI/application scenarios pass a compatibility matrix. A

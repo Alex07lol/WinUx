@@ -1495,3 +1495,42 @@ users during stop/restart, hotplug, IRQs/MSI, power management or a virtual
 GPU. A future stage should add a lock/refcount around network users and
 fault-injection tests before calling stop safe under load.
 
+
+## ADR-0031 - Exact DMA page ownership and an explicit polled IRQ policy
+
+**Context.** Stage 3 claimed a 19-frame DMA budget with no addresses, so the
+ledger could not prove which physical pages a driver owned, could not detect a
+DMA/MMIO alias, and could not answer an ownership query for an address.
+Stage 4 freed and re-claimed the same frames but still used the count-only
+model. The e1000 has no interrupt path, yet the ledger models `Irq`; claiming a
+line without handling it would overstate what the kernel does.
+
+**Decision.** Replace `Resource::DmaFrames { count }` with
+`Resource::DmaPages { base, pages }`. The ledger requires a page-aligned base,
+at least one page and no range overflow, and rejects overlap between any two
+physical claims (MMIO and DMA together). It exposes `dma_owner(address)` and
+`dma_pages(owner)`. The e1000 allocates its rings after reset, reports the
+four real ranges (RX buffer run, TX descriptors, RX descriptors, TX buffer) to
+a claim callback, and only then enables RX/TX; a failed claim frees the rings
+and aborts start. The driver structural check requires exactly 19 DMA pages
+for a Running binding. Stop releases five claims (BAR0 plus four ranges).
+Interrupts stay explicitly polled: `IMS` remains masked and no `Irq` claim is
+made. `Resource::Irq` remains modeled and host-tested for a future interrupt
+controller, but is unused in the kernel.
+
+**Alternatives considered.** Keeping the count budget (does not establish
+ownership or detect aliasing); claiming pages before allocation (addresses do
+not exist yet); enabling RX/TX before claiming (a device could DMA before the
+ownership check); claiming an IRQ line while polling (false capability claim);
+dropping `Irq` from the model (loses tested future interface).
+
+**Evidence.** Host suite 287 (17 driver tests, including DMA/MMIO overlap and
+page ownership); `scripts/test_driver_model_qemu.sh` PASS with the four-range
+resource line; `scripts/test_driver_restart_qemu.sh` PASS with five claims
+released/reclaimed, exactly 19 pages freed/reallocated and ICMP after restart;
+`scripts/test_net_qemu.sh` PASS; `scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2.
+
+**Consequences.** The ledger now checks real physical ranges, but it is still
+a software registry: without an IOMMU it cannot prevent a buggy device from
+DMAing outside its claimed pages. MMIO unmapping, interrupt delivery/MSI,
+hotplug and allocation-failure fault injection remain unclaimed.

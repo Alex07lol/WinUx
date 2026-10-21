@@ -1,26 +1,27 @@
 # Driver registration, matching, lifecycle, resource ownership and restart
 
-Status: stages 2–4 implemented and verified (2026-10-21). Contract for
+Status: stages 2-5 implemented and verified (2026-10-21). Contract for
 `os_core::driver`, `kernel/src/driver.rs`, `kernel/src/net.rs`,
 `kernel/src/e1000.rs`, the shell `drivers [stop|start]` command and the QEMU
-harnesses. Evidence is in section 8; ADR-0028/0029/0030 and
-R-021/022/023 record the decisions and research.
+harnesses. Evidence is in section 8; ADR-0028/0029/0030/0031 and
+R-021/022/023/024 record the decisions and research.
 
 ## 1. Scope and non-claims
 
 The model registers compile-time descriptors, matches them against the PCI
 inventory, binds deterministically, starts the matched e1000 through
-`net::init`, records the resources the binding owns, and exposes explicit
-`Bound -> Running -> Stopped` and `-> Failed(reason)` transitions. Stop
-disables the device, resets it, returns all ring frames to the frame
-allocator, removes the network state and releases the ledger claims; start
-repeats the claim/start path. A stop/restart cycle is exercised end to end on
-QEMU, including ICMP after the restart.
+`net::init`, records the exact BAR0 and DMA page ranges the binding owns, and
+exposes explicit `Bound -> Running -> Stopped` and `-> Failed(reason)`
+transitions. Stop disables the device, resets it, returns all ring frames to
+the frame allocator, removes the network state and releases the ledger
+claims; start repeats the claim/start path. A stop/restart cycle is exercised
+end to end on QEMU, including ICMP after the restart.
 
 Not claimed: MMIO unmapping (the HHDM mapping is kernel-lifetime and reused),
-interrupts/MSI (the driver is polled), hotplug, power management, IRPs,
-device stacks, WDM compatibility, dynamic driver loading, class filters,
-multiple NICs (one e1000; a second is unbound) and any virtual GPU. A reset
+interrupts/MSI (the driver is explicitly polled and claims no IRQ line),
+hotplug, power management, IRPs, device stacks, WDM compatibility, dynamic
+driver loading, class filters, multiple NICs (one e1000; a second is unbound)
+and any virtual GPU. A reset
 timeout during stop intentionally leaks the ring frames rather than freeing
 memory the device might still DMA into; that path is reported as failure and
 leaves the binding `Failed`, so restart requires a clean stop.
@@ -40,18 +41,21 @@ leaves the binding `Failed`, so restart requires a clean stop.
   binding can restart), `stop` (`Running -> Stopped`), `fail`
   (`Bound|Running -> Failed(reason)`); illegal transitions are
   `InvalidTransition`, never no-ops. `Failed` is terminal without rebinding.
-- `Ledger`: allocation-free resource ownership. `Mmio { base, len }` ranges
-  are exclusive and overlap-checked; `Irq { line }` is exclusive; `DmaFrames
-  { count }` is an accounting budget owned by the allocator. 16 claims max;
-  MMIO zero/overflow/overlap and IRQ reuse are errors; `release(owner)`
-  drops all of a binding's claims and returns the count; `mmio_owner(addr)`
+- `Ledger`: allocation-free resource ownership. `Mmio { base, len }` and
+  `DmaPages { base, pages }` are physical range claims; all physical claims
+  are mutually overlap-checked, so a DMA page cannot alias MMIO or another
+  driver's pages. DMA bases must be page-aligned, `pages` non-zero and the
+  range must not overflow. `Irq { line }` is a separate exclusive claim.
+  16 claims max; `release(owner)` drops all of a binding's claims and
+  returns the count; `mmio_owner(addr)`, `dma_owner(addr)`, `dma_pages(owner)`
   and `irq_owner(line)` resolve ownership.
 - `unmatched(devices, bindings)` reports unclaimed functions.
 
 The host tests cover matching, priority, single-instance, validation, caps,
 determinism, all lifecycle transitions (including restart from `Stopped`),
-ledger claims, overlap, IRQ exclusivity, invalid resources, caps, release,
-DMA accounting and stop-releases/restart-reclaims.
+ledger claims, physical overlap (including MMIO vs DMA), IRQ exclusivity,
+invalid resources, caps, release, exact DMA page accounting and
+stop-releases/restart-reclaims.
 
 ## 3. Kernel startup lifecycle
 
@@ -59,19 +63,23 @@ Boot order: `pci::init()` records bus-0 functions; `driver::init(hhdm, tsc)`
 then:
 
 1. converts the snapshot to model devices and binds them;
-2. for each binding, finds the PCI function and claims BAR0's MMIO range and
-   the e1000 DMA frame budget (`3` descriptor/buffer frames + `RX_PAGES`
-   buffer pages = 19 frames) in the ledger **before** touching hardware;
-3. calls `net::init(&PciDevice, ...)`, which enables memory/bus-master,
-   resets/configures the e1000, allocates the rings, reads the MAC, runs the
-   polled loopback selftest and installs the network state;
-4. on success moves the binding to `Running`; on any failure releases the
+2. for each binding, finds the PCI function and claims BAR0's MMIO range
+   **before** touching hardware;
+3. calls `net::init(&PciDevice, ..., claim)`, which enables memory/bus-master,
+   resets the e1000, allocates the RX/TX rings, then invokes the claim
+   callback with the four physical ranges (RX buffer run, TX descriptors, RX
+   descriptors, TX buffer; 19 pages) **before** `RCTL`/`TCTL` enable the
+   device. A claim failure frees the just-allocated rings and aborts start;
+4. on success configures RX/TX, reads the MAC, runs the polled loopback
+   selftest and installs the network state; any later failure frees the rings
+   and releases all claims;
+5. on success moves the binding to `Running`; on any failure releases the
    claims and moves it to `Failed(reason)`;
-5. logs the binding, final state, resources, unmatched count and a
+6. logs the binding, final state, resources, unmatched count and a
    structural self-test: descriptor indices, one binding per device, rules
    hold, single-instance honored, every matched device reached Running or
-   Failed, Running bindings own their BAR0 MMIO range, Failed bindings own
-   nothing, and rebinding produces the same plan.
+   Failed, Running bindings own BAR0 plus exactly 19 DMA pages, Failed
+   bindings own nothing, and rebinding produces the same plan.
 
 A device is never started without a successful claim, and a failed start
 leaves no ledger entry. The e1000 uses polled I/O with no IRQ claim.
@@ -82,7 +90,7 @@ Pinned q35 boot lines (pinned e1000 at 00:02.0):
 driver: registered 1 descriptor(s)
 driver: e1000 matched 00:02.0 8086:100e
 driver: e1000 state Running
-driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 19 DMA frame(s), polled
+driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), polled
 driver: 5 function(s) unmatched (no registered driver)
 driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness, single-instance and resource ownership verified)
 ```
@@ -104,24 +112,27 @@ reprints the descriptor table, state, resources and claim count.
 2. On success the RX buffer run (16 pages) and the TX/RX descriptor and TX
    buffer frames (3) are returned with `memory::free_pages`, logging
    `net: stopped (19 DMA frame(s) released)`.
-3. The driver releases its 2 claims (`Mmio`, `DmaFrames`), records
-   `Stopped`, and logs `driver: e1000 state Stopped` plus
-   `driver: e1000 resources released (2 claim(s); mmio mapping retained)`.
+3. The driver releases its 5 claims (`Mmio` plus four `DmaPages` ranges),
+   records `Stopped`, and logs `driver: e1000 state Stopped` plus
+   `driver: e1000 resources released (5 claim(s); mmio mapping retained)`.
    The HHDM MMIO mapping is retained for the kernel lifetime because there is
    no unmap API; pages backing the mapping are firmware MMIO, not allocator
    frames.
 
 `drivers start` (only from `Stopped`) re-runs the same claim and
-`net::init` path: BAR0 and the 19-frame budget are claimed again, the device
-is reset/configured, rings are allocated, the MAC is re-read, the loopback
-selftest runs, and the binding returns to `Running` with
+`net::init` path: BAR0 is claimed again, the device is reset, rings are
+reallocated, their four exact ranges are claimed (19 pages total) before
+RX/TX enable, the MAC is re-read, the loopback selftest runs, and the
+binding returns to `Running` with
 `driver: e1000 restarted (stop/start cycle ok)`. A machine without a run
 state or a failed driver is rejected, never silently restarted.
 
 The QEMU harness proves the accounting end to end: `mem` free frames increase
 by exactly 19 after stop and return to the pre-stop value after restart,
 `net` is inactive while stopped, `drivers` shows zero claims, and
-`ping 10.0.2.2 -c 1` succeeds after the restart.
+`ping 10.0.2.2 -c 1` succeeds after the restart. The ledger log names five
+claims, and the kernel self-test rejects a Running binding whose DMA pages do
+not sum to 19.
 
 ## 5. Why the e1000 moved behind the model
 
@@ -154,12 +165,13 @@ Stop/restart now exercises the same path in reverse.
   `ping 10.0.2.2 -c 1` over paced serial. It asserts exactly 19 frames are
   freed and reallocated, so a leak or double-free fails the test.
 - Host tests cannot exercise the allocator or hardware; they cover the
-  state/ledger rules and the stop/restart accounting contract.
+  state/ledger rules, physical overlap, exact DMA page accounting and the
+  stop/restart accounting contract.
 
 ## 8. Evidence
 
 - Host suite 287 tests; `os_core::driver` has 17 tests covering binding,
-  ownership, teardown and restart.
+  exact page ownership, physical overlap, teardown and restart.
 - `scripts/test_driver_model_qemu.sh` PASS on q35 with a pinned e1000: the
   six boot lines, `,driver`, no panic, QEMU exit 33.
 - `scripts/test_driver_restart_qemu.sh` PASS: stop freed 19 frames, restart
@@ -172,6 +184,9 @@ Stop/restart now exercises the same path in reverse.
 
 ## 9. Next stage (not claimed)
 
-Extend ownership to real DMA page tracking and IRQ allocation, then consider
-a virtual GPU. MMIO unmapping remains absent; a stop/restart does not remap
-or release the HHDM window.
+IRQ/MSI allocation and a real interrupt path, then a virtual GPU. The current
+policy is explicit polling: the e1000 keeps `IMS` masked and no `Irq` claim is
+made, because the kernel has no IOAPIC routing or driver IRQ dispatch yet.
+`Resource::Irq` stays modeled and host-tested but unused in the kernel. MMIO
+unmapping and IOMMU isolation remain absent; DMA claims detect overlap in our
+ledger, they do not enforce isolation in hardware.

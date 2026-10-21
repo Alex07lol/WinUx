@@ -88,7 +88,7 @@ def main():
     boot_tokens = [
         b"driver: e1000 matched 00:02.0 8086:100e",
         b"driver: e1000 state Running",
-        b"driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 19 DMA frame(s), polled",
+        b"driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), polled",
         b"driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness, single-instance and resource ownership verified)",
         b"net selftest: passed (arp resolved, icmp echo reply in ",
     ]
@@ -118,7 +118,7 @@ def main():
         [
             b"net: stopped (19 DMA frame(s) released)",
             b"driver: e1000 state Stopped",
-            b"driver: e1000 resources released (2 claim(s); mmio mapping retained)",
+            b"driver: e1000 resources released (5 claim(s); mmio mapping retained)",
         ],
     )
     if status:
@@ -153,7 +153,7 @@ def main():
         [
             b"net: e1000 at 00:02.0 bar0 0xfebc0000 size 128 KiB",
             b"driver: e1000 state Running",
-            b"driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 19 DMA frame(s), polled",
+            b"driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), polled",
             b"driver: e1000 restarted (stop/start cycle ok)",
         ],
     )

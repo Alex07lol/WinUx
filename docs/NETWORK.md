@@ -153,6 +153,10 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
     `RDBAL/RDBAH/RDLEN`, `RDH = 0`, `RDT = 31`;
   - TX: one 4 KiB descriptor frame (8 × 16 B), one 2048 B buffer frame,
     `TDBAL/TDBAH/TDLEN`, `TDH = TDT = 0`.
+- Before RX/TX enable, the four allocated physical ranges are claimed by the
+  driver model (RX buffer run, TX descriptors, RX descriptors, TX buffer; 19
+  pages). `RCTL`/`TCTL` are written only after the claim succeeds; a claim
+  failure frees the rings without enabling the device.
 - Control registers after rings: `RCTL = EN | BAM | SECRC` (unicast filtering
   by RAL/RAH stays on), `TCTL = EN | PSP | RTLC | CT(0x10) | COLD(0x40)`.
 - `send(frame)`: wait for the previous descriptor's `STA.DD` (1 s deadline),
@@ -174,8 +178,9 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
   (reason ∈ {reset timeout, mac unavailable, ring allocation, loopback
   state}); the probe is then `net selftest: skipped (no NIC)`.
 - Counters: `frames_tx`, `frames_rx`, `errors` (timeouts, descriptor errors).
-- No IRQ: `IMS` stays masked; `poll()` is called from the stack when a command
-  is waiting.
+- No IRQ: `IMS` stays masked, no `Irq` claim is made and `poll()` is called
+  from the stack when a command is waiting. This is an explicit polled policy,
+  not interrupt support.
 
 ## 7. Stack and shell (`kernel/src/net.rs`, `kernel/src/shell.rs`)
 

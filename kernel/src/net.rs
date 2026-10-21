@@ -66,11 +66,15 @@ static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
 /// `Ok` means the MAC is read, the loopback selftest ran and the polled
 /// network state is installed; `Err` carries a stable reason for the driver
 /// binding's `Failed` state. A machine without a NIC never calls this.
-pub fn init(
+pub fn init<F>(
     device: &crate::pci::PciDevice,
     hhdm_offset: u64,
     tsc_frequency: Option<u64>,
-) -> Result<(), &'static str> {
+    claim: F,
+) -> Result<(), &'static str>
+where
+    F: FnOnce([(u64, u32); 4]) -> Result<(), &'static str>,
+{
     TSC_FREQUENCY.store(tsc_frequency.unwrap_or(0), Ordering::SeqCst);
 
     crate::kprintln!(
@@ -83,7 +87,7 @@ pub fn init(
     );
     crate::pci::enable_device(device.bus, device.device, device.function);
 
-    let mut nic = match E1000::init(device, hhdm_offset) {
+    let mut nic = match E1000::init(device, hhdm_offset, claim) {
         Ok(nic) => nic,
         Err(reason) => {
             crate::kprintln!("net: e1000 init failed ({})", reason);
@@ -122,7 +126,7 @@ pub fn shutdown() -> Result<(), &'static str> {
     SELFTEST_PASSED.store(false, Ordering::SeqCst);
     crate::kprintln!(
         "net: stopped ({} DMA frame(s) released)",
-        crate::e1000::DMA_FRAME_BUDGET
+        crate::e1000::DMA_PAGE_TOTAL
     );
     Ok(())
 }

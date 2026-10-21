@@ -55,8 +55,8 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_graphics_host.sh` | framebuffer geometry/colour tests | PASS |
 | `scripts/test_virtualbox.sh` | VirtualBox BIOS boot with an Intel 82540EM NAT NIC attached; kernel detects the NIC (`net: e1000 at 00:03.0`), loopback `unsupported`, gateway ARP unanswered — non-fatal | PASS (7.2.20; marker + 5 ticks) |
 | `scripts/test_pci_qemu.sh` | PCI bus-0 inventory (Phase 9 stage 1): 6 functions/7 BARs on q35 with a pinned e1000, host-bridge/LPC/e1000+BAR0 lines, power-of-two BAR invariants, `pci selftest: passed`, marker `pci`, QEMU exit 33 | PASS |
-| `scripts/test_driver_model_qemu.sh` | driver lifecycle and resource ownership (Phase 9 stage 3): one descriptor registered, e1000 `Running` at 00:02.0, BAR0 MMIO `0xfebc0000..0xfebe0000` and 19-frame DMA budget claimed, five unmatched functions, structural self-test, marker `driver`, QEMU exit 33 | PASS |
-| `scripts/test_driver_restart_qemu.sh` | e1000 stop/restart (Phase 9 stage 4): `drivers stop` frees exactly 19 DMA frames and releases 2 claims, `net` inactive, `drivers` shows Stopped/0 claims, `drivers start` reclaims 19 frames and returns to Running, `ping 10.0.2.2 -c 1` succeeds | PASS |
+| `scripts/test_driver_model_qemu.sh` | driver lifecycle and exact resource ownership (Phase 9 stage 5): one descriptor registered, e1000 `Running` at 00:02.0, BAR0 MMIO `0xfebc0000..0xfebe0000` and four DMA ranges/19 pages claimed, five unmatched functions, structural self-test, marker `driver`, QEMU exit 33 | PASS |
+| `scripts/test_driver_restart_qemu.sh` | e1000 stop/restart with exact page claims (Phase 9 stage 5): `drivers stop` frees exactly 19 DMA frames and releases 5 claims, `net` inactive, `drivers` shows Stopped/0 claims, `drivers start` reclaims 19 frames and returns to Running, `ping 10.0.2.2 -c 1` succeeds | PASS |
 | `scripts/test_gpu_vm.sh` | virtual GPU driver | SKIP (framebuffer only) |
 | `scripts/bench_graphics.sh` | accelerated graphics benchmark | SKIP (no implementation) |
 | `scripts/bench_memory.sh` | host allocator performance | PASS (measurement, not a correctness gate) |

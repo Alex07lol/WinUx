@@ -1281,6 +1281,37 @@ conservative branch, not tested behavior.
 exact frame accounting and post-restart network evidence. Do not claim MMIO
 unmapping, forced reset-failure handling or concurrent stop/restart safety.
 
+## R-024 - DMA page claims must precede device enable; polling vs an IRQ claim
+
+**Question.** When should a driver record ownership of its DMA pages, and is it
+honest to leave the e1000 interrupt line unclaimed?
+
+**Sources.** Reused recorded primary sources from R-012/R-022/R-023: PCI Local
+Bus Specification 3.0 (command-register memory/bus-master gating) and the Intel
+8254x SDM (`CTRL.RST`, `RCTL.EN`, `TCTL.EN`, ring base/length registers, `IMS`
+masking). Our allocator and ledger code define frame ownership. No new external
+document was fetched for this stage, and no vendor driver code was copied.
+
+**Claim.** Ring pages must exist before they can be claimed, but the device
+must not be able to DMA before the claim succeeds. Therefore the safe order is:
+reset and disable RX/TX, allocate the rings, claim their exact physical ranges,
+then set `RCTL`/`TCTL`. If the claim fails, the rings were never enabled and can
+be freed. A count-only budget cannot detect a DMA/MMIO alias; page ranges can.
+A polled driver must not claim an IRQ line: the kernel has no IOAPIC routing or
+driver IRQ dispatch, so such a claim would describe a capability that does not
+exist. Polling is a deliberate limitation, not interrupt support.
+
+**Experiment.** PASSED (2026-10-21): the host ledger suite rejects unaligned,
+empty, overflowing and overlapping DMA ranges, including DMA-vs-MMIO overlap.
+QEMU boots log four ranges/19 pages and five claims; `drivers stop` releases
+five claims and frees exactly 19 frames; `drivers start` reclaims five claims
+and 19 pages; `ping 10.0.2.2 -c 1` succeeds after restart. No interrupt was
+requested or delivered.
+
+**Conclusion.** Use exact page claims before enable and keep the IRQ resource
+unused until a real interrupt path exists. This establishes bookkeeping, not
+hardware isolation (no IOMMU) and not interrupt-driven I/O.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

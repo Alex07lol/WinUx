@@ -66,10 +66,10 @@ const DESC_STATUS_EOP: u8 = 0x02;
 const RX_DESCRIPTORS: usize = 32;
 const RX_BUFFER_BYTES: usize = 2048;
 const RX_PAGES: usize = RX_DESCRIPTORS * RX_BUFFER_BYTES / os_core::frame::PAGE_SIZE as usize;
-/// Frames the driver allocates before the device is usable: TX descriptors,
-/// TX buffer, RX descriptors and the RX buffer pages. Recorded in the driver
-/// resource ledger after a successful start.
-pub const DMA_FRAME_BUDGET: u32 = 3 + RX_PAGES as u32;
+/// Pages the driver allocates before the device is usable: TX descriptors,
+/// TX buffer, RX descriptors and the RX buffer pages. Claimed as four exact
+/// physical ranges in the driver resource ledger before the device is enabled.
+pub const DMA_PAGE_TOTAL: u32 = 3 + RX_PAGES as u32;
 const TX_DESCRIPTORS: usize = 8;
 const TX_BUFFER_BYTES: usize = 2048;
 
@@ -159,7 +159,14 @@ impl E1000 {
 
     /// Bring up the NIC at `device`'s BAR0. `hhdm_offset` maps the physical
     /// window; must be called after the frame allocator and vm init.
-    pub fn init(device: &crate::pci::PciDevice, hhdm_offset: u64) -> Result<E1000, &'static str> {
+    pub fn init<F>(
+        device: &crate::pci::PciDevice,
+        hhdm_offset: u64,
+        claim: F,
+    ) -> Result<E1000, &'static str>
+    where
+        F: FnOnce([(u64, u32); 4]) -> Result<(), &'static str>,
+    {
         if !matches!(device.bar0.kind, BarKind::Memory32 | BarKind::Memory64) {
             return Err("bar0 is not a memory BAR");
         }
@@ -196,8 +203,23 @@ impl E1000 {
         nic.read_mac()?;
         nic.allocate_rings(hhdm_offset)?;
         nic.configure_rings();
+        if let Err(reason) = claim(nic.dma_ranges()) {
+            let _ = nic.free_rings();
+            return Err(reason);
+        }
         nic.configure_device();
         Ok(nic)
+    }
+
+    /// Physical DMA page ranges owned by this device: RX buffer run, TX
+    /// descriptors, RX descriptors and the TX buffer.
+    pub fn dma_ranges(&self) -> [(u64, u32); 4] {
+        [
+            (self.rx_buffers_phys, RX_PAGES as u32),
+            (self.tx_descriptors_phys, 1),
+            (self.rx_descriptors_phys, 1),
+            (self.tx_buffer_phys, 1),
+        ]
     }
 
     /// Stop the device and return every ring frame to the frame allocator.
@@ -210,7 +232,11 @@ impl E1000 {
         self.write(RCTL, 0);
         self.write(TCTL, 0);
         self.reset()?;
+        self.free_rings()
+    }
 
+    /// Return the ring frames. Callers must have quiesced the device.
+    fn free_rings(&self) -> Result<(), &'static str> {
         let mut error = None;
         for (physical, count) in [
             (self.rx_buffers_phys, RX_PAGES),

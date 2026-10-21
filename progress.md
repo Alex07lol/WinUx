@@ -1931,7 +1931,8 @@ enumeration/deletion (ADR-0026, R-019), the PCI bus-0 inventory
 (docs/PCI.md, ADR-0027, R-020), the driver binding model
 (docs/DRIVER_MODEL.md, ADR-0028, R-021) and e1000 start with MMIO/DMA
 ownership (ADR-0029, R-022). Final verified state: 28 PASS / 0 FAIL /
-2 SKIP; unit suite 286; kernel `01e083b3...`, driver session `0bc2ef7b...`.
+2 SKIP; unit suite 286; kernel `01e083b3...`, driver session `0bc2ef7b...`;
+stage-3 commit `f7838fb` is pushed with this progress commit (`4a7bbaf..78f9c66`).
 Single best next action: **Phase 9 stage 4 — kernel stop/restart with mock
 teardown tests**, adding MMIO unmapping, DMA frame reclamation, NET teardown
 and a QEMU stop/restart harness before extending the ledger to real DMA page

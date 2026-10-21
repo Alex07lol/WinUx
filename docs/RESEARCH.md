@@ -1105,6 +1105,57 @@ handles, 234/259 paths) and clean-up back to the seeded defaults;
 **Conclusion.** Confirmed: the harness PASS and `test_all.sh`
 PASS=26/FAIL=0/SKIP=4 are recorded in `docs/WIN32_REGISTRY_ENUM.md` §14.
 
+
+## R-020 — PCI bus-0 inventory: header types, multifunction and BAR sizing safety
+
+**Question.** What is the minimum correct way to inventory PCI functions on
+bus 0 without resource assignment, and how must BARs be probed so that
+enumeration is safe on arbitrary firmware-initiated layouts?
+
+**Sources.**
+- *PCI Local Bus Specification 3.0* (reused from R-012): configuration
+  mechanism #1 (`0xCF8` address, `0xCFC` data), the 256-byte Type 0/1/2
+  header layout, header-type byte at `0x0E` with bit 7 as the multifunction
+  flag, BARs at `0x10` onwards (six for Type 0, two for Type 1, one for
+  Type 2), BAR sizing by writing all ones and reading the mask, and 64-bit
+  memory BARs occupying two dwords.
+- *PCI Local Bus Specification 3.0*: a function is present when the vendor
+  ID read at `0x00` is not `0xFFFF`.
+- QEMU 11.1.0 q35 machine, observed 2026-10-20 with a pinned `-device
+  e1000`: six functions on bus 0 (host bridge `8086:29c0`, VGA `1234:1111`,
+  e1000 `8086:100e`, LPC `8086:2918` with no BARs, SATA `8086:2922` with two
+  BARs, SMBus `8086:2930` with one BAR) and seven implemented BARs.
+
+**Claim.** Reading and recording bus-0 functions with the vendor-presence
+rule, the header-type/multifunction bit, and all-ones BAR sizing with
+immediate restore is sufficient for a truthful inventory and cannot assign
+or move resources. Restricting to bus 0 avoids needing bridge traversal and
+secondary-bus config access in this stage; devices behind root ports are
+explicitly outside the claim. A boot-time snapshot with a 64-function cap
+and a failing self-test on truncation prevents silent data loss.
+
+**Experiment.** PASSED (QEMU 11.1.0 q35, 512 MiB, pinned e1000,
+2026-10-20). `scripts/test_pci_qemu.sh` observed:
+
+```text
+pci: enumerated 6 function(s), 7 BAR(s) on bus 0
+pci: 00:00.0 8086:29c0 class 06:00:00 hdr 00
+pci: 00:02.0 8086:100e class 02:00:00 hdr 00
+pci:   bar0 mem32 base=0xfebc0000 size=0x20000
+pci: 00:1f.0 8086:2918 class 06:01:00 hdr 00
+pci selftest: passed (6 function(s), 7 BAR(s); vendors present, BAR sizes power-of-two, no duplicate function)
+```
+
+and the boot marker included `,pci`; `scripts/test_all.sh` reports
+`PASS=27 FAIL=0 SKIP=3`. The 256 MiB, 512 MiB and 1 GiB boots all ran the
+inventory without a panic. Confidence high for the bus-0 inventory and the
+Type 0/1 BAR count; medium for Type 2 header BAR count (none appeared in
+the test environment). The bridge/secondary-bus and resource-assignment
+questions remain open.
+
+**Conclusion.** Keep bus-0 enumeration with the recorded constraints; add
+bridge traversal and a driver lifecycle model only when a stage needs them.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

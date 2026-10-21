@@ -23,7 +23,7 @@ descriptors, no transactions or change notifications, no
 `RegDeleteTree`/`RegDeleteKeyEx`, no class names or
 `REG_QUERY_INFO_KEY` statistics (the fetched `lpClass`/`lpcchClass`/
 `lpftLastWriteTime` outputs are ignored, never dereferenced), no value or
-key ordering guarantee beyond our deterministic insertion order, no `W`/
+key ordering guarantee beyond our deterministic store order, no `W`/
 Unicode variants, no remote registry, no symbolic links or redirection, no
 typed values beyond REG_SZ, no default/unnamed values, and no recursion in
 `RegDeleteKeyA` (per the fetched rule). No new marker token. No claim of

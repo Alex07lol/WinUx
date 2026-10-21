@@ -14,7 +14,7 @@ were run and observed. No dates or completion percentages are implied.
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–5, 2026-10-20)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025), and a registry enumeration/deletion surface (`RegDeleteKeyA`/`RegEnumKeyExA`/`RegEnumValueA`, services 21–23, first eight- and two-argument stubs, deterministic canonical-order enumeration, non-recursive key deletion with the enumerate-first rule) lets a PE fixture enumerate keys/values and delete keys (`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026); larger Win32 surface, GUI and the compatibility matrix not started |
-| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | not started (framebuffer only) |
+| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stage 1: PCI bus-0 inventory, 2026-10-20) — driver lifecycle, MMIO/DMA/IRQ ownership and VM display not started |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
 
@@ -347,6 +347,22 @@ outputs). The `peregen.exe` fixture will ship only on
 `scripts/test_registry_enum_qemu.sh` PASS plus
 `scripts/test_all.sh` PASS=26 FAIL=0 SKIP=4. See ADR-0026 and R-019; limits
 are restated there and in `docs/WINDOWS_COMPATIBILITY.md`.
+
+## Phase 9 stage 1 (2026-10-20): PCI bus-0 inventory
+
+Implemented and verified: `kernel/src/pci.rs` now records every present
+bus-0 function (devices 0-31, functions 1-7 only for multifunction device 0)
+with vendor/device IDs, class, header type and all implemented BARs, sized by
+the standard all-ones write-back with immediate restore; header types 0/1/2
+have 6/2/1 BAR slots, 64-bit BARs consume two dwords, and a 64-function cap
+fails the self-test instead of dropping data. Boot prints the summary and
+per-function lines, the shell gains `pci`, and the boot marker gains `,pci`
+only on a passing self-test. The e1000 locator uses the inventory with a
+direct-scan fallback. Evidence: `scripts/test_pci_qemu.sh` PASS (q35, pinned
+e1000, six functions/seven BARs, host bridge/LPC/e1000+BAR0 lines, exit 33),
+270/270 host tests, `scripts/test_all.sh` PASS=27 FAIL=0 SKIP=3. No bridge
+traversal, resource assignment, IRQ routing, driver lifecycle or GPU claim.
+See `docs/PCI.md`, ADR-0027, R-020.
 
 ## Phase 8 acceptance (planned)
 

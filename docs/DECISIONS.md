@@ -1285,7 +1285,7 @@ pinned serial lines, fixture sequence, call deltas) lives in
 - **Enumeration over the flattened namespace, deterministic order.**
   Child keys are the distinct first components of entry tails containing
   `/`; values are the direct entries (full tail as the name); order is store
-  insertion order. One `/`-containing value name can therefore be visible as
+  the store's canonical order. One `/`-containing value name can therefore be visible as
   both a value and a child key — Windows' separate namespaces cannot express
   this, and it is stated as a consequence of the store, not hidden.
   Rejected: sorted or hash order (no store basis, unstable across inserts)
@@ -1331,8 +1331,7 @@ does not exercise key removal); typed-value enumeration (needs a typed value
 model the store lacks); a `user32.dll`-shaped surface before a window manager
 exists (misrepresents capability).
 
-**Evidence.** `scripts/test_registry_enum_qemu.sh` → `PASS: Win32 registry
-and `scripts/test_all.sh` runs are recorded.
+**Evidence.** `scripts/test_registry_enum_qemu.sh` -> `PASS: Win32 registry enumeration/deletion verified` (QEMU exit 33, serial transcript pinned); `scripts/test_all.sh` -> `PASS=26 FAIL=0 SKIP=4`; recorded in `docs/WIN32_REGISTRY_ENUM.md` section 14.
 
 **Consequences.** PROJECT_OS can discover and delete registry-shaped
 configuration from ring 3 through allowlisted services, with the fetched
@@ -1341,4 +1340,44 @@ no hives, ACLs, access checks, transactions, class/time outputs, recursion,
 `W`/Unicode variants, typed values, default values, empty keys, remote
 registry or Windows-matching order; four handles and the 64-entry store are
 stage contracts.
+
+
+## ADR-0027 – PCI bus-0 inventory with deterministic BAR probing, no driver framework yet (Phase 9, stage 1)
+
+**Context.** Phase 6 added a single-purpose PCI scan for the e1000
+(`docs/NETWORK.md`, ADR-0018, R-012). Phase 9 needs a general device view
+before any driver lifecycle, MMIO/DMA ownership, interrupt routing or
+virtual GPU work can be honest. The SKIP entry in `scripts/test_all.sh`
+explicitly stated that PCI enumeration was not implemented.
+
+**Decision.** Record every present function on bus 0 (devices 0–31,
+functions 1–7 only when multifunction is set), for header types 0/1/2,
+with vendor/device, class, header type and all implemented BARs. BARs are
+sized by the standard all-ones write-back and restored immediately; a
+64-bit BAR consumes two dword slots. Store at most 64 functions; a truncated
+inventory fails the self-test rather than dropping data silently. Print the
+inventory at boot, expose it through the shell `pci` command, and add `,pci`
+to the boot marker only when the self-test passed. Do **not** add resource
+assignment, bridge traversal, interrupt routing, capability parsing, driver
+matching, hotplug or a GPU claim in this stage.
+
+**Alternatives considered.** Keeping the e1000-only scan (leaves Phase 9
+without a device surface); scanning all buses through bridges (needs
+secondary-bus access, resource rules and much more test surface); ECAM/MMCONFIG
+(needs ACPI MCFG discovery; mechanism #1 is sufficient and already tested);
+assigning BARs (destructive, unnecessary for a read-only inventory); a driver
+model in the same stage (larger, and would mix inventory evidence with
+lifecycle claims).
+
+**Evidence.** `os_core::pci::header_type` unit-tested (270/270 host tests);
+`scripts/test_pci_qemu.sh` PASS with the pinned six-function/seven-BAR q35
+layout, host bridge, LPC, e1000 and BAR0 lines, and the marker check;
+`scripts/test_all.sh` PASS=27 FAIL=0 SKIP=3. Full transcripts and limits are
+in `docs/PCI.md` section 7 and R-020.
+
+**Consequences.** Driver code can now ask a single inventory instead of
+rescanning; the e1000 keeps a fallback scan. Limits to restate: bus 0 only,
+boot-time snapshot, no resource assignment, no IRQ/MSI, no hotplug, no
+driver matching, no GPU. The next stage (driver registration/lifecycle with
+mock devices) is not claimed.
 

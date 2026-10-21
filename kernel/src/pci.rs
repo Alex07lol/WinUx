@@ -1,18 +1,56 @@
-//! PCI configuration-space access (mechanism #1) and a bus-0 scan for the
-//! Intel 82540EM NIC (Phase 6, stage 5).
+//! PCI configuration-space access (mechanism #1), the bus-0 device inventory
+//! and the e1000 locator (Phase 6 stage 5; inventory added in Phase 9 stage 1).
 //!
-//! Deliberately not a general PCI framework: one scan function and the two
-//! register reads/writes the e1000 bring-up needs. Fun facts and the choice of
-//! mechanism #1 over MMCONFIG are recorded in `docs/NETWORK.md` and R-012.
+//! The inventory scans bus 0, honours the multifunction bit and probes BARs
+//! with the standard all-ones write-back (restoring every value immediately).
+//! It is deliberately not a driver framework: no bridge traversal, resource
+//! assignment, interrupt routing or device matching lives here yet. Scope,
+//! limits and evidence are in `docs/PCI.md`, R-020 and ADR-0027.
+
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use os_core::pci;
 
 use crate::arch::x86_64::io::{inl, inw, outl, outw};
+use crate::sync::SpinLock;
 
 pub const VENDOR_INTEL: u16 = 0x8086;
 pub const DEVICE_82540EM: u16 = 0x100E;
 
-/// One located function with its decoded BAR0.
+/// Upper bound on recorded functions; exceeding it is reported, never hidden.
+pub const MAX_FUNCTIONS: usize = 64;
+const BAR_SLOTS: usize = 6;
+
+static INVENTORY: SpinLock<Vec<Function>> = SpinLock::new(Vec::new());
+static TRUNCATED: AtomicBool = AtomicBool::new(false);
+static SELFTEST_PASSED: AtomicBool = AtomicBool::new(false);
+
+/// One decoded Base Address Register.
+#[derive(Clone, Copy, Debug)]
+pub struct BarInfo {
+    pub index: u8,
+    pub bar: pci::Bar,
+    pub size: u64,
+}
+
+/// One present PCI function (vendor != 0xFFFF).
+#[derive(Clone, Copy, Debug)]
+pub struct Function {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor: u16,
+    pub device_id: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub interface: u8,
+    pub header: u8,
+    pub bar_count: u8,
+    pub bars: [Option<BarInfo>; BAR_SLOTS],
+}
+
+/// One located function with its decoded BAR0 (e1000 bring-up shape).
 #[derive(Clone, Copy, Debug)]
 pub struct PciDevice {
     pub bus: u8,
@@ -68,58 +106,297 @@ pub fn enable_device(bus: u8, device: u8, function: u8) {
     write_command(bus, device, function, command);
 }
 
-/// Size BAR0 with the standard all-ones write-back probe and restore the
-/// original value immediately. Returns the decoded BAR and its region size.
-fn bar0_info(bus: u8, device: u8, function: u8) -> (pci::Bar, u64) {
-    const BAR0: u8 = 0x10;
-    const BAR1: u8 = 0x14;
-
-    let original_lo = read_u32(bus, device, function, BAR0);
+/// Size one BAR with the all-ones write-back probe and restore the original
+/// value immediately. Returns `None` for an unimplemented BAR (size zero).
+fn probe_bar(bus: u8, device: u8, function: u8, index: u8) -> Option<BarInfo> {
+    let offset = 0x10 + index * 4;
+    let original_lo = read_u32(bus, device, function, offset);
     let is_64_bit = pci::decode_bar(original_lo, 0).kind == pci::BarKind::Memory64;
     let original_hi = if is_64_bit {
-        read_u32(bus, device, function, BAR1)
+        read_u32(bus, device, function, offset + 4)
     } else {
         0
     };
 
-    write_u32(bus, device, function, BAR0, 0xFFFF_FFFF);
+    write_u32(bus, device, function, offset, 0xFFFF_FFFF);
     if is_64_bit {
-        write_u32(bus, device, function, BAR1, 0xFFFF_FFFF);
+        write_u32(bus, device, function, offset + 4, 0xFFFF_FFFF);
     }
-    let mask_lo = read_u32(bus, device, function, BAR0);
+    let mask_lo = read_u32(bus, device, function, offset);
     let mask_hi = if is_64_bit {
-        Some(read_u32(bus, device, function, BAR1))
+        Some(read_u32(bus, device, function, offset + 4))
     } else {
         None
     };
 
-    write_u32(bus, device, function, BAR0, original_lo);
+    write_u32(bus, device, function, offset, original_lo);
     if is_64_bit {
-        write_u32(bus, device, function, BAR1, original_hi);
+        write_u32(bus, device, function, offset + 4, original_hi);
     }
 
-    (
-        pci::decode_bar(original_lo, original_hi),
-        pci::bar_size(mask_lo, mask_hi),
-    )
+    let size = pci::bar_size(mask_lo, mask_hi);
+    if size == 0 {
+        return None;
+    }
+    Some(BarInfo {
+        index,
+        bar: pci::decode_bar(original_lo, original_hi),
+        size,
+    })
 }
 
-/// Scan bus 0 (all devices, function 0) for the first Intel 82540EM.
+/// Read one function into the inventory. `None` means no device is present
+/// (vendor 0xFFFF). BAR probing happens only for present functions.
+fn scan_function(bus: u8, device: u8, function: u8) -> Option<Function> {
+    let id = read_u32(bus, device, function, 0x00);
+    let (vendor, device_id) = pci::vendor_device(id);
+    if vendor == 0xFFFF {
+        return None;
+    }
+    let (header, _multifunction) = pci::header_type(read_u32(bus, device, function, 0x0C));
+    let (class, subclass, interface) = pci::class_revision(read_u32(bus, device, function, 0x08));
+    let bar_slots = match header {
+        0x00 => 6,
+        0x01 => 2,
+        0x02 => 1,
+        _ => 0,
+    };
+    let mut bars = [None; BAR_SLOTS];
+    let mut index = 0;
+    let mut recorded = 0u8;
+    while index < bar_slots {
+        let info = probe_bar(bus, device, function, index);
+        let is_64_bit = match info {
+            Some(info) => {
+                bars[index as usize] = Some(info);
+                recorded += 1;
+                info.bar.kind == pci::BarKind::Memory64
+            }
+            None => {
+                // An unimplemented BAR still occupies its slot; stop there.
+                false
+            }
+        };
+        index += if is_64_bit { 2 } else { 1 };
+    }
+    Some(Function {
+        bus,
+        device,
+        function,
+        vendor,
+        device_id,
+        class,
+        subclass,
+        interface,
+        header,
+        bar_count: recorded,
+        bars,
+    })
+}
+
+fn push(function: Function) -> bool {
+    let mut inventory = INVENTORY.lock();
+    if inventory.len() >= MAX_FUNCTIONS {
+        TRUNCATED.store(true, Ordering::SeqCst);
+        return false;
+    }
+    inventory.push(function);
+    true
+}
+
+/// Enumerate bus 0 (all 32 devices, functions only beyond 0 when the
+/// multifunction bit is set), record the inventory and run its self-test.
+pub fn init() {
+    {
+        let mut inventory = INVENTORY.lock();
+        inventory.clear();
+    }
+    TRUNCATED.store(false, Ordering::SeqCst);
+    for device in 0..32u8 {
+        let Some(first) = scan_function(0, device, 0) else {
+            continue;
+        };
+        let multifunction = pci::header_type(read_u32(0, device, 0, 0x0C)).1;
+        if !push(first) {
+            break;
+        }
+        if multifunction {
+            for function in 1..8u8 {
+                if let Some(function) = scan_function(0, device, function)
+                    && !push(function)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    let (functions, bars) = {
+        let inventory = INVENTORY.lock();
+        (
+            inventory.len(),
+            inventory
+                .iter()
+                .map(|f| f.bar_count as usize)
+                .sum::<usize>(),
+        )
+    };
+    let truncated = TRUNCATED.load(Ordering::SeqCst);
+    crate::kprintln!(
+        "pci: enumerated {} function(s), {} BAR(s) on bus 0{}",
+        functions,
+        bars,
+        if truncated { " (truncated)" } else { "" }
+    );
+
+    print_devices();
+
+    match selftest() {
+        Ok((functions, bars)) => {
+            SELFTEST_PASSED.store(true, Ordering::SeqCst);
+            crate::kprintln!(
+                "pci selftest: passed ({} function(s), {} BAR(s); vendors present, BAR sizes power-of-two, no duplicate function)",
+                functions,
+                bars
+            );
+        }
+        Err(error) => crate::kprintln!("pci selftest: FAILED ({})", error),
+    }
+}
+
+/// Verify the recorded inventory's invariants and return its totals.
+pub fn selftest() -> Result<(usize, usize), &'static str> {
+    if TRUNCATED.load(Ordering::SeqCst) {
+        return Err("inventory truncated");
+    }
+    let inventory = INVENTORY.lock();
+    if inventory.is_empty() {
+        return Err("no PCI functions on bus 0");
+    }
+    let mut bars = 0usize;
+    for (index, function) in inventory.iter().enumerate() {
+        if function.vendor == 0xFFFF {
+            return Err("missing vendor was recorded");
+        }
+        if inventory[..index].iter().any(|other| {
+            (other.bus, other.device, other.function)
+                == (function.bus, function.device, function.function)
+        }) {
+            return Err("duplicate function was recorded");
+        }
+        let mut recorded = 0u8;
+        for info in function.bars.iter().flatten() {
+            if info.size == 0 || !info.size.is_power_of_two() {
+                return Err("BAR size is not a power of two");
+            }
+            recorded += 1;
+            bars += 1;
+        }
+        if recorded != function.bar_count {
+            return Err("BAR count does not match the recorded bars");
+        }
+    }
+    Ok((inventory.len(), bars))
+}
+
+pub fn selftest_passed() -> bool {
+    SELFTEST_PASSED.load(Ordering::SeqCst)
+}
+
+fn bar_kind_name(kind: pci::BarKind) -> &'static str {
+    match kind {
+        pci::BarKind::Memory32 => "mem32",
+        pci::BarKind::Memory64 => "mem64",
+        pci::BarKind::Io => "io",
+    }
+}
+
+/// Print every recorded function and its BARs (boot log and shell `pci`).
+pub fn print_devices() {
+    let inventory = INVENTORY.lock();
+    for function in inventory.iter() {
+        crate::kprintln!(
+            "pci: {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}:{:02x}:{:02x} hdr {:02x}",
+            function.bus,
+            function.device,
+            function.function,
+            function.vendor,
+            function.device_id,
+            function.class,
+            function.subclass,
+            function.interface,
+            function.header
+        );
+        for info in function.bars.iter().flatten() {
+            crate::kprintln!(
+                "pci:   bar{} {} base={:#x} size={:#x}",
+                info.index,
+                bar_kind_name(info.bar.kind),
+                info.bar.base,
+                info.size
+            );
+        }
+    }
+    crate::kprintln!(
+        "pci: {} function(s), {} BAR(s) on bus 0",
+        inventory.len(),
+        inventory
+            .iter()
+            .map(|f| f.bar_count as usize)
+            .sum::<usize>()
+    );
+}
+
+/// Locate the first Intel 82540EM: inventory first, direct bus-0 scan as a
+/// fallback when the inventory is empty.
 pub fn find_e1000() -> Option<PciDevice> {
+    {
+        let inventory = INVENTORY.lock();
+        if let Some(function) = inventory.iter().find(|function| {
+            function.vendor == VENDOR_INTEL && function.device_id == DEVICE_82540EM
+        }) {
+            let bar0 = function.bars[0]?;
+            return Some(PciDevice {
+                bus: function.bus,
+                device: function.device,
+                function: function.function,
+                bar0: bar0.bar,
+                bar0_size: bar0.size,
+            });
+        }
+    }
     for device in 0..32u8 {
         let id = read_u32(0, device, 0, 0x00);
         let (vendor, device_id) = pci::vendor_device(id);
-        if vendor == 0xFFFF {
-            continue;
-        }
         if vendor == VENDOR_INTEL && device_id == DEVICE_82540EM {
-            let (bar0, bar0_size) = bar0_info(0, device, 0);
+            let offset = 0x10;
+            let original_lo = read_u32(0, device, 0, offset);
+            let is_64_bit = pci::decode_bar(original_lo, 0).kind == pci::BarKind::Memory64;
+            let original_hi = if is_64_bit {
+                read_u32(0, device, 0, offset + 4)
+            } else {
+                0
+            };
+            write_u32(0, device, 0, offset, 0xFFFF_FFFF);
+            if is_64_bit {
+                write_u32(0, device, 0, offset + 4, 0xFFFF_FFFF);
+            }
+            let mask_lo = read_u32(0, device, 0, offset);
+            let mask_hi = if is_64_bit {
+                Some(read_u32(0, device, 0, offset + 4))
+            } else {
+                None
+            };
+            write_u32(0, device, 0, offset, original_lo);
+            if is_64_bit {
+                write_u32(0, device, 0, offset + 4, original_hi);
+            }
             return Some(PciDevice {
                 bus: 0,
                 device,
                 function: 0,
-                bar0,
-                bar0_size,
+                bar0: pci::decode_bar(original_lo, original_hi),
+                bar0_size: pci::bar_size(mask_lo, mask_hi),
             });
         }
     }

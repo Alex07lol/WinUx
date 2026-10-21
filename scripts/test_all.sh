@@ -54,7 +54,7 @@ run registry-enum "$ROOT_DIR/scripts/test_registry_enum_qemu.sh"
 run fbcon "$ROOT_DIR/scripts/test_console_qemu.sh"
 run net "$ROOT_DIR/scripts/test_net_qemu.sh"
 run persistence "$ROOT_DIR/scripts/test_persistence_qemu.sh"
-run pci "$ROOT_DIR/scripts/test_pci.sh"
+run pci "$ROOT_DIR/scripts/test_pci_qemu.sh"
 run driver-model "$ROOT_DIR/scripts/test_driver_model.sh"
 run gpu-vm "$ROOT_DIR/scripts/test_gpu_vm.sh"
 

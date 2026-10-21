@@ -38,6 +38,13 @@ pub fn class_revision(dword: u32) -> (u8, u8, u8) {
     ((dword >> 24) as u8, (dword >> 16) as u8, (dword >> 8) as u8)
 }
 
+/// Split a dword read at configuration offset 12 into the 7-bit header-type
+/// value and the multifunction flag (bit 7 of the header-type byte).
+pub fn header_type(dword: u32) -> (u8, bool) {
+    let header = ((dword >> 16) & 0xFF) as u8;
+    (header & 0x7F, header & 0x80 != 0)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarKind {
     Memory32,
@@ -133,6 +140,14 @@ mod tests {
     fn class_revision_split() {
         let (base, subclass, interface) = class_revision(0x0200_0003);
         assert_eq!((base, subclass, interface), (0x02, 0x00, 0x00));
+    }
+
+    #[test]
+    fn header_type_split() {
+        assert_eq!(header_type(0x0000_0000), (0x00, false));
+        assert_eq!(header_type(0x0080_0000), (0x00, true));
+        assert_eq!(header_type(0x0081_0000), (0x01, true));
+        assert_eq!(header_type(0x00FF_0000), (0x7F, true));
     }
 
     #[test]

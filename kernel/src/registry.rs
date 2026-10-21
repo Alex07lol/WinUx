@@ -8,7 +8,7 @@
 //! while the store itself stays byte-exact (POCF). Stage 4 adds mutations:
 //! `create` (lazy — keys exist only while entries live under them),
 //! `set_value` and `delete_value`, both persisted through `config::save()`.
-//! Stage 5 adds deterministic insertion-order enumeration (`enum_key`,
+//! Stage 5 adds deterministic canonical-order enumeration (`enum_key`,
 //! `enum_value`) and non-recursive `delete_key` (child keys block deletion
 //! with `AccessDenied`; callers delete children first, as Windows
 //! prescribes). The full contracts are `docs/WIN32_REGISTRY.md`,

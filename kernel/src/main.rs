@@ -480,8 +480,13 @@ pub extern "C" fn kmain() -> ! {
         .map(|response| response.frequency)
         .filter(|frequency| *frequency > 0);
 
-    // PCI + network bring-up (Phase 6, stage 5). Runs with interrupts enabled
-    // and the PIT ticking (before the scheduler exists), so the driver's poll
+    // PCI inventory (Phase 9, stage 1): enumerate bus 0 and validate the
+    // recorded functions. A failure is logged, not fatal; the boot marker
+    // records whether the self-test passed.
+    pci::init();
+
+    // Network bring-up (Phase 6, stage 5). Runs with interrupts enabled and
+    // the PIT ticking (before the scheduler exists), so the driver's poll
     // deadlines are real time. Non-fatal without a supported NIC: the probe
     // and selftest each log one pinned line and boot continues.
     net::init(hhdm_offset, tsc_frequency);
@@ -582,6 +587,9 @@ pub extern "C" fn kmain() -> ! {
     }
     if persist::active() {
         checks.push_str(",persist");
+    }
+    if pci::selftest_passed() {
+        checks.push_str(",pci");
     }
     if net::selftest_passed() {
         checks.push_str(",net");

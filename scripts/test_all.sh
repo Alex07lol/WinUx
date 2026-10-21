@@ -56,6 +56,7 @@ run net "$ROOT_DIR/scripts/test_net_qemu.sh"
 run persistence "$ROOT_DIR/scripts/test_persistence_qemu.sh"
 run pci "$ROOT_DIR/scripts/test_pci_qemu.sh"
 run driver-model "$ROOT_DIR/scripts/test_driver_model_qemu.sh"
+run driver-restart "$ROOT_DIR/scripts/test_driver_restart_qemu.sh"
 run gpu-vm "$ROOT_DIR/scripts/test_gpu_vm.sh"
 
 log ""

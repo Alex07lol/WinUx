@@ -1243,6 +1243,44 @@ for this stage. Do not claim kernel stop/restart until mock teardown tests
 and a QEMU stop/restart harness exist; keep `Stopped`/`release` host-tested
 and mark them unused in the kernel.
 
+
+## R-023 — Teardown requires device quiescence before freeing DMA memory; stop/restart accounting
+
+**Question.** What must a kernel driver stop path do before returning ring
+frames to the global allocator, and what evidence is needed to claim a
+restart is correct?
+
+**Sources.** PCI Local Bus Specification 3.0 and the Intel 8254x SDM
+(reused from R-012/R-022): the command register gates bus mastering; RX/TX
+are enabled by `RCTL.EN`/`TCTL.EN`; a device reset (`CTRL.RST`) quiesces
+the function, and descriptor/buffer memory must stay valid until DMA has
+stopped. Our memory/allocator code (Phase 3/R-008) and `docs/DRIVER_MODEL.md`
+define frame ownership. No new external document was fetched for this
+stage; claims are limited to these recorded primary sources and our code.
+
+**Claim.** A safe stop must (1) make the network entry points see no device,
+(2) disable RX/TX and reset the device, (3) wait for reset completion, and
+only then (4) free the ring frames. If the reset does not complete, freeing
+would risk DMA into memory the allocator may hand to another owner, so the
+frames must be leaked and the stop reported as failed. The MMIO HHDM window
+is firmware memory, not allocator memory, so retaining it is not a leak. A
+restart must reclaim the same ledger entries, reallocate exactly the same
+frame budget, and be followed by a functional check (ARP/ICMP), not just a
+`Running` state.
+
+**Experiment.** PASSED (2026-10-21): `scripts/test_driver_restart_qemu.sh`
+stopped the running e1000, observed `net: stopped (19 DMA frame(s)
+released)`, measured frame allocator free count increase by exactly 19,
+verified `net` inactive and `drivers` showing zero claims, restarted with
+`drivers start`, measured the free count return to the pre-stop value, and
+completed `ping 10.0.2.2 -c 1`. Host test count 287. The reset-timeout leak
+path was not forced in QEMU (no fault-injection hook); it is a documented
+conservative branch, not tested behavior.
+
+**Conclusion.** Claim stop/restart only with quiescence-before-free,
+exact frame accounting and post-restart network evidence. Do not claim MMIO
+unmapping, forced reset-failure handling or concurrent stop/restart safety.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

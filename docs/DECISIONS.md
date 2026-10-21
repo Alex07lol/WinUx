@@ -1456,3 +1456,42 @@ remain unimplemented and unclaimed; the next stage should add mock teardown
 tests first, then a QEMU stop/restart harness, then extend ownership to real
 DMA pages and IRQ allocation.
 
+
+## ADR-0030 – Quiesce-before-free stop/restart of the e1000 behind the model
+
+**Context.** Stage 3 starts the e1000 behind the driver model and claims
+BAR0 plus a 19-frame DMA budget, but cannot stop it. A restart is the first
+operation that must return DMA frames to the allocator without risking a
+device still writing into them, and it must not regress the network stack.
+
+**Decision.** Add `drivers stop` and `drivers start` over the model. Stop
+requires `Running`, removes the global network state, masks interrupts,
+disables RX/TX, resets and waits for completion, then frees the RX buffer run
+and three descriptor/buffer frames and logs the 19-frame release. The driver
+then releases both ledger claims, records `Stopped`, and keeps the HHDM MMIO
+window (no unmap API; it is firmware memory). A reset timeout returns an
+error without freeing rings, releases claims and records `Failed`; this path
+is conservative and untested by fault injection. Start is allowed only from
+`Stopped`: it re-claims BAR0 and the 19-frame budget, re-runs `net::init`
+with the saved HHDM/TSC values, and records `Running` with a restart log.
+Extend `Binding::start` to allow `Stopped -> Running` and add host tests for
+teardown/restart accounting.
+
+**Alternatives considered.** Freeing frames before reset (unsafe DMA race);
+resetting without disabling RX/TX first (device can restart DMAs); keeping
+frames allocated across stop (not a real stop; allocator accounting would
+lie); unmap/re-map the HHDM window (no unmap API, and the mapping is firmware
+MMIO); allowing restart from `Failed` (unknown device state).
+
+**Evidence.** 17 driver host tests (suite 287); `scripts/test_driver_restart_qemu.sh`
+PASS with exactly 19 frames freed and reallocated, claims released, network
+inactive/active around the cycle and ICMP after restart;
+`scripts/test_net_qemu.sh` PASS; `scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2.
+See `docs/DRIVER_MODEL.md` and R-023.
+
+**Consequences.** Stop/restart is a verified single-threaded shell operation.
+Not claimed: MMIO unmapping, reset-timeout recovery, concurrent network
+users during stop/restart, hotplug, IRQs/MSI, power management or a virtual
+GPU. A future stage should add a lock/refcount around network users and
+fault-injection tests before calling stop safe under load.
+

@@ -80,7 +80,7 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
             crate::kprintln!("  blk               ATA device information");
             crate::kprintln!("  persist           checkpoint image status");
             crate::kprintln!("  pci               PCI bus-0 inventory");
-            crate::kprintln!("  drivers           driver descriptors and binding plan");
+            crate::kprintln!("  drivers [stop|start]  driver report, stop or restart");
             crate::kprintln!("  net               network interface status");
             crate::kprintln!("  ping <ip> [-c n]  ICMP echo request (default 3, max 10)");
             crate::kprintln!("  udpecho <port>    echo one UDP datagram back to its sender");
@@ -307,7 +307,12 @@ fn execute(command: &str, args: &str) -> Result<(), &'static str> {
             }
         }
         "pci" => pci::print_devices(),
-        "drivers" => driver::print_report(),
+        "drivers" => match args {
+            "" => driver::print_report(),
+            "stop" => driver::stop()?,
+            "start" => driver::start()?,
+            _ => return Err("usage: drivers [stop|start]"),
+        },
         "net" => match net::status() {
             Some(line) => crate::kprintln!("{}", line),
             None => crate::kprintln!("net: inactive (no supported e1000 NIC)"),

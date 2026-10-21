@@ -112,6 +112,21 @@ pub fn init(
     Ok(())
 }
 
+/// Stop the polled NIC and release its ring frames. The network state is
+/// removed first, so even a teardown failure leaves the network inactive.
+pub fn shutdown() -> Result<(), &'static str> {
+    let Some(state) = NET.lock().take() else {
+        return Err("network is not running");
+    };
+    state.nic.shutdown()?;
+    SELFTEST_PASSED.store(false, Ordering::SeqCst);
+    crate::kprintln!(
+        "net: stopped ({} DMA frame(s) released)",
+        crate::e1000::DMA_FRAME_BUDGET
+    );
+    Ok(())
+}
+
 /// Boot selftest: resolve the gateway with ARP, then one ICMP echo. Logs the
 /// pinned `net selftest:` line; never fatal.
 pub fn selftest() {

@@ -14,7 +14,7 @@ were run and observed. No dates or completion percentages are implied.
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–5, 2026-10-20)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025), and a registry enumeration/deletion surface (`RegDeleteKeyA`/`RegEnumKeyExA`/`RegEnumValueA`, services 21–23, first eight- and two-argument stubs, deterministic canonical-order enumeration, non-recursive key deletion with the enumerate-first rule) lets a PE fixture enumerate keys/values and delete keys (`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026); larger Win32 surface, GUI and the compatibility matrix not started |
-| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–3: PCI inventory, driver model, e1000 start + MMIO/DMA claim, 2026-10-21) — stop/restart, real DMA page/IRQ ownership and VM display not started |
+| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–4: PCI inventory, driver model, e1000 start/stop/restart + MMIO/DMA accounting, 2026-10-21) — real DMA page/IRQ ownership, MMIO unmap and VM display not started |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
 
@@ -400,6 +400,25 @@ machine covers `Stopped`/`release`. Evidence: 16 driver host tests (suite
 286), `scripts/test_driver_model_qemu.sh` PASS (state Running, resources,
 `,driver`, exit 33), `scripts/test_net_qemu.sh` PASS, `scripts/test_all.sh`
 PASS=28 FAIL=0 SKIP=2. See `docs/DRIVER_MODEL.md`, ADR-0029, R-022.
+
+
+## Phase 9 stage 4 (2026-10-21): e1000 stop and restart
+
+`drivers stop` removes the network state, masks interrupts, disables RX/TX,
+resets and waits, then frees the 16-page RX buffer run and three
+descriptor/buffer frames (19 total) and releases both ledger claims; the
+binding becomes `Stopped` and the HHDM MMIO window is retained (no unmap API).
+A reset timeout leaks the rings deliberately and records `Failed`.
+`drivers start` is allowed only from `Stopped`, re-claims BAR0 plus the
+19-frame budget, re-runs `net::init` with the saved HHDM/TSC values and
+returns the binding to `Running`. Evidence: host suite 287 (17 driver tests
+including stop-releases/restart-reclaims); `scripts/test_driver_restart_qemu.sh`
+PASS with exactly 19 frames freed and reallocated, zero claims while stopped,
+network inactive/active around the cycle and ICMP after restart;
+`scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2. Not claimed: MMIO unmapping,
+reset-timeout recovery, concurrent network use during restart, IRQs, hotplug,
+power management or a virtual GPU. See `docs/DRIVER_MODEL.md`, ADR-0030,
+R-023.
 
 ## Phase 8 acceptance (planned)
 

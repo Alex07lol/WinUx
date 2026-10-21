@@ -76,10 +76,10 @@ pub struct Binding {
 }
 
 impl Binding {
-    /// `Bound -> Running` after a successful start.
+    /// `Bound | Stopped -> Running` after a successful start or restart.
     pub fn start(&mut self) -> Result<(), Error> {
         match self.state {
-            State::Bound => {
+            State::Bound | State::Stopped => {
                 self.state = State::Running;
                 Ok(())
             }
@@ -473,7 +473,8 @@ mod tests {
         assert_eq!(binding.state, State::Stopped);
         assert_eq!(binding.stop(), Err(Error::InvalidTransition));
         assert_eq!(binding.fail("late failure"), Err(Error::InvalidTransition));
-        assert_eq!(binding.start(), Err(Error::InvalidTransition));
+        binding.start().unwrap();
+        assert_eq!(binding.state, State::Running);
     }
 
     #[test]
@@ -653,5 +654,42 @@ mod tests {
         assert_eq!(ledger.len(), 2);
         assert_eq!(ledger.release(0), 1);
         assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn stop_releases_resources_and_restart_reclaims_them() {
+        let mut binding = bind(&[E1000], &[nic(0, 2, 0)]).unwrap()[0];
+        binding.start().unwrap();
+        let mut ledger = Ledger::new();
+        ledger
+            .claim(
+                0,
+                Resource::Mmio {
+                    base: 0x1000,
+                    len: 0x2000,
+                },
+            )
+            .unwrap();
+        ledger.claim(0, Resource::DmaFrames { count: 19 }).unwrap();
+        assert_eq!(ledger.mmio_owner(0x1000), Some(0));
+
+        binding.stop().unwrap();
+        assert_eq!(ledger.release(0), 2);
+        assert_eq!(ledger.mmio_owner(0x1000), None);
+        assert!(ledger.is_empty());
+
+        binding.start().unwrap();
+        assert_eq!(binding.state, State::Running);
+        ledger
+            .claim(
+                0,
+                Resource::Mmio {
+                    base: 0x1000,
+                    len: 0x2000,
+                },
+            )
+            .unwrap();
+        ledger.claim(0, Resource::DmaFrames { count: 19 }).unwrap();
+        assert_eq!(ledger.len(), 2);
     }
 }

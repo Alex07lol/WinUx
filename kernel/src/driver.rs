@@ -11,7 +11,7 @@
 //! owned. Scope and limits: `docs/DRIVER_MODEL.md`, ADR-0028/0029, R-021/022.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use os_core::driver::{self, Binding, Descriptor, Device, Ledger, Match, Resource, State};
 
@@ -24,6 +24,7 @@ const E1000_NAME: &str = "e1000";
 const STATE_NONE: u8 = 0;
 const STATE_RUNNING: u8 = 1;
 const STATE_FAILED: u8 = 2;
+const STATE_STOPPED: u8 = 3;
 
 static DESCRIPTORS: &[Descriptor] = &[Descriptor {
     name: E1000_NAME,
@@ -36,6 +37,9 @@ static DESCRIPTORS: &[Descriptor] = &[Descriptor {
 
 static SELFTEST_PASSED: AtomicBool = AtomicBool::new(false);
 static STATE: AtomicU8 = AtomicU8::new(STATE_NONE);
+static RUNNING_OWNER: AtomicUsize = AtomicUsize::new(usize::MAX);
+static HHDM: AtomicU64 = AtomicU64::new(0);
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static LEDGER: SpinLock<Ledger> = SpinLock::new(Ledger::new());
 
 fn device_of(function: &pci::Function) -> Device {
@@ -202,6 +206,8 @@ fn check(
 /// devices and log the result. A model or start failure is logged, not fatal;
 /// the boot marker records the model self-test outcome.
 pub fn init(hhdm_offset: u64, tsc_frequency: Option<u64>) {
+    HHDM.store(hhdm_offset, Ordering::SeqCst);
+    TSC_HZ.store(tsc_frequency.unwrap_or(0), Ordering::SeqCst);
     crate::kprintln!("driver: registered {} descriptor(s)", DESCRIPTORS.len());
     let functions = pci::snapshot();
     let devices: Vec<Device> = functions.iter().map(device_of).collect();
@@ -224,36 +230,9 @@ pub fn init(hhdm_offset: u64, tsc_frequency: Option<u64>) {
             binding.device.vendor,
             binding.device.device_id
         );
-
-        let Some(function) = find_function(&functions, binding) else {
-            start_failed(binding, name, "matched function missing from inventory");
-            continue;
-        };
-        let Some(device) = pci_device_of(function) else {
-            start_failed(binding, name, "matched function has no usable BAR0");
-            continue;
-        };
-        match claim_resources(index, function) {
-            Ok(()) => match crate::net::init(&device, hhdm_offset, tsc_frequency) {
-                Ok(()) => {
-                    let _ = binding.start();
-                    STATE.store(STATE_RUNNING, Ordering::SeqCst);
-                    log_state(name, binding);
-                    log_resources(name, function);
-                }
-                Err(reason) => {
-                    LEDGER.lock().release(index);
-                    start_failed(binding, name, reason);
-                }
-            },
-            Err(error) => start_failed(
-                binding,
-                name,
-                match error {
-                    driver::Error::InvalidResource => "invalid resource descriptor",
-                    _ => "resource conflict",
-                },
-            ),
+        match start_at(index, binding, &functions, hhdm_offset, tsc_frequency) {
+            Ok(()) => STATE.store(STATE_RUNNING, Ordering::SeqCst),
+            Err(reason) => start_failed(binding, name, reason),
         }
     }
 
@@ -268,6 +247,91 @@ pub fn init(hhdm_offset: u64, tsc_frequency: Option<u64>) {
             );
         }
         Err(error) => crate::kprintln!("driver selftest: FAILED ({})", error),
+    }
+}
+
+/// Claim a binding's resources and start its device. On failure the claims are
+/// rolled back and the caller records `Failed(reason)`.
+fn start_at(
+    index: usize,
+    binding: &mut Binding,
+    functions: &[pci::Function],
+    hhdm_offset: u64,
+    tsc_frequency: Option<u64>,
+) -> Result<(), &'static str> {
+    let name = DESCRIPTORS[binding.driver].name;
+    let function =
+        find_function(functions, binding).ok_or("matched function missing from inventory")?;
+    let device = pci_device_of(function).ok_or("matched function has no usable BAR0")?;
+    claim_resources(index, function).map_err(|error| match error {
+        driver::Error::InvalidResource => "invalid resource descriptor",
+        _ => "resource conflict",
+    })?;
+    if let Err(reason) = crate::net::init(&device, hhdm_offset, tsc_frequency) {
+        LEDGER.lock().release(index);
+        return Err(reason);
+    }
+    let _ = binding.start();
+    RUNNING_OWNER.store(index, Ordering::SeqCst);
+    log_state(name, binding);
+    log_resources(name, function);
+    Ok(())
+}
+
+/// Shell `drivers stop`: stop the NIC, release its claims and leave the
+/// binding `Stopped`. The HHDM mapping is retained for a later restart.
+pub fn stop() -> Result<(), &'static str> {
+    if STATE.load(Ordering::SeqCst) != STATE_RUNNING {
+        return Err("driver is not running");
+    }
+    let owner = RUNNING_OWNER.load(Ordering::SeqCst);
+    let result = crate::net::shutdown();
+    let released = LEDGER.lock().release(owner);
+    RUNNING_OWNER.store(usize::MAX, Ordering::SeqCst);
+    if let Err(reason) = result {
+        STATE.store(STATE_FAILED, Ordering::SeqCst);
+        crate::kprintln!("driver: e1000 stop FAILED ({})", reason);
+        return Err(reason);
+    }
+    STATE.store(STATE_STOPPED, Ordering::SeqCst);
+    crate::kprintln!("driver: e1000 state Stopped");
+    crate::kprintln!(
+        "driver: e1000 resources released ({} claim(s); mmio mapping retained)",
+        released
+    );
+    Ok(())
+}
+
+/// Shell `drivers start`: restart a stopped NIC through the same claim/start
+/// path used at boot. Only a cleanly stopped driver may be restarted.
+pub fn start() -> Result<(), &'static str> {
+    if STATE.load(Ordering::SeqCst) == STATE_RUNNING {
+        return Err("driver is already running");
+    }
+    if STATE.load(Ordering::SeqCst) != STATE_STOPPED {
+        return Err("driver is not stopped");
+    }
+    let functions = pci::snapshot();
+    let devices: Vec<Device> = functions.iter().map(device_of).collect();
+    let mut bindings = driver::bind(DESCRIPTORS, &devices).map_err(|_| "model failed")?;
+    let Some((index, binding)) = bindings.iter_mut().enumerate().next() else {
+        return Err("no registered device to start");
+    };
+    let name = DESCRIPTORS[binding.driver].name;
+    let tsc = match TSC_HZ.load(Ordering::SeqCst) {
+        0 => None,
+        hz => Some(hz),
+    };
+    match start_at(index, binding, &functions, HHDM.load(Ordering::SeqCst), tsc) {
+        Ok(()) => {
+            STATE.store(STATE_RUNNING, Ordering::SeqCst);
+            crate::kprintln!("driver: {} restarted (stop/start cycle ok)", name);
+            Ok(())
+        }
+        Err(reason) => {
+            start_failed(binding, name, reason);
+            Err(reason)
+        }
     }
 }
 
@@ -308,6 +372,7 @@ pub fn print_report() {
         match STATE.load(Ordering::SeqCst) {
             STATE_RUNNING => binding.state = State::Running,
             STATE_FAILED => binding.state = State::Failed("boot start failed"),
+            STATE_STOPPED => binding.state = State::Stopped,
             _ => {}
         }
         let name = DESCRIPTORS[binding.driver].name;

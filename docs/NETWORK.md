@@ -129,12 +129,15 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
 
 - Config mechanism #1: `outl(0xCF8, address)`, `inl(0xCFC)`; writes restore
   the original BAR value immediately after sizing.
-- Scan bus 0, devices 0..32, function 0; stop at the first `8086:100E`.
+- Enumerate bus 0, devices 0..31, functions 0..7 for multifunction device
+  0; every present function is recorded with vendor/device IDs, class,
+  header type and sized BARs (Phase 9 stage 1).
+- `kernel/src/driver.rs` matches `8086:100E` from that inventory and passes
+  the matched `PciDevice` to `net::init`; there is no separate direct-scan
+  fallback anymore (removed in stage 3).
 - Enable command register bits: memory space (bit 1) and bus master (bit 2).
-- Output: `PciNic { bus, device, function, bar0_physical, bar0_size }`;
-  BAR0 must be a memory BAR of at least 128 KiB, else the device is rejected.
-- One pinned log line from `net::init` (below). `inl` is added to
-  `arch::x86_64::io`; the `outl` comment is updated (no longer test-exit-only).
+- BAR0 must be a memory BAR of at least 128 KiB, else the device is rejected.
+- One pinned log line from `net::init` (below).
 
 ## 6. Driver (`kernel/src/e1000.rs`)
 
@@ -176,10 +179,11 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
 
 ## 7. Stack and shell (`kernel/src/net.rs`, `kernel/src/shell.rs`)
 
-- `net::init(hhdm) -> Status` runs after the persistence step:
-  - no supported NIC: `net: inactive (no supported e1000 NIC)`; every entry
+- `net::init(device, hhdm, tsc) -> Result` runs from the driver model after
+  the PCI inventory and resource claim:
+  - no binding/claim: `net: inactive (no supported e1000 NIC)`; every entry
     point becomes a no-op (except `net` status printing inactive);
-  - NIC found: pinned line
+  - started NIC: pinned line
     `net: e1000 at {bus:02x}:{dev:02x}.{fn} bar0 {:#x} size {} KiB`, then
     `net: mac {mac}` and `net: ip 10.0.2.15/24 gw 10.0.2.2`.
 - `net::selftest() -> Selftest`, exactly one line:
@@ -210,6 +214,17 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
 - Dispatch drops (counted, never logged per packet): non-IPv4/ARP EtherTypes,
   fragmented IPv4, ICMP non-echo, UDP to unbound ports, ARP that is not for
   our IP/gateway, frames shorter than their headers claim.
+
+## 7a. Stop and restart
+
+`net::shutdown()` takes and removes the network state first, disables RX/TX,
+resets the e1000, frees the 16-page RX buffer run and the three TX/RX
+descriptor/buffer frames (19 total), and logs
+`net: stopped (19 DMA frame(s) released)`. `net::init` can then run again
+through `drivers start`: the HHDM BAR0 mapping is retained and reused, rings
+are reallocated, the MAC is re-read and the loopback selftest reruns.
+A reset timeout does not free the rings (the device may still DMA); it is
+reported as a stop failure. See `docs/DRIVER_MODEL.md` section 4.
 
 ## 8. Pinned serial lines (evidence contract)
 

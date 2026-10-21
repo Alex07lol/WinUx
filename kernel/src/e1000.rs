@@ -123,6 +123,7 @@ pub struct E1000 {
     tx_next: usize,
     rx_descriptors: usize,
     rx_descriptors_phys: u64,
+    rx_buffers_phys: u64,
     rx_buffers: [(usize, u64); RX_DESCRIPTORS],
     rx_next: usize,
     tx_frames: u32,
@@ -184,6 +185,7 @@ impl E1000 {
             tx_next: 0,
             rx_descriptors: 0,
             rx_descriptors_phys: 0,
+            rx_buffers_phys: 0,
             rx_buffers: [(0, 0); RX_DESCRIPTORS],
             rx_next: 0,
             tx_frames: 0,
@@ -196,6 +198,38 @@ impl E1000 {
         nic.configure_rings();
         nic.configure_device();
         Ok(nic)
+    }
+
+    /// Stop the device and return every ring frame to the frame allocator.
+    /// The HHDM MMIO mapping is kernel-lifetime and intentionally retained
+    /// (there is no unmap API yet); a restart reuses it. If the reset before
+    /// the free fails the rings are leaked rather than freed while the device
+    /// may still be DMAing.
+    pub fn shutdown(mut self) -> Result<(), &'static str> {
+        self.write(IMC, u32::MAX);
+        self.write(RCTL, 0);
+        self.write(TCTL, 0);
+        self.reset()?;
+
+        let mut error = None;
+        for (physical, count) in [
+            (self.rx_buffers_phys, RX_PAGES),
+            (self.tx_descriptors_phys, 1),
+            (self.rx_descriptors_phys, 1),
+            (self.tx_buffer_phys, 1),
+        ] {
+            let Some(frame) = os_core::frame::PhysFrame::from_address(physical) else {
+                error.get_or_insert("ring frame is not page aligned");
+                continue;
+            };
+            if let Err(reason) = memory::free_pages(frame, count) {
+                error.get_or_insert(reason);
+            }
+        }
+        match error {
+            None => Ok(()),
+            Some(reason) => Err(reason),
+        }
     }
 
     fn reset(&mut self) -> Result<(), &'static str> {
@@ -290,6 +324,7 @@ impl E1000 {
         self.rx_descriptors = (hhdm_offset + self.rx_descriptors_phys) as usize;
 
         let rx_buffers = memory::alloc_pages(RX_PAGES)?;
+        self.rx_buffers_phys = rx_buffers.address();
         for (index, slot) in self.rx_buffers.iter_mut().enumerate() {
             let physical = rx_buffers.address() + (index * RX_BUFFER_BYTES) as u64;
             *slot = ((hhdm_offset + physical) as usize, physical);

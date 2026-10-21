@@ -1997,6 +1997,8 @@ enumeration/deletion (ADR-0026, R-019), the PCI bus-0 inventory
 (ADR-0029, R-022) and e1000 stop/restart with 19-frame teardown/restart
 accounting (ADR-0030, R-023). Final verified state: 29 PASS / 0 FAIL /
 2 SKIP; unit suite 287; kernel `bba9bb7d...`, restart session `4af9dfd4...`.
+Stage commits: `f7838fb` (stage 3), `3ec22ae` (stage 4); pushed with
+progress commits `78f9c66`, `e5796e7` and `acb1892`.
 Single best next action: **Phase 9 stage 5 — real DMA page and IRQ
 ownership**, extending the ledger to actual allocated frames and interrupt
 lines (or explicitly designs a polled-only alternative), with mock

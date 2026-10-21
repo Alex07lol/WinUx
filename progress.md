@@ -180,6 +180,19 @@ marked in the boot checks as `,pci`; the e1000 locator now reads the inventory
 with a direct-scan fallback. A new q35 harness pins the six-function/seven-BAR
 layout, host bridge/LPC and e1000 BAR0 (`docs/PCI.md`, ADR-0027, R-020).
 
+**Phase 9 stage 2** — driver registration and binding model — is implemented
+and verified: `os_core::driver` provides exact vendor/device and class match
+rules, compile-time descriptors, deterministic first-match binding in
+descriptor order, optional single-instance drivers, caps (8 descriptors,
+64 bindings) and explicit `Bound -> Running -> Stopped` / `-> Failed(reason)`
+transitions with illegal transitions rejected. The kernel registers the real
+e1000 descriptor, reports its `Bound` binding over the PCI inventory plus the
+unmatched count and a structural self-test, and exposes `drivers` in the
+shell; no hardware is started or stopped through the model yet. Evidence:
+10 new host tests (suite 280/280), `scripts/test_driver_model_qemu.sh` PASS
+and `scripts/test_all.sh` PASS=28 FAIL=0 SKIP=2 (`docs/DRIVER_MODEL.md`,
+ADR-0028, R-021).
+
 ## Repository state
 
 - Workspace root: this thread's local checkout.
@@ -899,6 +912,22 @@ layout, host bridge/LPC and e1000 BAR0 (`docs/PCI.md`, ADR-0027, R-020).
 - Stage-5 leftovers corrected: canonical-order wording in `registry.rs`,
   DECISIONS and the enum contract; ADR-0026 evidence sentence fixed.
 
+- Phase 9 stage 2 — host model (`os_core/src/driver.rs` + lib export):
+  `Device`/`Match`/`Descriptor`/`Binding`/`State`, strict descriptor
+  validation, deterministic binding, single-instance, caps, explicit
+  lifecycle transitions, 10 unit tests.
+- Phase 9 stage 2 — kernel model (`kernel/src/driver.rs`): e1000 descriptor,
+  inventory snapshot conversion, bind + structural self-test (rules,
+  uniqueness, single-instance, determinism, `Bound` only), boot lines and
+  `drivers` shell report.
+- Phase 9 stage 2 — integration/harness: `pci::snapshot()`, `driver::init()`
+  after the PCI inventory, `,driver` boot check, shell help/command,
+  `scripts/test_driver_model_qemu.sh` (pinned lines, marker, exit 33)
+  replacing the old SKIP-only script; `test_all.sh` path updated.
+- Phase 9 stage 2 — docs: `docs/DRIVER_MODEL.md`, ADR-0028, R-021 (Microsoft
+  driver/device-object pages fetched 2026-10-20 used only for terminology and
+  scope boundaries), TESTING/ROADMAP/ARCHITECTURE updates.
+
 ## Exact commands and results
 
 | Command | Result |
@@ -1446,18 +1475,39 @@ across repeated builds (`7761d0e6...`). Final artifacts: kernel `7761d0e6...`
 1,697,064 B; default ISO `2e890c65...` 7,733,248 B; PCI session log
 `aea6f88d...` 9,836 B; VirtualBox serial `f679b6ec...` 10,169 B.
 
+Phase 9 stage 2 (final runs, 2026-10-20):
+
+```sh
+scripts/format.sh                 # PASS
+scripts/lint.sh                   # PASS
+scripts/build.sh                  # PASS -> kernel 1,826,000 bytes
+scripts/test_unit.sh              # PASS (280/280)
+scripts/test_driver_model_qemu.sh # PASS (exit 33)
+scripts/test_all.sh               # PASS=28 FAIL=0 SKIP=2
+```
+
+The q35 boot with a pinned e1000 printed `driver: registered 1 descriptor(s)`,
+`driver: e1000 matched 00:02.0 8086:100e (state Bound)`,
+`driver: 5 function(s) unmatched (no registered driver)` and
+`driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness
+and single-instance verified)`, and the marker gained `,driver`. The model
+stays `Bound`: net bring-up is unchanged and no start/stop runs through it.
+Final artifacts: kernel `2ce7c393...` 1,826,000 B; default ISO `6ddd0274...`
+7,862,272 B; driver session log `f5578086...` 10,097 B; VirtualBox serial
+`89390a76...` 10,430 B. Full suite 28 PASS / 0 FAIL / 2 SKIP, 280 unit tests.
+
 ## Artifact
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 1,697,064 bytes (Phase 9 stage 1) |
-| Kernel SHA-256 | `7761d0e66ac9cb8b1623318a57a37c7f05afc6cc00c7e8fd01a883c8266d116f` (deterministic: two consecutive stage-9 builds produced the same hash) |
+| Kernel ELF | `artifacts/kernel.elf`, 1,826,000 bytes (Phase 9 stage 2) |
+| Kernel SHA-256 | `2ce7c393a8484cf7a57138c0c745d4997b16dd8393b6078d9ff0ec8344bb1e93` (build id `0.1.0-65ecbfdf`) |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
 | PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1`; `artifacts/pebasics.exe` (Phase 7 stage 3: 5 sections, 1 relocation, nine imports `kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile`), 4096 bytes, SHA-256 `4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`; `artifacts/pebadfn2.exe` (`GetTickCount` → `Sleep` pattern patch), 4096 bytes, SHA-256 `9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d`; `artifacts/peinput.exe` (Phase 8 stage 2: 5 sections, 1 relocation, five imports `kernel32.dll:ExitThread,GetLastError,GetStdHandle,ReadFile,WriteFile`), 4096 bytes, SHA-256 `a2ab21aa4ea7e282c79e2ed1b437c72cee0a21e7b706ba4d0b007a46d5167de0`; `artifacts/pereg.exe` (Phase 8 stage 3: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegOpenKeyExA,RegQueryValueExA;kernel32.dll:ExitThread,WriteFile`), 5120 bytes, SHA-256 `0ca37e2e762035bc98729b102d3a1d53340214e67365eba91daa72866fd3b3d4` (pehello/pebad hash-stable from clean rebuilds; the existing eight artifacts' hashes were unchanged by the stage-3 rebuild; `pereg.exe` was built once and recorded); `artifacts/peregw.exe` (Phase 8 stage 4: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegCreateKeyExA,RegDeleteValueA,RegQueryValueExA,RegSetValueExA;kernel32.dll:ExitThread,WriteFile`), 5632 bytes, SHA-256 `3b00b91a8677ce733f62af242809abe146005c853bb23e99d0c0d00135d5df01` (the nine pre-existing artifacts' hashes were unchanged by the stage-4 rebuild) |
 | ISO | `artifacts/project-os.iso` (default: seven PE modules) |
-| ISO size | 7,733,248 bytes |
-| ISO SHA-256 | `2e890c65cadeb57a3f6f01d0f2a1d4a593cd93b9c17154b483bfa52a430e2aad` (rebuilt in the final stage-9 `test_all.sh` run; `mkisofs` timestamps make byte-for-byte reproducibility impossible) |
+| ISO size | 7,862,272 bytes |
+| ISO SHA-256 | `6ddd0274cb3af372e3c0323a229d9fbeb9dcd4175d92973ef76ea26ca9b7e692` (rebuilt in the final stage-2 `test_all.sh` run; `mkisofs` timestamps make byte-for-byte reproducibility impossible) |
 | Registry ISO | `artifacts/project-os-registry.iso` (`make_iso.sh --registry-fixture`: kernel + three ELF modules + eight PE modules incl. `pereg.exe`, `debug_exit` kept) |
 | Registry ISO size / SHA-256 | 7,909,376 bytes / `d6d909a6c499f58d534cbc5a62b8b8365020dd83215c0abfaedb13246efcdf22` (rebuilt in the final stage-4 `test_all.sh` run; the stage-4 kernel grows the image) |
 | Registry-write ISO | `artifacts/project-os-registry-write.iso` (`make_iso.sh --registry-write-fixture`: kernel + three ELF modules + eight PE modules incl. `peregw.exe`, `debug_exit` kept) |
@@ -1480,8 +1530,8 @@ across repeated builds (`7761d0e6...`). Final artifacts: kernel `7761d0e6...`
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
 The kernel and fixture builds are deterministic for identical sources, flags
-and build ID. The checksums above are from the final Phase 9 stage-1
-`scripts/test_all.sh` run (27 PASS / 0 FAIL / 3 SKIP, unit suite 270 passed).
+and build ID. The checksums above are from the final Phase 9 stage-2
+`scripts/test_all.sh` run (28 PASS / 0 FAIL / 2 SKIP, unit suite 280 passed).
 The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
@@ -1584,6 +1634,12 @@ This is a host model, not a kernel or Linux comparison.
   Networking exists as stage 5 (one polled e1000 with static addressing);
   there is no general on-disk filesystem: persistence is the
   whole-tree checkpoint image (stage 2) described above.
+- Phase 9 stage 2 limits: bindings stay `Bound` (no probe/start callback is
+  invoked by the kernel); e1000 start/stop and MMIO/DMA/IRQ ownership remain
+  outside the model; no IRPs/device stacks/WDM compatibility, hotplug,
+  power management or virtual GPU. The model is compile-time descriptors
+  only (no dynamic loading), 8 descriptors and 64 bindings.
+
 - Phase 9 stage 1 limits: bus 0 only (no bridge/secondary-bus traversal),
   boot-time snapshot (no hotplug), no resource assignment/rebalancing, no
   interrupt routing/MSI, no capability parsing, no driver matching/lifecycle,
@@ -1807,14 +1863,16 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 8 stages 1–5 and Phase 9 stage 1 are complete: configuration store
+Phase 8 stages 1–5 and Phase 9 stages 1–2 are complete: configuration store
 (ADR-0022), Win32 console input (ADR-0023, R-016), read-only registry
 (ADR-0024, R-017), registry write (ADR-0025, R-018), registry
-enumeration/deletion (ADR-0026, R-019) and the PCI bus-0 inventory
-(docs/PCI.md, ADR-0027, R-020). Final verified state: 27 PASS / 0 FAIL /
-3 SKIP; unit suite 270; kernel `7761d0e6...`, PCI session `aea6f88d...`.
-Single best next action: **Phase 9 stage 2 — a driver registration and
-lifecycle model over the PCI inventory**, with host-tested match keys and
-probe/start/stop transitions plus mock-device tests, before any MMIO/DMA/IRQ
-ownership or virtual-GPU claim. Phase 8 acceptance and Phase 9 acceptance
-remain open and are not claimed.
+enumeration/deletion (ADR-0026, R-019), the PCI bus-0 inventory
+(docs/PCI.md, ADR-0027, R-020) and the driver binding model
+(docs/DRIVER_MODEL.md, ADR-0028, R-021). Final verified state: 28 PASS /
+0 FAIL / 2 SKIP; unit suite 280; kernel `2ce7c393...`, driver session
+`f5578086...`.
+Single best next action: **Phase 9 stage 3 — resource ownership and the first
+real lifecycle-managed driver**, defining MMIO/DMA/polled-IRQ ownership and
+stop/restart for the e1000 behind the model, with mock failure tests and the
+network harness as the regression gate. Virtual GPU work and the Phase 8/9
+acceptance matrices remain open and are not claimed.

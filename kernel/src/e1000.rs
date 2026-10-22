@@ -9,10 +9,12 @@
 //! buffers come from the frame allocator and are mapped through the HHDM;
 //! device-visible addresses are the physical addresses of those frames.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use os_core::net::eth::{self, MacAddr};
 use os_core::pci::BarKind;
+use os_core::queue::SpscQueue;
 
 use crate::arch::x86_64::pit;
 use crate::memory;
@@ -77,10 +79,28 @@ const DESC_STATUS_EOP: u8 = 0x02;
 const RX_DESCRIPTORS: usize = 32;
 const RX_BUFFER_BYTES: usize = 2048;
 const RX_PAGES: usize = RX_DESCRIPTORS * RX_BUFFER_BYTES / os_core::frame::PAGE_SIZE as usize;
+
+/// Software handoff capacity. The hardware ring has 32 descriptors; the queue
+/// deliberately holds fewer frames so a burst cannot pin an unbounded amount
+/// of kernel memory. New frames are dropped when it is full.
+pub const RX_QUEUE_FRAMES: usize = 16;
+/// Upper bound on descriptors drained by one interrupt: one full ring. A
+/// refill that races the handler is picked up by the next RXT0/RXDMT0 cause.
+/// A full software queue drops new frames rather than extending latency.
+const RX_IRQ_BUDGET: usize = RX_DESCRIPTORS;
+/// Larger than the maximum Ethernet frame after FCS stripping, with room for
+/// a VLAN tag that the filter currently accepts but does not parse.
+const RX_FRAME_BYTES: usize = 1536;
+
 /// Virtual BAR0 base used by the interrupt handler; zero when no device is
-/// started. The handler only reads ICR to acknowledge the cause.
+/// started. The handler reads ICR (read-to-clear) to acknowledge the cause.
 static IRQ_MMIO: AtomicU64 = AtomicU64::new(0);
 static IRQ_EVENTS: AtomicU64 = AtomicU64::new(0);
+static RX_IRQ_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RX_IRQ_PRODUCED: AtomicU64 = AtomicU64::new(0);
+static RX_IRQ_DEQUEUED: AtomicU64 = AtomicU64::new(0);
+static RX_IRQ_DROPPED: AtomicU64 = AtomicU64::new(0);
+static RX_IRQ_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 /// Pages the driver allocates before the device is usable: TX descriptors,
 /// TX buffer, RX descriptors and the RX buffer pages. Claimed as four exact
@@ -127,6 +147,32 @@ struct TxDescriptor {
     special: u16,
 }
 
+#[derive(Clone, Copy)]
+struct RxFrame {
+    length: usize,
+    bytes: [u8; RX_FRAME_BYTES],
+}
+
+/// The fields the interrupt handler needs to keep draining the hardware ring
+/// after the device is running. Published once before the PIC line is
+/// unmasked and cleared while that line is masked.
+struct RxContext {
+    registers: usize,
+    descriptors: usize,
+    buffers: [(usize, u64); RX_DESCRIPTORS],
+    next: usize,
+}
+
+struct RxContextSlot(UnsafeCell<Option<RxContext>>);
+
+// SAFETY: `RX_CONTEXT` is written only while RX IRQ delivery is stopped and
+// interrupts are disabled, and read by the handler only while
+// `RX_IRQ_ACTIVE` is true. The single CPU cannot run both at once.
+unsafe impl Sync for RxContextSlot {}
+
+static RX_CONTEXT: RxContextSlot = RxContextSlot(UnsafeCell::new(None));
+static RX_QUEUE: SpscQueue<RxFrame, RX_QUEUE_FRAMES> = SpscQueue::new();
+
 /// All fields are plain integers (virtual/physical addresses as `usize`/`u64`)
 /// so the driver is `Send` and can live inside the network lock's state.
 pub struct E1000 {
@@ -168,9 +214,21 @@ impl E1000 {
         self.mac
     }
 
-    /// `(tx_frames, rx_frames, errors)`.
+    /// `(tx_frames, rx_frames, errors)`. Received frames counted by the IRQ
+    /// producer are included so status does not report zero while data is
+    /// flowing through the queue.
     pub fn counters(&self) -> (u32, u32, u32) {
-        (self.tx_frames, self.rx_frames, self.errors)
+        let irq_frames = RX_IRQ_PRODUCED
+            .load(Ordering::Relaxed)
+            .min(u64::from(u32::MAX)) as u32;
+        let irq_errors = RX_IRQ_ERRORS
+            .load(Ordering::Relaxed)
+            .min(u64::from(u32::MAX)) as u32;
+        (
+            self.tx_frames,
+            self.rx_frames.saturating_add(irq_frames),
+            self.errors.saturating_add(irq_errors),
+        )
     }
 
     /// Bring up the NIC at `device`'s BAR0. `hhdm_offset` maps the physical
@@ -227,19 +285,45 @@ impl E1000 {
         Ok(nic)
     }
 
-    /// Enable RX interrupts and publish the MMIO base for the IRQ handler.
-    /// Called only after the IRQ line is claimed and the PIC is about to be
-    /// unmasked; the handler never touches the descriptor rings.
+    /// Enable RX interrupts and publish the ring context for the handler.
+    /// Called after the loopback selftest (which consumes descriptors through
+    /// the polled path) and before the PIC line is unmasked.
     pub fn enable_interrupts(&self) {
+        RX_QUEUE.reset();
+        RX_IRQ_PRODUCED.store(0, Ordering::Relaxed);
+        RX_IRQ_DEQUEUED.store(0, Ordering::Relaxed);
+        RX_IRQ_DROPPED.store(0, Ordering::Relaxed);
+        RX_IRQ_ERRORS.store(0, Ordering::Relaxed);
+        let context = RxContext {
+            registers: self.registers,
+            descriptors: self.rx_descriptors,
+            buffers: self.rx_buffers,
+            next: self.rx_next,
+        };
+        // SAFETY: the PIC line is masked and no handler can observe the slot
+        // until `RX_IRQ_ACTIVE` is published below.
+        unsafe {
+            *RX_CONTEXT.0.get() = Some(context);
+        }
+        RX_IRQ_ACTIVE.store(true, Ordering::Release);
         self.write(RDTR, RDTR_VALUE);
         IRQ_MMIO.store(self.registers as u64, Ordering::SeqCst);
         self.write(IMS, IMS_RXDMT0 | IMS_RXT0);
     }
 
-    /// Mask all device interrupts and detach the handler's MMIO context.
+    /// Mask all device interrupts and detach the handler's ring context. The
+    /// queue is cleared so frames from a stopped device cannot appear after a
+    /// restart; the caller has already masked the PIC line.
     pub fn disable_interrupts(&self) {
         self.write(IMC, u32::MAX);
         IRQ_MMIO.store(0, Ordering::SeqCst);
+        RX_IRQ_ACTIVE.store(false, Ordering::Release);
+        // SAFETY: the line is masked and interrupts are disabled, so the
+        // handler is not running and cannot observe a partially cleared slot.
+        unsafe {
+            *RX_CONTEXT.0.get() = None;
+        }
+        RX_QUEUE.reset();
     }
 
     /// Number of e1000 interrupt causes acknowledged by the IRQ handler.
@@ -247,9 +331,40 @@ impl E1000 {
         IRQ_EVENTS.load(Ordering::Relaxed)
     }
 
-    /// IRQ handler: read ICR (write-one-to-clear causes) and count non-zero
-    /// events. RX frames stay queued for the normal poll path; this handler
-    /// performs no allocation and takes no network lock.
+    /// Whether the interrupt handler owns the hardware RX ring.
+    pub fn irq_rx_active() -> bool {
+        RX_IRQ_ACTIVE.load(Ordering::Acquire)
+    }
+
+    /// `(produced, dequeued, dropped, descriptor_errors)` since the last
+    /// enable. Produced frames are copies owned by the software queue.
+    pub fn irq_rx_stats() -> (u64, u64, u64, u64) {
+        (
+            RX_IRQ_PRODUCED.load(Ordering::Relaxed),
+            RX_IRQ_DEQUEUED.load(Ordering::Relaxed),
+            RX_IRQ_DROPPED.load(Ordering::Relaxed),
+            RX_IRQ_ERRORS.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn irq_rx_depth() -> usize {
+        RX_QUEUE.len()
+    }
+
+    /// Pop one frame produced by the handler, copying it into `buffer`.
+    /// Returns the (possibly truncated) length, or `None` when the queue is
+    /// empty. Only the network service path calls this.
+    pub fn irq_rx_pop_into(buffer: &mut [u8]) -> Option<usize> {
+        let frame = RX_QUEUE.try_pop()?;
+        let copy = frame.length.min(buffer.len());
+        buffer[..copy].copy_from_slice(&frame.bytes[..copy]);
+        RX_IRQ_DEQUEUED.fetch_add(1, Ordering::Relaxed);
+        Some(copy)
+    }
+
+    /// IRQ handler: acknowledge ICR and move completed RX descriptors into the
+    /// bounded queue. This performs bounded copies, takes no lock and never
+    /// calls the protocol stack; the consumer dispatches from the queue.
     pub fn handle_irq() {
         let base = IRQ_MMIO.load(Ordering::Acquire);
         if base == 0 {
@@ -258,9 +373,76 @@ impl E1000 {
         // SAFETY: `base` is the mapped BAR0 virtual address published by a
         // running device; ICR is a valid 32-bit register at offset 0xC0.
         let cause = unsafe { core::ptr::read_volatile((base + ICR as u64) as *const u32) };
-        if cause != 0 {
-            IRQ_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if cause == 0 {
+            return;
         }
+        IRQ_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if cause & (IMS_RXDMT0 | IMS_RXT0) == 0 {
+            return;
+        }
+        if !RX_IRQ_ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: active was observed with acquire after the context was
+        // published; the handler runs with interrupts disabled on the single
+        // CPU, so the network service path cannot mutate the context.
+        let Some(rx) = (unsafe { (*RX_CONTEXT.0.get()).as_mut() }) else {
+            return;
+        };
+
+        let mut produced = 0u64;
+        let mut dropped = 0u64;
+        let mut errors = 0u64;
+        for _ in 0..RX_IRQ_BUDGET {
+            let index = rx.next;
+            let descriptor = (rx.descriptors as *mut RxDescriptor).wrapping_add(index);
+            // SAFETY: descriptor belongs to the ring the device was configured
+            // with; DD is read before the driver re-arms the slot.
+            let status =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*descriptor).status)) };
+            if status & DESC_STATUS_DD == 0 {
+                break;
+            }
+            // SAFETY: as above; the device has filled in these fields.
+            let descriptor_errors =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*descriptor).errors)) };
+            // SAFETY: as above.
+            let length =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*descriptor).length)) }
+                    as usize;
+            let complete = status & DESC_STATUS_EOP != 0;
+            if descriptor_errors != 0 || !complete {
+                errors += 1;
+            } else if RX_QUEUE.is_full() {
+                dropped += 1;
+            } else {
+                let (source, _) = rx.buffers[index];
+                let mut frame = RxFrame {
+                    length: length.min(RX_FRAME_BYTES),
+                    bytes: [0u8; RX_FRAME_BYTES],
+                };
+                for (offset, byte) in frame.bytes[..frame.length].iter_mut().enumerate() {
+                    // SAFETY: the device wrote `length` bytes into this buffer
+                    // and the descriptor is still owned by the driver.
+                    *byte = unsafe { core::ptr::read_volatile((source + offset) as *const u8) };
+                }
+                if RX_QUEUE.try_push(frame).is_ok() {
+                    produced += 1;
+                } else {
+                    dropped += 1;
+                }
+            }
+            // SAFETY: clearing DD and moving the tail pointer hands the slot
+            // back to the device (same rule as the polled path).
+            unsafe {
+                core::ptr::write_volatile(core::ptr::addr_of_mut!((*descriptor).status), 0);
+                core::ptr::write_volatile((rx.registers + RDT as usize) as *mut u32, index as u32);
+            }
+            rx.next = (index + 1) % RX_DESCRIPTORS;
+        }
+        RX_IRQ_PRODUCED.fetch_add(produced, Ordering::Relaxed);
+        RX_IRQ_DROPPED.fetch_add(dropped, Ordering::Relaxed);
+        RX_IRQ_ERRORS.fetch_add(errors, Ordering::Relaxed);
     }
 
     /// Physical DMA page ranges owned by this device: RX buffer run, TX

@@ -1,11 +1,11 @@
 # Driver registration, matching, lifecycle, resource ownership and restart
 
-Status: stages 2-6 implemented and verified (2026-10-22). Contract for
-`os_core::driver`, `kernel/src/driver.rs`, `kernel/src/net.rs`,
-`kernel/src/e1000.rs`, `kernel/src/irq.rs`, the shell `drivers [stop|start]`
-command and the QEMU harnesses. Evidence is in section 8;
-ADR-0028/0029/0030/0031/0032 and R-021/022/023/024/025 record the decisions
-and research.
+Status: stages 2-7 implemented and verified (2026-10-22). Contract for
+`os_core::driver`, `os_core::queue`, `kernel/src/driver.rs`,
+`kernel/src/net.rs`, `kernel/src/e1000.rs`, `kernel/src/irq.rs`, the shell
+`drivers [stop|start]` command and the QEMU harnesses. Evidence is in section
+8; ADR-0028/0029/0030/0031/0032/0033 and R-021/022/023/024/025/026 record the
+decisions and research.
 
 ## 1. Scope and non-claims
 
@@ -15,18 +15,22 @@ inventory, binds deterministically, starts the matched e1000 through
 exposes explicit `Bound -> Running -> Stopped` and `-> Failed(reason)`
 transitions. Stage 6 adds legacy INTx delivery: firmware's PCI interrupt
 line is claimed exclusively, the e1000 handler is registered before the line
-is unmasked, and a handler acknowledges `ICR` and counts events without
-touching the rings. Stop masks and unregisters the line, disables the device,
-resets it, returns all ring frames, removes network state and releases every
-claim; start repeats the same path. A stop/restart cycle is exercised end to
-end on QEMU, including ICMP and new interrupt events after the restart.
+is unmasked, and the handler acknowledges `ICR`. Stage 7 moves the RX data
+path into that handler: it copies completed descriptors into a bounded
+single-producer/single-consumer queue (16 frames, drop-newest on overflow),
+while the network service path pops and dispatches them. Without a usable
+line the driver keeps the original polled path. Stop masks and unregisters
+the line, clears the queue, disables the device, resets it, returns all ring
+frames, removes network state and releases every claim; start repeats the
+same path. A stop/restart cycle is exercised end to end on QEMU, including
+ICMP and queue delivery after the restart.
 
 Not claimed: MMIO unmapping (the HHDM mapping is kernel-lifetime and reused),
-MSI/IOAPIC routing (only legacy 8259 INTx is implemented), interrupt-driven
-networking (RX frames are still drained by `poll()`; the handler only
-acknowledges and counts), hotplug, power management, IRPs, device stacks, WDM
-compatibility, dynamic driver loading, class filters, multiple NICs (one
-e1000; a second is unbound) and any virtual GPU. A reset
+MSI/IOAPIC routing (only legacy 8259 INTx is implemented), a background
+network thread (protocol dispatch still runs from the service/poll path),
+hotplug, power management, IRPs, device stacks, WDM compatibility, dynamic
+driver loading, class filters, multiple NICs (one e1000; a second is unbound)
+and any virtual GPU. A reset
 timeout during stop intentionally leaks the ring frames rather than freeing
 memory the device might still DMA into; that path is reported as failure and
 leaves the binding `Failed`, so restart requires a clean stop.
@@ -78,8 +82,10 @@ then:
    invokes the claim callback with the four physical ranges (RX buffer run,
    TX descriptors, RX descriptors, TX buffer; 19 pages) **before**
    `RCTL`/`TCTL` enable the device. A claim failure frees the just-allocated
-   rings and aborts start. On success it programs `RDTR`, publishes the MMIO
-   base and enables `RXT0|RXDMT0` in `IMS`; the PIC line is still masked;
+   rings and aborts start. On success it runs the loopback selftest, then
+   publishes the RX context and enables `RXT0|RXDMT0` in `IMS`; the PIC line
+   is still masked. The IRQ handler, not the service path, advances the
+   hardware RX ring from here;
 5. after `net::init` returns, unmasks the line, moves the binding to
    `Running`; on any failure masks/unregisters the IRQ, frees the rings and
    releases all claims, then moves it to `Failed(reason)`;
@@ -91,8 +97,9 @@ then:
    same plan.
 
 A device is never started without a successful claim, and a failed start
-leaves no ledger entry. The e1000's IRQ claim describes delivery only: RX/TX
-completion remains polled, so an interrupt does not run protocol code.
+leaves no ledger entry. The e1000's IRQ claim now covers both delivery and
+ring handoff: the handler copies frames, but protocol parsing and replies
+still run on the service path after the network lock is taken.
 
 Pinned q35 boot lines (pinned e1000 at 00:02.0):
 
@@ -102,8 +109,8 @@ driver: e1000 matched 00:02.0 8086:100e
 net: e1000 at 00:02.0 bar0 0xfebc0000 size 128 KiB
 net: mac 52:54:00:12:34:56
 net: ip 10.0.2.15/24 gw 10.0.2.2
-net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX drain remains polled)
 net: loopback selftest: unsupported
+net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX queue 16 frames, drop-newest)
 driver: e1000 state Running
 driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), irq 11 (legacy INTx)
 driver: 5 function(s) unmatched (no registered driver)
@@ -148,10 +155,11 @@ state or a failed driver is rejected, never silently restarted.
 The QEMU harness proves the accounting end to end: `mem` free frames increase
 by exactly 19 after stop and return to the pre-stop value after restart,
 `net` is inactive while stopped, `drivers` shows zero claims, and
-`ping 10.0.2.2 -c 1` succeeds after the restart and the e1000 IRQ event
-count grows (2 -> 4 in the recorded run). The ledger log names six claims,
-and the kernel self-test rejects a Running binding whose DMA pages do not sum
-to 19 or whose IRQ line is owned by another claim.
+`ping 10.0.2.2 -c 1` succeeds after the restart, the e1000 IRQ event
+count grows (2 -> 4 in the recorded run), and the RX queue counters reset and
+deliver two frames after the restart. The ledger log names six claims, and the
+kernel self-test rejects a Running binding whose DMA pages do not sum to 19 or
+whose IRQ line is owned by another claim.
 
 ## 5. Why the e1000 moved behind the model
 
@@ -182,33 +190,38 @@ Stop/restart now exercises the same path in reverse.
 - `scripts/test_driver_restart_qemu.sh` boots the interactive ISO and drives
   `net`, `mem`, `drivers stop`, `net`, `drivers`, `drivers start`,
   `ping 10.0.2.2 -c 1`, `net` over paced serial. It asserts exactly 19 frames
-  are freed and reallocated and that the e1000 IRQ event count grows after the
-  restart, so a leak, double-free or unregistered handler fails the test.
+  are freed and reallocated, the e1000 IRQ event count grows, and queue
+  delivery restarts from zero, so a leak, double-free, stale queued frame or
+  unregistered handler fails the test.
 - Host tests cannot exercise the allocator or hardware; they cover the
   state/ledger rules, physical overlap, exact DMA page accounting and the
   stop/restart accounting contract.
 
 ## 8. Evidence
 
-- Host suite 287 tests; `os_core::driver` has 17 tests covering binding,
-  exact page ownership, physical overlap, teardown and restart.
+- Host suite 292 tests; `os_core::driver` has 17 tests covering binding,
+  exact page ownership, physical overlap, teardown and restart, and
+  `os_core::queue` has 5 tests including order, overflow, reset and a
+  20,000-item two-thread SPSC stress run.
 - `scripts/test_driver_model_qemu.sh` PASS on q35 with a pinned e1000: the
   six boot lines, `,driver`, no panic, QEMU exit 33.
 - `scripts/test_driver_restart_qemu.sh` PASS: stop freed 19 frames, restart
   reclaimed them, `net` inactive/active, ping after restart.
-- `scripts/test_net_qemu.sh` PASS: the restart-capable driver did not
-  regress ARP/ICMP/UDP, and the e1000 IRQ event count grows after `ping`
-  (boot baseline 2). VirtualBox assigns line 9 and boots; its isolated NAT has
-  no gateway reply, so no delivery count is claimed there.
-- `scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2 after the stage-6 changes.
+- `scripts/test_net_qemu.sh` PASS: ARP/ICMP/UDP still work; the IRQ event
+  count grows 2 -> 5 and queue delivery grows 2 -> 5 frames after `ping`.
+  VirtualBox assigns line 9 and boots; its isolated NAT has no gateway reply,
+  so no delivery count is claimed there.
+- `scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2 after the stage-7 changes.
 - Recorded sessions: `artifacts/qemu-driver-session.log`,
   `artifacts/qemu-driver-restart-session.log`, `artifacts/qemu-net-session.log`,
   `artifacts/vbox-serial.log`.
 
 ## 9. Next stage (not claimed)
 
-A useful interrupt-driven RX path (deferred ring drain with bounded work),
-then APIC/IOAPIC/MSI routing, then a virtual GPU. The stage-6 handler is a
-delivery/ownership proof only: it reads `ICR` and counts, while protocol work
-remains polled. MMIO unmapping and IOMMU isolation remain absent; DMA claims
-detect overlap in our ledger, they do not enforce isolation in hardware.
+APIC/IOAPIC/MSI routing, then a virtual GPU. The stage-7 handler drains up to
+one full 32-descriptor ring per interrupt into a 16-frame software queue and
+drops new frames when that queue is full; protocol work still runs on the
+service path, so this is not a background network thread. Queue-overflow and
+interrupt-storm injection are not exercised in the VM. MMIO unmapping and
+IOMMU isolation remain absent; DMA claims detect overlap in our ledger, they
+do not enforce isolation in hardware.

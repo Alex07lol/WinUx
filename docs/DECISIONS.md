@@ -1584,3 +1584,59 @@ IOAPIC routing, shared lines, interrupt coalescing, deferred work and
 concurrent stop safety remain unclaimed. An interrupt storm is bounded only
 by reading `ICR`; there is no queue or backlog because no deferred work is
 queued.
+
+## ADR-0033 - Bounded SPSC handoff for interrupt-context RX
+
+**Context.** Stage 6 delivered legacy INTx and acknowledged `ICR`, but the
+handler deliberately avoided the descriptor ring: taking the network lock in
+an interrupt would deadlock against a lock held by the interrupted thread, and
+doing unbounded copies in interrupt context would put a latency bound on every
+packet burst. Polling still worked, so the data path did not depend on the
+interrupt. A real interrupt-driven receiver needs a safe handoff between the
+handler and the service path without allocation and without a blocking lock.
+
+**Decision.** The e1000 interrupt handler becomes the only writer of the
+hardware RX tail. After the loopback selftest, `enable_interrupts` publishes a
+static `RxContext` (MMIO base, descriptor base, buffer table, next index) and
+enables `RXT0|RXDMT0`. Each interrupt reads `ICR`, then drains at most one full
+32-descriptor ring. A valid completed frame is copied into a fixed 1536-byte
+slot and pushed to `os_core::queue::SpscQueue<RxFrame, 16>`; the descriptor is
+cleared and returned through `RDT` immediately, including when the queue is
+full. The queue has one producer and one consumer, free-running head/tail
+counters, release publication and acquire observation, and no allocation. A
+full queue rejects the newest frame and increments a drop counter. The network
+service path pops at most 8 frames per pass and dispatches them under the
+existing lock. When no usable legacy line exists, the original polled
+`receive_into` path remains. Stop clears the context and resets the queue while
+the PIC line is masked.
+
+**Alternatives considered.** Keep the handler as an acknowledge-only probe
+(leaves the data path polled and does not exercise deferred work); take the
+network lock in the handler (deadlock on the single CPU); dispatch the full
+protocol stack in the handler (unbounded work, lock inversion, ARP replies
+inside interrupt context); use an unbounded heap queue (allocation in IRQ and
+no overload bound); mask the line and drain from a flag-driven service path
+(simpler, but the handler would still not own the ring and the queue would be
+implicit in the device); allow the consumer to poll the device when the queue
+is empty (two ring owners, harder to reason about). The chosen split keeps the
+handler bounded and lock-free and gives the service path a single, testable
+input.
+
+**Evidence.** Host suite 292 (5 queue tests: order, full rejection, wrap,
+reset, 20,000-item two-thread stress). QEMU q35 with the pinned e1000: boot
+selftest delivers 2 frames; `ping 10.0.2.2 -c 3` raises IRQ events 2 -> 5 and
+queue delivery 2 -> 5 with zero drops; stop frees 19 frames, restart resets
+the queue and delivers 2 frames after the restart ping; UDP echo round-trips
+19 bytes. `scripts/test_driver_model_qemu.sh`, `scripts/test_driver_restart_qemu.sh`,
+`scripts/test_net_qemu.sh` and `scripts/test_all.sh` PASS (29 PASS / 0 FAIL /
+2 SKIP).
+
+**Consequences.** RX copies now happen in interrupt context and are bounded by
+32 frames per interrupt and a 16-frame software queue. The implementation is
+single-CPU SPSC: it assumes the handler and consumer never run concurrently
+(the handler runs with interrupts disabled, and the consumer runs with the
+network lock, which disables interrupts). SMP would require per-CPU queues or
+a different discipline. Queue overflow is counted but the VM run did not force
+a drop; storm behavior, coalescing and MSI/IOAPIC remain untested. Frames are
+copied twice on the IRQ path (device buffer to queue, queue to dispatch
+buffer), a deliberate simplicity/latency trade-off that is not benchmarked.

@@ -14,7 +14,7 @@ were run and observed. No dates or completion percentages are implied.
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–5, 2026-10-20)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025), and a registry enumeration/deletion surface (`RegDeleteKeyA`/`RegEnumKeyExA`/`RegEnumValueA`, services 21–23, first eight- and two-argument stubs, deterministic canonical-order enumeration, non-recursive key deletion with the enumerate-first rule) lets a PE fixture enumerate keys/values and delete keys (`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026); larger Win32 surface, GUI and the compatibility matrix not started |
-| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–6: PCI inventory, driver model, e1000 start/stop/restart + exact MMIO/DMA/IRQ claims, 2026-10-22) — interrupt-driven RX, MSI/IOAPIC, MMIO unmap and VM display not started |
+| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–7: PCI inventory, driver model, e1000 start/stop/restart + exact MMIO/DMA/IRQ claims, bounded IRQ-to-service RX queue, 2026-10-22) — MSI/IOAPIC, MMIO unmap and VM display not started |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
 
@@ -459,6 +459,31 @@ VirtualBox assigns line 9 and boots. `scripts/test_all.sh` PASS=29 FAIL=0
 SKIP=2. Not claimed: interrupt-driven RX (protocol work remains polled),
 MSI/IOAPIC, shared lines, coalescing tuning, MMIO unmapping, IOMMU isolation or
 a virtual GPU. See `docs/DRIVER_MODEL.md`, `docs/NETWORK.md`, ADR-0032, R-025.
+
+## Phase 9 stage 7 (2026-10-22): bounded interrupt-driven RX
+
+The e1000 handler now owns the hardware RX ring. After the loopback selftest,
+`enable_interrupts` publishes the MMIO/descriptor/buffer context and enables
+`RXT0|RXDMT0`. Each interrupt reads `ICR` and drains at most one full
+32-descriptor ring into a fixed 16-frame SPSC copy queue
+(`os_core::queue::SpscQueue`); descriptors are re-armed immediately, including
+when the queue is full. A full queue drops the newest frame and increments a
+counter. `net::drain_rx` pops at most 8 frames per pass and dispatches them
+under the existing network lock; the original polled ring path remains for
+machines without a usable legacy line. Stop masks the line, clears the context
+and resets the queue, so a restart cannot deliver a pre-stop frame. `net`
+status reports depth, delivered and dropped counters.
+
+Evidence: host suite 292 (5 queue tests including a 20,000-item two-thread
+stress); QEMU q35 boot selftest delivered 2 frames; `ping 10.0.2.2 -c 3` raised
+IRQ events 2 -> 5 and queue delivery 2 -> 5 with zero drops; stop/restart
+freed/reclaimed 19 frames and delivered 2 frames after the restart ping; UDP
+echo round-tripped 19 bytes. `scripts/test_driver_model_qemu.sh`,
+`scripts/test_driver_restart_qemu.sh` and `scripts/test_net_qemu.sh` PASS;
+`scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2. Not claimed: forced VM
+queue-overflow, interrupt-storm or coalescing behaviour, MSI/IOAPIC routing, a
+background protocol thread, SMP, MMIO unmapping or IOMMU isolation. See
+`docs/NETWORK.md` section 13, `docs/DRIVER_MODEL.md`, ADR-0033, R-026.
 
 ## Phase 8 acceptance (planned)
 

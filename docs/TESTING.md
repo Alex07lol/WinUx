@@ -51,7 +51,7 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_registry_write_qemu.sh` | Win32 registry write-surface self-test (Phase 8 stage 4, `project-os-registry-write.iso`): `pe: peregw.exe loaded ... 5 sections, 1 relocation applied`, `RegCreateKeyExA` handle 4096/4097 with `created`/`opened existing`, `RegSetValueExA` sets (7/2 bytes) and updates with read-back `"enabled"`, error values 87 (type, NULL data, bad/empty name), 6 (bad handle) and 2 (missing value on delete/query), `RegDeleteValueA` 0 with the key vanishing after its last value, `.Persisted` write (3 bytes), `RegCloseKey(4097)` twice, `registry write surface verified` (39 bytes), `win32 registry write selftest: passed`, marker `win32,vfs`, QEMU exit 33 | PASS |
 | `scripts/test_console_qemu.sh` | framebuffer console: pinned `fbcon:` lines, selftest, shell output mirror and a validated QEMU screendump | PASS (106x50 at scale 2; screendump matches) |
 | `scripts/test_persistence_qemu.sh` | four-boot durability on a raw 8 MiB disk (format/save, reboot load, CRC fallback incl. configuration rollback, fresh format with defaults reseeded) | PASS (4 boots) |
-| `scripts/test_net_qemu.sh` | e1000 end-to-end on q35 with a pinned `model=e1000` slirp NIC: pinned `net:` lines including legacy IRQ 11, `,net` marker, `net` counters, `ping 10.0.2.2 -c 3` (3/3), interrupt event count strictly grows after the ping, host-forwarded 19-byte UDP echo round trip | PASS |
+| `scripts/test_net_qemu.sh` | e1000 end-to-end on q35 with a pinned `model=e1000` slirp NIC: pinned `net:` lines including legacy IRQ 11 and the 16-frame RX queue, `,net` marker, `net` counters including `rxq`, `ping 10.0.2.2 -c 3` (3/3), IRQ event count and queue delivery both strictly grow after the ping, host-forwarded 19-byte UDP echo round trip | PASS |
 | `scripts/test_graphics_host.sh` | framebuffer geometry/colour tests | PASS |
 | `scripts/test_virtualbox.sh` | VirtualBox BIOS boot with an Intel 82540EM NAT NIC attached; kernel detects the NIC (`net: e1000 at 00:03.0`), loopback `unsupported`, gateway ARP unanswered — non-fatal | PASS (7.2.20; marker + 5 ticks) |
 | `scripts/test_pci_qemu.sh` | PCI bus-0 inventory (Phase 9 stage 1): 6 functions/7 BARs on q35 with a pinned e1000, host-bridge/LPC/e1000+BAR0 lines, power-of-two BAR invariants, `pci selftest: passed`, marker `pci`, QEMU exit 33 | PASS |
@@ -307,10 +307,13 @@ selects the 82540EM the driver targets. The driver picks a free host UDP port
 for `hostfwd` before starting QEMU and then asserts on serial: the
 `net: e1000 at ... bar0 ... size ... KiB` line, `net: mac 52:54:00:` (slirp's
 default OUI), the IP line, a `net: loopback selftest:` line (any of the three
-documented outcomes is accepted; QEMU reports `unsupported`),
-`net selftest: passed (arp resolved, icmp echo reply in ...)` and `,net` in the
-marker. It then types `net` (status tokens including `arp 1/8 entries`),
-`ping 10.0.2.2 -c 3` (three replies and `0% loss`) and `udpecho 7777`, sends
+documented outcomes is accepted; QEMU reports `unsupported`), the
+`net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX queue 16 frames,
+drop-newest)` line, `net selftest: passed (arp resolved, icmp echo reply in
+...)` and `,net` in the marker. It then types `net` (status tokens including
+`arp 1/8 entries` and `rxq`), `ping 10.0.2.2 -c 3` (three replies and
+`0% loss`), `net` again (requiring both the IRQ event count and queue delivery
+to grow; recorded 2 -> 5 and 2 -> 5) and `udpecho 7777`, sends
 `PROJECT_OS-NET-TEST` (19 bytes) over UDP to the host port, and asserts the
 identical payload returns to the same socket and the guest printed
 `udpecho: echoed 19 bytes to 10.0.2.2:<port>`. Transcripts:

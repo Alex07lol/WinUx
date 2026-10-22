@@ -2,10 +2,11 @@
 
 Status: **approved 2026-10-18 (scope chosen by the user); implemented and
 verified 2026-10-18.** Phase 9 stage 6 (2026-10-22) adds legacy INTx delivery
-and ownership; packet I/O remains polled (see section 12). This document is the contract for the stage: code, tests
-and logs must match it, and any deviation is recorded in §11 (observed results,
-a corrected loopback assumption and one harness-found defect are recorded
-there).
+and ownership; stage 7 (2026-10-22) adds a bounded IRQ-to-service RX queue
+(sections 12-13). Protocol dispatch still runs from the service path. This
+document is the contract for the stage: code, tests and logs must match it,
+and any deviation is recorded in §11 (observed results, a corrected loopback
+assumption and one harness-found defect are recorded there).
 
 ## 1. Goal and non-goals
 
@@ -22,9 +23,9 @@ Deliberately **not** in this stage:
   VirtualBox NAT defaults), no DNS, no routing beyond the local subnet;
 - no TCP, no sockets API: UDP is exercised through a bounded shell fixture
   (`udpecho`), not a general socket layer;
-- no interrupt-driven packet processing and no MSI: stage 6 accepts and
-  acknowledges the legacy INTx line, but packets are still processed while a
-  command polls, not in a background thread;
+- no background packet-processing thread and no MSI: stage 7's IRQ handler
+  copies completed RX descriptors into a bounded queue, but parsing and replies
+  run only while a command services the queue; legacy INTx only;
 - no IPv6, no fragment reassembly (fragmented packets are rejected), no
   checksum offload, no VLAN, no jumbo frames;
 - one NIC, bus 0 only, device `8086:100E` only (`e1000e` 82574L and others are
@@ -165,10 +166,12 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
   copy into the shared buffer, set length and `CMD = EOP | IFCS | RS`, clear
   `STA`, advance `TDT`, poll `STA.DD` with `TDH` wrap (1 s deadline); returns
   a labelled error on timeout.
-- `receive(&mut [u8; 2048]) -> Option<usize>`: process descriptors from the
-  software tail while it differs from `RDH`; `STA.DD` marked → copy length
-  bytes, clear `STA`/`ERRORS`, advance `RDT`, return; else none. Hardware
-  errors on a descriptor are counted and the frame dropped.
+- `receive_into(&mut [u8]) -> Option<usize>`: the polled fallback used when
+  no legacy line is available. It reads the next descriptor, and if `STA.DD`
+  is set copies the frame, clears `STA`, advances `RDT` and returns; hardware
+  errors and non-EOP descriptors are counted and dropped. When the line is
+  live, the IRQ handler owns this ring and the service path pops the software
+  queue instead.
 - Loopback check: set `RCTL.LBM_MAC`, send a crafted 60-byte frame (EtherType
   0x88B5, fixed pattern), poll RX up to 500 ms for the frame, clear the LBM
   bit. Outcomes (never fatal in themselves): identical frame →
@@ -182,8 +185,11 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
 - Counters: `frames_tx`, `frames_rx`, `errors` (timeouts, descriptor errors).
 - No IRQ in the original stage: `IMS` stayed masked and `poll()` was called
   from the stack when a command waited. Phase 9 stage 6 enables `RXT0|RXDMT0`
-  and claims the legacy line, but the handler only reads `ICR` and counts; the
-  packet path is unchanged and still polled. See section 12 and R-025.
+  and claims the legacy line. Stage 7 runs the loopback selftest first, then
+  publishes the ring context and enables the interrupt; the handler reads
+  `ICR` and drains up to 32 completed descriptors into a 16-frame SPSC queue.
+  A full queue drops new frames and counts them. See sections 12-13, ADR-0033
+  and R-026.
 
 ## 7. Stack and shell (`kernel/src/net.rs`, `kernel/src/shell.rs`)
 
@@ -193,8 +199,9 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
     point becomes a no-op (except `net` status printing inactive);
   - started NIC: pinned line
     `net: e1000 at {bus:02x}:{dev:02x}.{fn} bar0 {:#x} size {} KiB`, then
-    `net: mac {mac}`, `net: ip 10.0.2.15/24 gw 10.0.2.2` and either
-    `net: e1000 irq {line} (legacy INTx, RXT0/RXDMT0; RX drain remains polled)`
+    `net: mac {mac}`, `net: ip 10.0.2.15/24 gw 10.0.2.2`, the loopback outcome,
+    and either
+    `net: e1000 irq {line} (legacy INTx, RXT0/RXDMT0; RX queue 16 frames, drop-newest)`
     or `net: e1000 irq unavailable; polled only`.
 - `net::selftest() -> Selftest`, exactly one line:
   - `net selftest: skipped (no NIC)`;
@@ -219,8 +226,9 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
   `udpecho: echoed {n} bytes to {src_ip}:{src_port}`; timeout is an error
   (`udpecho: no datagram within 10 s`). Payloads over 1024 bytes are dropped.
 - `net` status builtin:
-  `net: mac {mac}, ip {ip}/24 gw {gw}; tx {tx} frames, rx {rx} frames, arp {used}/8 entries, errors {errors}`
-  (inactive NIC prints the one inactive line).
+  `net: mac {mac}, ip {ip}/24 gw {gw}; tx {tx} frames, rx {rx} frames, arp {used}/8 entries, errors {errors}, irq {events} event(s), rxq {depth}/{capacity} ({delivered} delivered, {dropped} dropped)`
+  (inactive NIC prints the one inactive line). `rx` includes frames produced by
+  the IRQ handler; `delivered` counts queue pops.
 - Dispatch drops (counted, never logged per packet): non-IPv4/ARP EtherTypes,
   fragmented IPv4, ICMP non-echo, UDP to unbound ports, ARP that is not for
   our IP/gateway, frames shorter than their headers claim.
@@ -249,6 +257,8 @@ net: ip 10.0.2.15/24 gw 10.0.2.2
 net: loopback selftest: passed
 net: loopback selftest: unsupported
 net: loopback selftest: unexpected frame
+net: e1000 irq {line} (legacy INTx, RXT0/RXDMT0; RX queue 16 frames, drop-newest)
+net: e1000 irq unavailable; polled only
 net selftest: skipped (no NIC)
 net selftest: no gateway reply ({reason})
 net selftest: passed (arp resolved, icmp echo reply in {n} ms)
@@ -268,9 +278,12 @@ Host tests: as §4.
    `-nic user,model=e1000,hostfwd=udp:127.0.0.1:{host_port}-:7777`; the
    driver picks a free host UDP port itself.
 3. Asserts on serial: the `net: e1000 at`, `net: mac 52:54:00:` (slirp's
-   default OUI), `net selftest: passed` lines and `,net` in the marker.
-4. Types `net` (status tokens), `ping 10.0.2.2 -c 3` (three replies,
-   `0% loss`) and `udpecho 7777`.
+   default OUI), `net: e1000 irq 11` (queue handoff), `net selftest: passed`
+   lines and `,net` in the marker.
+4. Types `net` (status tokens including `rxq`), `ping 10.0.2.2 -c 3` (three
+   replies, `0% loss`), `net` again and `udpecho 7777`. The harness requires
+   both the IRQ event count and the queue's delivered-frame count to grow
+   after the ping (recorded: 2 -> 5 events and 2 -> 5 frames).
 5. Sends `PROJECT_OS-NET-TEST` (19 bytes) to `127.0.0.1:{host_port}` over
    UDP and asserts the identical payload arrives back on the same socket
    (the guest replied) and the guest printed
@@ -285,10 +298,11 @@ VirtualBox: `scripts/test_virtualbox.sh` gains
 ## 10. Limits (restated honestly)
 
 - Static addressing and no routing: only the slirp/NAT subnet is reachable.
-- Polled driver: no background RX; packets that arrive while no command polls
-  wait in the ring (and can be dropped by the ring wrapping — counted by
-  hardware, not by us). Stage 6 delivers and counts legacy INTx but does no
-  deferred work; MSI/IOAPIC are absent.
+- IRQ-assisted RX, service-path dispatch: the handler copies completed
+  descriptors into a 16-frame queue; a full queue drops new frames (counted)
+  and a burst larger than 32 descriptors per interrupt waits for the next
+  RXT0/RXDMT0 cause. Packets are parsed only while a command services the
+  queue; there is no background thread. MSI/IOAPIC are absent.
 - One datagram at a time for `udpecho`; no sockets, no TCP, no DHCP/DNS.
 - Fragmented IPv4 is rejected; UDP payloads over 1024 bytes are dropped;
   frames larger than the 2048-byte RX buffer are dropped by the hardware.
@@ -326,6 +340,9 @@ VirtualBox: `scripts/test_virtualbox.sh` gains
 
 ## 12. Phase 9 stage 6: legacy INTx delivery and ownership
 
+This section records the delivery-only step; section 13 supersedes the
+handler's no-ring-work behaviour.
+
 The PCI inventory decodes the type-0 `INTERRUPT_LINE`/`INTERRUPT_PIN` bytes at
 config offset `0x3C`; a line is usable only with pin 1-4 and line 1-15, so the
 reserved timer (0) and COM1 (4) lines are never handed to a device. q35 assigns
@@ -347,5 +364,50 @@ Verified on QEMU q35 with the pinned e1000: 2 interrupt events before the
 harness ping, 4 after the restart ping; the restart harness fails if the count
 does not grow. VirtualBox boots with line 9 but its isolated NAT has no
 gateway, so no delivery count is claimed there. Not claimed: MSI, IOAPIC
-routing, deferred RX work, interrupt coalescing tuning or shared interrupt
-lines.
+routing, interrupt coalescing tuning or shared interrupt lines.
+
+## 13. Phase 9 stage 7: bounded interrupt-driven RX
+
+The stage-6 handler only acknowledged `ICR`. Stage 7 makes it the sole owner
+of the hardware RX ring:
+
+- `net::init` runs the loopback selftest **before** publishing the IRQ
+  context, so the polled selftest and the handler never advance `rx_next`
+  independently.
+- `E1000::enable_interrupts` copies the MMIO base, descriptor base, buffer
+  table and current tail into a static context, resets the software queue and
+  counters, publishes the context, then enables `RXT0|RXDMT0`.
+- `E1000::handle_irq` reads `ICR` (read-to-clear), then drains at most one
+  full ring (32 descriptors). Each valid completed frame is copied into a
+  fixed 1536-byte slot; each descriptor is cleared and returned through `RDT`.
+  Hardware errors and non-EOP descriptors are counted and dropped. The loop
+  is bounded, takes no lock, allocates nothing and never calls the protocol
+  stack.
+- The handoff is `os_core::queue::SpscQueue<RxFrame, 16>`: one producer (IRQ)
+  and one consumer (`net::drain_rx`), monotonic head/tail counters, release
+  publication and acquire observation. A full queue rejects the newest frame;
+  the handler counts the drop and keeps returning descriptors. The queue holds
+  copies, so a descriptor is recycled immediately after the copy.
+- `net::drain_rx` pops at most 8 frames per service pass and dispatches them
+  under the existing network lock. ARP/ICMP/UDP handlers are unchanged. With
+  no usable IRQ the original `receive_into` polled path is retained.
+- Stop masks the line, disables the device, clears the handler context and
+  resets the queue, so a restart cannot deliver a pre-stop frame. The `net`
+  status line exposes depth, delivered and dropped counters.
+
+**Backlog and drop policy.** The software queue is 16 frames (about 24 KiB of
+static BSS). The hardware ring is 32 descriptors. A single interrupt copies at
+most 32 frames; if the queue is full, new frames are dropped before a copy and
+`dropped` increments. There is no backpressure into the device and no
+allocation. Frames already queued are always delivered before newer ones. The
+consumer drains 8 per pass, so a full queue takes two passes to empty.
+
+**Evidence (2026-10-22).** Host suite 292 (5 new queue tests, including a
+20,000-item two-thread SPSC stress run). QEMU q35: boot selftest delivers 2
+frames, `ping 10.0.2.2 -c 3` raises queue delivery 2 -> 5 and IRQ events
+2 -> 5 with 0 drops; stop/restart frees/reclaims 19 frames, resets the queue
+counters and delivers 2 frames after the restart ping; UDP echo still
+round-trips 19 bytes. `scripts/test_driver_model_qemu.sh`,
+`scripts/test_driver_restart_qemu.sh`, `scripts/test_net_qemu.sh` and
+`scripts/test_all.sh` PASS (29 PASS / 0 FAIL / 2 SKIP). A queue-overflow burst
+is proven only by the host queue test; the VM run did not force a drop.

@@ -98,7 +98,7 @@ def main():
         b" KiB",
         b"net: mac 52:54:00:",
         b"net: ip 10.0.2.15/24 gw 10.0.2.2",
-        b"net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX drain remains polled)",
+        b"net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX queue 16 frames, drop-newest)",
         b"net: loopback selftest: ",
         b"net selftest: passed (arp resolved, icmp echo reply in ",
     ]
@@ -133,6 +133,7 @@ def main():
             b" frames, rx ",
             b"arp 1/8 entries",
             b"errors ",
+            b"rxq ",
         ],
     )
     if status:
@@ -147,10 +148,24 @@ def main():
                     events = int(match.group(1))
         return events
 
+    def irq_delivered():
+        delivered = 0
+        for line in bytes(session.data).splitlines():
+            if line.startswith(b"net: mac "):
+                match = re.search(rb"rxq \d+/\d+ \((\d+) delivered", line)
+                if match:
+                    delivered = int(match.group(1))
+        return delivered
+
     baseline_events = irq_events()
     if baseline_events <= 0:
         return session.finish(
             fail("e1000 delivered no interrupt events after boot", session.data)
+        )
+    baseline_delivered = irq_delivered()
+    if baseline_delivered <= 0:
+        return session.finish(
+            fail("IRQ RX queue delivered no frames after boot", session.data)
         )
 
     # ---- Shell: ARP + ICMP through the slirp gateway ---------------------
@@ -176,6 +191,15 @@ def main():
             fail(
                 "e1000 IRQ count did not grow after ping (%d -> %d)"
                 % (baseline_events, after_events),
+                session.data,
+            )
+        )
+    after_delivered = irq_delivered()
+    if after_delivered <= baseline_delivered:
+        return session.finish(
+            fail(
+                "IRQ RX queue delivery did not grow after ping (%d -> %d)"
+                % (baseline_delivered, after_delivered),
                 session.data,
             )
         )
@@ -214,8 +238,9 @@ def main():
     if not session.wait_for(PROMPT, COMMAND_TIMEOUT, start):
         return session.finish(fail("no prompt after udpecho", session.data))
 
-    print("network: loopback %s; ARP + 3/3 ICMP replies; 19-byte UDP round trip"
-          % loopback_outcome)
+    print("network: loopback %s; ARP + 3/3 ICMP replies; 19-byte UDP round trip; "
+          "IRQ queue delivery %d -> %d frames"
+          % (loopback_outcome, baseline_delivered, after_delivered))
     return session.finish(0)
 
 

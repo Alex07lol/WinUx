@@ -1356,6 +1356,52 @@ deferred-work design exists. Do not claim MSI, IOAPIC routing, shared lines,
 interrupt-driven networking or storm-free operation under sustained load; the
 handler only acknowledges `ICR`, and no backlog is queued.
 
+## R-026 - Bounded SPSC RX handoff and interrupt-context drop policy
+
+**Question.** How can the e1000 interrupt handler hand received frames to the
+single-threaded service path without taking the network lock, allocating in
+interrupt context, or letting a burst grow kernel memory without bound? What
+happens when the consumer is slower than the wire?
+
+**Sources.** Intel 8254x SDM (reused from R-012): receive descriptor `STA.DD`,
+`STA.EOP`, `ERRORS`, `RDT` tail semantics and the `RXT0`/`RXDMT0` causes; the
+8259A/IDT path from R-025 establishes that handlers run with interrupts
+disabled on the single CPU. Rust `core::sync::atomic` release/acquire semantics
+(reused from the kernel synchronization work, no new external document
+fetched): a producer publishes a slot with a release store and the consumer
+observes it with an acquire load. The SPSC algorithm is independently written
+from the standard monotonic head/tail invariant: the producer owns `head`, the
+consumer owns `tail`, and `head - tail` is the number of published values.
+No vendor, Linux, Wine or ReactOS implementation code was read or copied.
+
+**Claim.** A fixed-capacity SPSC queue is sufficient because there is exactly
+one producer (the e1000 handler) and one consumer (`net::drain_rx`) and both
+run on the same CPU under mutually exclusive interrupt state. The queue must
+store copies, not descriptor indices, so the handler can clear and return each
+descriptor through `RDT` immediately; otherwise a slow consumer would pin the
+hardware ring. The handler must drain a bounded number of descriptors; one
+full 32-descriptor ring is a natural bound and is enough to cover every
+snapshot the device can have completed at interrupt entry. When the software
+queue is full, dropping the newest frame and re-arming the descriptor is the
+only policy that keeps the handler bounded and the device making progress.
+Counters for produced, delivered, dropped and descriptor errors make the
+policy observable; they do not make it lossless.
+
+**Experiment.** PASSED (2026-10-22). Host tests validate order, full-queue
+rejection, wrap, reset and a 20,000-item two-thread producer/consumer stress
+run. QEMU q35: the boot selftest delivers 2 frames, `ping 10.0.2.2 -c 3`
+raises IRQ events 2 -> 5 and queue delivery 2 -> 5 with zero drops; stop frees
+19 frames, restart resets the counters and delivers 2 frames after the
+restart ping; UDP echo still round-trips 19 bytes. No VM run forced a
+software-queue overflow or an interrupt storm, so the drop path is exercised
+only by the host queue test.
+
+**Conclusion.** Use a 16-frame SPSC copy queue with drop-newest, a 32-frame
+per-interrupt drain bound and 8-frame consumer batches. This is a single-CPU
+design; SMP would need per-CPU queues or a different handoff. It does not claim
+lossless RX, storm-free operation, MSI/IOAPIC routing, coalescing tuning or a
+background protocol thread.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

@@ -93,9 +93,9 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/config.rs` | registry-like configuration store: `/etc/config` load or in-memory defaults, lazy save via the VFS dirty bit, boot self-test | working (ADR-0022) |
 | `kernel/src/registry.rs` | Win32 registry-shaped view over the config store: four-slot `HKLM` handle table (`0x1000 + slot`), case-insensitive prefix/value lookups, write mutations (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`) saved through `config::save()`, per-program reset | working (Phase 8 stages 3–4, ADR-0024/0025) |
 | `kernel/src/pci.rs` | PCI config mechanism #1: bus-0 function inventory (vendor/device/class/header, BAR sizing, multifunction scan), snapshot access, command-register enable | working (Phase 9 stage 1; bus 0 only) |
-| `kernel/src/driver.rs` | driver descriptors over the PCI inventory, deterministic binding, e1000 start/stop/restart through `net`, exact MMIO/DMA-page/IRQ ownership ledger and structural self-test | working (Phase 9 stage 6; e1000 Running/Stopped) |
-| `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, polled data path, legacy INTx acknowledge/count, counters, ring teardown | working (QEMU/VirtualBox) |
-| `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch, `ping`, `udpecho`, status, legacy IRQ event count | working (static config) |
+| `kernel/src/driver.rs` | driver descriptors over the PCI inventory, deterministic binding, e1000 start/stop/restart through `net`, exact MMIO/DMA-page/IRQ ownership ledger and structural self-test | working (Phase 9 stage 7; e1000 Running/Stopped) |
+| `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, bounded IRQ RX queue (polled fallback), INTx acknowledge, counters, ring teardown | working (QEMU/VirtualBox) |
+| `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch from the IRQ queue, `ping`, `udpecho`, status counters | working (static config) |
 | `kernel/src/irq.rs` | exclusive legacy IRQ registration, PIC mask/unmask/EOI, dispatch | working (Phase 9 stage 6) |
 | `kernel/src/shell.rs` | serial shell builtins over kernel services, incl. `config get/set/del/list` | working (serial only) |
 | `kernel/src/arch/x86_64/gdt.rs` | GDT (kernel + user segments), TSS, IST1 double-fault stack | working |
@@ -119,6 +119,7 @@ writable, which the segment permissions above guarantee.
 | `os_core::elf` | ELF64 `ET_EXEC` parser: headers, segments, W^X and overlap policy | host-tested |
 | `os_core::pe` | PE32+ parser: headers, sections, import directory (ILT/IAT/names), data-directory policy, DIR64 relocations | host-tested |
 | `os_core::pci` | config-address construction, BAR decode and sizing | host-tested |
+| `os_core::queue` | bounded single-producer/single-consumer queue with overflow rejection | host-tested |
 | `os_core::net` | Ethernet/ARP/IPv4/ICMP/UDP codecs, RFC 1071 checksums, ARP cache with expiry | host-tested |
 | `os_core::font` | original 5x7 bitmap font (moved from the kernel for host tests) | host-tested |
 | `os_core::textcon` | scrolling text-grid model: byte semantics, wrap, dirty rows | host-tested |
@@ -227,14 +228,15 @@ as well (ADR-0014).
   PIIX-legacy ATA disk, flushed write-through at shell-command boundaries
   (ADR-0016). No journal, no AHCI/virtio, no DMA or IRQ14, and the disk path
   is verified on QEMU `-machine pc` only. The console and shell are
-  serial-only; there is no framebuffer console input. PCI access is a
-  single-purpose config-space scan for the e1000, not a driver model
-  (ADR-0018).
-- Networking (ADR-0018, `docs/NETWORK.md`): one polled e1000 with static
-  `10.0.2.15/24` on QEMU slirp / VirtualBox NAT — no DHCP, DNS, TCP, sockets,
-  interrupts/MSI or routing beyond the local subnet; one NIC on bus 0; IPv4
-  only, fragments rejected, no reassembly; the VirtualBox NAT run detected the
-  NIC but did not answer the gateway ARP (non-fatal, reported as observed).
+  serial-only; there is no framebuffer console input. PCI access is a bus-0
+  inventory feeding the driver model (ADR-0028/0029).
+- Networking (ADR-0018/0032/0033, `docs/NETWORK.md`): one e1000 with static
+  `10.0.2.15/24` on QEMU slirp / VirtualBox NAT; legacy INTx delivery and a
+  16-frame IRQ RX queue feed a service-path dispatcher. No background protocol
+  thread, MSI/IOAPIC, DHCP, DNS, TCP, sockets or routing beyond the local
+  subnet; one NIC on bus 0; IPv4 only, fragments rejected, no reassembly; the
+  VirtualBox NAT run detected the NIC but did not answer the gateway ARP
+  (non-fatal, reported as observed).
 - No reclaim of bootloader-reclaimable memory.
 - `IrqSpinLock` is safe to share with interrupt handlers on a single CPU; the
   plain `SpinLock` is not and must not be taken from code an interrupt handler

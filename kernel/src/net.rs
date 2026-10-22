@@ -1,10 +1,13 @@
-//! Network stack glue (Phase 6, stage 5): one e1000 NIC, static IPv4
-//! configuration, and ARP/ICMP/UDP built on the host-tested `os_core` codecs.
+//! Network stack glue (Phase 6, stage 5; IRQ handoff Phase 9, stage 7): one
+//! e1000 NIC, static IPv4 configuration, and ARP/ICMP/UDP built on the
+//! host-tested `os_core` codecs.
 //!
-//! The driver is polled and synchronous. Every operation that waits for a
-//! reply runs a bounded poll loop that takes the network lock per iteration,
-//! so timer and serial interrupts keep flowing between iterations and PIT
-//! deadlines stay meaningful.
+//! When a legacy IRQ is available the handler copies completed RX descriptors
+//! into a bounded software queue; the service path pops that queue. Without an
+//! IRQ the driver falls back to polling the ring. Every operation that waits
+//! for a reply still runs a bounded poll loop that takes the network lock per
+//! iteration, so timer and serial interrupts keep flowing and PIT deadlines
+//! stay meaningful.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -97,16 +100,6 @@ where
     };
     crate::kprintln!("net: mac {}", nic.mac());
     crate::kprintln!("net: ip {}/{} gw {}", IP_ADDRESS, SUBNET_PREFIX, GATEWAY);
-    match irq_line {
-        Some(line) => {
-            nic.enable_interrupts();
-            crate::kprintln!(
-                "net: e1000 irq {} (legacy INTx, RXT0/RXDMT0; RX drain remains polled)",
-                line
-            );
-        }
-        None => crate::kprintln!("net: e1000 irq unavailable; polled only"),
-    }
 
     let outcome = nic.loopback_selftest();
     crate::kprintln!(
@@ -117,6 +110,18 @@ where
             Loopback::UnexpectedFrame => "unexpected frame",
         }
     );
+
+    match irq_line {
+        Some(line) => {
+            nic.enable_interrupts();
+            crate::kprintln!(
+                "net: e1000 irq {} (legacy INTx, RXT0/RXDMT0; RX queue {} frames, drop-newest)",
+                line,
+                crate::e1000::RX_QUEUE_FRAMES
+            );
+        }
+        None => crate::kprintln!("net: e1000 irq unavailable; polled only"),
+    }
 
     *NET.lock() = Some(NetState {
         nic,
@@ -180,8 +185,9 @@ pub fn status() -> Option<String> {
     let guard = NET.lock();
     let state = guard.as_ref()?;
     let (tx, rx, errors) = state.nic.counters();
+    let (_, delivered, dropped, _) = E1000::irq_rx_stats();
     Some(alloc::format!(
-        "net: mac {}, ip {}/{} gw {}; tx {} frames, rx {} frames, arp {}/{} entries, errors {}, irq {} event(s)",
+        "net: mac {}, ip {}/{} gw {}; tx {} frames, rx {} frames, arp {}/{} entries, errors {}, irq {} event(s), rxq {}/{} ({} delivered, {} dropped)",
         state.nic.mac(),
         IP_ADDRESS,
         SUBNET_PREFIX,
@@ -191,7 +197,11 @@ pub fn status() -> Option<String> {
         state.cache.len(),
         ARP_ENTRIES,
         errors,
-        E1000::irq_events()
+        E1000::irq_events(),
+        E1000::irq_rx_depth(),
+        crate::e1000::RX_QUEUE_FRAMES,
+        delivered,
+        dropped
     ))
 }
 
@@ -330,6 +340,15 @@ fn with_state<R>(f: impl FnOnce(&mut NetState) -> R) -> Option<R> {
 
 fn drain_rx(state: &mut NetState) {
     let mut buffer = [0u8; MAX_FRAME_BYTES];
+    if E1000::irq_rx_active() {
+        for _ in 0..RX_DRAIN_PER_POLL {
+            let Some(length) = E1000::irq_rx_pop_into(&mut buffer) else {
+                return;
+            };
+            dispatch(state, &buffer[..length]);
+        }
+        return;
+    }
     for _ in 0..RX_DRAIN_PER_POLL {
         let Some(length) = state.nic.receive_into(&mut buffer) else {
             return;

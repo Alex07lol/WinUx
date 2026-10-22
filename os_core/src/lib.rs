@@ -26,6 +26,7 @@ pub mod path;
 pub mod pci;
 pub mod pe;
 pub mod pofs;
+pub mod queue;
 pub mod rng;
 pub mod textcon;
 pub mod textrender;

@@ -117,6 +117,15 @@ def main():
                     events = int(match.group(1))
         return events
 
+    def irq_delivered():
+        delivered = 0
+        for line in bytes(session.data).splitlines():
+            if line.startswith(b"net: mac "):
+                match = re.search(rb"rxq \d+/\d+ \((\d+) delivered", line)
+                if match:
+                    delivered = int(match.group(1))
+        return delivered
+
     status = run_command(session, "net", [b"net: mac 52:54:00:", b"irq "])
     if status:
         return status
@@ -124,6 +133,11 @@ def main():
     if baseline_events <= 0:
         return session.finish(
             fail("e1000 delivered no interrupt events before stop", session.data)
+        )
+    baseline_delivered = irq_delivered()
+    if baseline_delivered <= 0:
+        return session.finish(
+            fail("IRQ RX queue delivered no frames before stop", session.data)
         )
 
     before = mem_free(session)
@@ -213,11 +227,26 @@ def main():
                 session.data,
             )
         )
+    restarted_delivered = irq_delivered()
+    if restarted_delivered <= 0:
+        return session.finish(
+            fail(
+                "IRQ RX queue delivered no frames after restart (counter reset expected)",
+                session.data,
+            )
+        )
 
     print(
         "driver restart: stop freed %d frames, restart reclaimed them, "
-        "ping and IRQ delivery after restart passed (%d -> %d events)"
-        % (FREED_FRAMES, baseline_events, restarted_events)
+        "ping and IRQ queue delivery after restart passed (%d -> %d events, "
+        "%d -> 0-reset -> %d delivered frames)"
+        % (
+            FREED_FRAMES,
+            baseline_events,
+            restarted_events,
+            baseline_delivered,
+            restarted_delivered,
+        )
     )
     return session.finish(0)
 

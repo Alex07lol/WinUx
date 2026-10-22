@@ -99,8 +99,12 @@ Pinned q35 boot lines (pinned e1000 at 00:02.0):
 ```text
 driver: registered 1 descriptor(s)
 driver: e1000 matched 00:02.0 8086:100e
-driver: e1000 state Running
+net: e1000 at 00:02.0 bar0 0xfebc0000 size 128 KiB
+net: mac 52:54:00:12:34:56
+net: ip 10.0.2.15/24 gw 10.0.2.2
 net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX drain remains polled)
+net: loopback selftest: unsupported
+driver: e1000 state Running
 driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), irq 11 (legacy INTx)
 driver: 5 function(s) unmatched (no registered driver)
 driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness, single-instance and resource ownership verified)

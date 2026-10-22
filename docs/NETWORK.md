@@ -3,7 +3,9 @@
 Status: **approved 2026-10-18 (scope chosen by the user); implemented and
 verified 2026-10-18.** Phase 9 stage 6 (2026-10-22) adds legacy INTx delivery
 and ownership; stage 7 (2026-10-22) adds a bounded IRQ-to-service RX queue
-(sections 12-13). Protocol dispatch still runs from the service path. This
+(sections 12-13); stage 8 routes only the PIT and COM1 through the IOAPIC, so
+the NIC remains on legacy INTx. Protocol dispatch still runs from the service
+path. This
 document is the contract for the stage: code, tests and logs must match it,
 and any deviation is recorded in §11 (observed results, a corrected loopback
 assumption and one harness-found defect are recorded there).
@@ -302,7 +304,8 @@ VirtualBox: `scripts/test_virtualbox.sh` gains
   descriptors into a 16-frame queue; a full queue drops new frames (counted)
   and a burst larger than 32 descriptors per interrupt waits for the next
   RXT0/RXDMT0 cause. Packets are parsed only while a command services the
-  queue; there is no background thread. MSI/IOAPIC are absent.
+  queue; there is no background thread. MSI and PCI IOAPIC routing are
+  absent; stage 8 routes only PIT/COM1 through the IOAPIC.
 - One datagram at a time for `udpecho`; no sockets, no TCP, no DHCP/DNS.
 - Fragmented IPv4 is rejected; UDP payloads over 1024 bytes are dropped;
   frames larger than the 2048-byte RX buffer are dropped by the hardware.
@@ -363,8 +366,9 @@ the handler and releases 6 claims; restart registers/claims/unmasks again.
 Verified on QEMU q35 with the pinned e1000: 2 interrupt events before the
 harness ping, 4 after the restart ping; the restart harness fails if the count
 does not grow. VirtualBox boots with line 9 but its isolated NAT has no
-gateway, so no delivery count is claimed there. Not claimed: MSI, IOAPIC
-routing, interrupt coalescing tuning or shared interrupt lines.
+gateway, so no delivery count is claimed there. Not claimed: MSI, PCI IOAPIC
+routing (stage 8 routes only PIT/COM1), interrupt coalescing tuning or shared
+interrupt lines.
 
 ## 13. Phase 9 stage 7: bounded interrupt-driven RX
 

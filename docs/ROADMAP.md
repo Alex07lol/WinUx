@@ -7,14 +7,14 @@ were run and observed. No dates or completion percentages are implied.
 |---|---|---|
 | 0 | repository audit, toolchain, engineering controls, initial docs | **complete** (2026-10-17) |
 | 1 | own kernel, Limine boot, serial/framebuffer, memory map, ISO, boot tests | **complete for available tooling** — QEMU BIOS (256 MiB/512 MiB/1 GiB) and VirtualBox BIOS verified; UEFI boot verification outstanding |
-| 2 | GDT/IDT/exceptions, timer, diagnostics | **partial** — GDT/TSS/IST, 32 exception gates, int3 self-test, PIT IRQ0 and xAPIC LINT0 ExtINT work, IRQ-safe locking for interrupt-shared state; APIC timer/IOAPIC, SMP, recoverable exceptions not started |
+| 2 | GDT/IDT/exceptions, timer, diagnostics | **partial** — GDT/TSS/IST, 32 exception gates, int3 self-test, PIT IRQ0 through IOAPIC GSI2 (PIC fallback), xAPIC LINT0 ExtINT, IRQ-safe locking for interrupt-shared state; APIC timer, PCI IOAPIC routing, SMP, recoverable exceptions not started |
 | 3 | physical/virtual memory, page tables, permissions | **partial (kernel-side VM manager done)** — bitmap frame allocator; kernel-owned 4-level address space with CR3 switch, map/unmap/translate, on-demand tables, W^X enforcement and guard refusals, all self-tested in QEMU/VirtualBox BIOS boots; user address spaces, guard-page and fragmentation stress tests outstanding |
 | 4 | kernel heap, slab/size classes, performance harness | **partial** — fixed 8 MiB first-fit free-list heap with global allocator, IRQ-safe locking, poisoning, double-free detection, `validate()` walk, host tests (14) and in-kernel self-test; growth, slabs per measurement and the heap benchmark harness outstanding |
 | 5 | tasks, user mode, syscalls, handles/IPC, isolation | **partial (threads + first ring-3 slice done)** — thread table, kernel stacks, register/RSP context switch, cooperative yield/exit, timer preemption, deferred stack reclaim; ring 3 with a DPL3 `int 0x80` gate, validated `write`/`exit` services, user-fault isolation and address-space teardown verified in QEMU/VirtualBox BIOS; handles/IPC, process model, ELF loading not started |
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–5, 2026-10-20)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025), and a registry enumeration/deletion surface (`RegDeleteKeyA`/`RegEnumKeyExA`/`RegEnumValueA`, services 21–23, first eight- and two-argument stubs, deterministic canonical-order enumeration, non-recursive key deletion with the enumerate-first rule) lets a PE fixture enumerate keys/values and delete keys (`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026); larger Win32 surface, GUI and the compatibility matrix not started |
-| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–7: PCI inventory, driver model, e1000 start/stop/restart + exact MMIO/DMA/IRQ claims, bounded IRQ-to-service RX queue, 2026-10-22) — MSI/IOAPIC, MMIO unmap and VM display not started |
+| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–8: PCI inventory, driver model, e1000 start/stop/restart + exact MMIO/DMA/IRQ claims, bounded IRQ-to-service RX queue, PIT/COM1 IOAPIC routing, 2026-10-22) — MSI, PCI INTx IOAPIC routing, MMIO unmap and VM display not started |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
 
@@ -42,12 +42,9 @@ in `progress.md`. VirtualBox EFI is a secondary follow-up.
 ## Phase 2 acceptance (partial)
 
 Met: own GDT/TSS/IST, IDT with exception gates, fatal exception reporting,
-breakpoint self-test, PIT periodic interrupt at 100 Hz with observed ticks in
-QEMU and VirtualBox, APIC MMIO mapping and LINT0 ExtINT for legacy PIC delivery.
+breakpoint self-test, PIT periodic interrupt at 100 Hz delivered through IOAPIC GSI2 in QEMU and VirtualBox, APIC MMIO mapping, local-APIC EOI and LINT0 ExtINT for the PIC fallback.
 
-Missing: APIC timer/IOAPIC, SMP bring-up, interrupt-safe locking, recoverable
-page-fault handling, interrupt-driven input, diagnostic dumps for every vector,
-TSC calibration independent of the bootloader.
+Missing: APIC timer, PCI INTx IOAPIC routing, ACPI MADT/_PRT discovery, MSI, SMP bring-up, recoverable page-fault handling, TSC calibration independent of the bootloader.
 
 ## Phase 3 acceptance (partial)
 
@@ -480,10 +477,36 @@ IRQ events 2 -> 5 and queue delivery 2 -> 5 with zero drops; stop/restart
 freed/reclaimed 19 frames and delivered 2 frames after the restart ping; UDP
 echo round-tripped 19 bytes. `scripts/test_driver_model_qemu.sh`,
 `scripts/test_driver_restart_qemu.sh` and `scripts/test_net_qemu.sh` PASS;
-`scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2. Not claimed: forced VM
+`scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2. Not claimed by stage 7: forced VM
 queue-overflow, interrupt-storm or coalescing behaviour, MSI/IOAPIC routing, a
 background protocol thread, SMP, MMIO unmapping or IOMMU isolation. See
 `docs/NETWORK.md` section 13, `docs/DRIVER_MODEL.md`, ADR-0033, R-026.
+
+## Phase 9 stage 8 (2026-10-22): IOAPIC bring-up and ISA routing
+
+`kernel/src/arch/x86_64/ioapic.rs` maps the fixed `0xfec00000` window, probes
+the ID/version/input count and masks every redirection entry before use.
+`os_core::ioapic::RedirectionEntry` encodes the 64-bit entry and is host-tested
+above the MMIO layer. `irq::init_ioapic` sends PIT GSI2 (edge, active-high) and
+COM1 GSI4 (level, active-high) to the boot CPU's physical LAPIC ID. The timer
+and COM1 IDT paths now call `irq::eoi`, which writes the local-APIC EOI for
+IOAPIC routes and the 8259 EOI for PIC routes. If mapping/probing fails, or if
+the timer does not start through the IOAPIC, the boot path masks IOAPIC 2/4 and
+returns both lines to the 8259. The e1000 deliberately remains on PCI INTx line
+11 through the PIC because QEMU q35's config line is not the ACPI GSI (the
+e1000's slot-2 INTA maps to GSI22 in QEMU's `_PRT`), and ACPI MADT/`_PRT`
+parsing is not implemented. MSI is deferred: the QEMU 82540EM e1000 exposes no
+MSI capability.
+
+Evidence: host suite 297 (5 IOAPIC encoding tests); QEMU q35 and VirtualBox
+7.2.20 both log `ioapic: version 0x20, 24 pins, id 0; timer GSI2, console
+GSI4`, report `pit: 100 Hz, IOAPIC GSI2`, and observe 7/6 ticks respectively
+with no PIC fallback; shell input over COM1 works in the driver harness;
+`test_boot_qemu.sh --require-ioapic`, the driver-model harness and VirtualBox
+with `--require-ioapic` PASS. `scripts/test_all.sh` PASS=30 FAIL=0 SKIP=2.
+Not claimed: ACPI MADT/`_PRT` discovery, PCI INTx IOAPIC routing, MSI/MSI-X,
+APIC timer, SMP, level-triggered PCI lines or physical-hardware testing. See
+ADR-0034, R-027.
 
 ## Phase 8 acceptance (planned)
 

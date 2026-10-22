@@ -39,13 +39,15 @@ run boot-qemu-bios-256m "$ROOT_DIR/scripts/test_boot_qemu.sh" "$ISO_PATH" --firm
     --serial-log "$ROOT_DIR/artifacts/qemu-serial-256m.log" --timeout 90
 run boot-qemu-bios-1g "$ROOT_DIR/scripts/test_boot_qemu.sh" "$ISO_PATH" --firmware bios --memory 1G \
     --serial-log "$ROOT_DIR/artifacts/qemu-serial-1g.log" --timeout 90
+run boot-qemu-ioapic "$ROOT_DIR/scripts/test_boot_qemu.sh" "$ISO_PATH" --firmware bios --memory 512M \
+    --serial-log "$ROOT_DIR/artifacts/qemu-serial-ioapic.log" --timeout 90 --require-ioapic
 run boot-qemu-uefi "$ROOT_DIR/scripts/test_boot_qemu.sh" "$ISO_PATH" --firmware uefi --timeout 90
 run elf "$ROOT_DIR/scripts/test_elf_qemu.sh"
 run pe "$ROOT_DIR/scripts/test_pe_qemu.sh"
 run memory "$ROOT_DIR/scripts/test_memory.sh"
 run vfs "$ROOT_DIR/scripts/test_vfs.sh"
 run graphics-host "$ROOT_DIR/scripts/test_graphics_host.sh"
-run virtualbox "$ROOT_DIR/scripts/test_virtualbox.sh" "$ISO_PATH" --timeout 90
+run virtualbox "$ROOT_DIR/scripts/test_virtualbox.sh" "$ISO_PATH" --timeout 90 --require-ioapic
 run shell "$ROOT_DIR/scripts/test_shell_qemu.sh"
 run input "$ROOT_DIR/scripts/test_input_qemu.sh"
 run registry "$ROOT_DIR/scripts/test_registry_qemu.sh"

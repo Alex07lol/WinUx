@@ -174,8 +174,9 @@ fn framebuffer_geometry() -> Option<(FramebufferGeometry, *mut u8)> {
 }
 
 /// Map the local APIC page and put LINT0 into ExtINT mode so PIC IRQs are
-/// accepted. Falls back to the disabled-LAPIC path if mapping is unavailable.
-fn setup_apic_extint(hhdm_offset: u64) -> Result<(), &'static str> {
+/// accepted. Returns the mapped LAPIC page for the IOAPIC destination ID and
+/// end-of-interrupt writes.
+fn setup_apic_extint(hhdm_offset: u64) -> Result<*mut u32, &'static str> {
     let physical = arch::x86_64::apic::enable_xapic()?;
     let aligned = physical & !((2 * 1024 * 1024) - 1);
     let virtual_base = hhdm_offset
@@ -185,7 +186,14 @@ fn setup_apic_extint(hhdm_offset: u64) -> Result<(), &'static str> {
     let lapic = hhdm_offset
         .checked_add(physical)
         .ok_or("APIC HHDM address overflowed")? as *mut u32;
-    arch::x86_64::apic::configure_extint(lapic)
+    arch::x86_64::apic::configure_extint(lapic)?;
+    Ok(lapic)
+}
+
+/// Map the fixed IOAPIC window and install the PIT/COM1 routes.
+fn setup_ioapic(hhdm_offset: u64, lapic: *mut u32) -> Result<irq::IoApicInfo, &'static str> {
+    let base = arch::x86_64::ioapic::map(hhdm_offset)?;
+    irq::init_ioapic(base, lapic)
 }
 
 fn wait_for_ticks(target: u64) -> bool {
@@ -433,25 +441,62 @@ pub extern "C" fn kmain() -> ! {
 
     pic::remap_and_mask_all();
     pit::init();
-    pic::unmask_irq0();
-    pic::unmask_irq(4);
     console::init();
-    if let Err(error) = setup_apic_extint(hhdm_offset) {
-        kprintln!(
-            "apic: ExtINT setup unavailable ({}); using disabled-LAPIC path",
-            error
-        );
-        arch::x86_64::disable_local_apic();
+    let mut ioapic_started = false;
+    match setup_apic_extint(hhdm_offset) {
+        Ok(lapic) => match setup_ioapic(hhdm_offset, lapic) {
+            Ok(info) => {
+                ioapic_started = true;
+                kprintln!(
+                    "ioapic: version {:#04x}, {} pins, id {}; timer GSI2, console GSI4",
+                    info.version,
+                    info.pins,
+                    info.id
+                );
+            }
+            Err(error) => {
+                kprintln!("ioapic: unavailable ({}); using 8259", error);
+                pic::unmask_irq0();
+                pic::unmask_irq(4);
+            }
+        },
+        Err(error) => {
+            kprintln!(
+                "apic: ExtINT setup unavailable ({}); using disabled-LAPIC path",
+                error
+            );
+            arch::x86_64::disable_local_apic();
+            pic::unmask_irq0();
+            pic::unmask_irq(4);
+        }
     }
     arch::x86_64::interrupts_enable();
-    kprintln!("pit: {} Hz, IRQ0 unmasked", pit::effective_hz());
-    kprintln!("console: COM1 receive interrupt enabled (IRQ4)");
 
     if !wait_for_ticks(5) {
-        fatal(format_args!(
-            "timer did not deliver 5 interrupts (observed {})",
-            pit::ticks()
-        ));
+        if ioapic_started {
+            arch::x86_64::interrupts_disable();
+            irq::fallback_to_pic();
+            arch::x86_64::interrupts_enable();
+            kprintln!("ioapic: timer timeout; fell back to 8259 IRQ0/IRQ4");
+            if !wait_for_ticks(5) {
+                fatal(format_args!(
+                    "timer did not deliver 5 interrupts after PIC fallback (observed {})",
+                    pit::ticks()
+                ));
+            }
+        } else {
+            fatal(format_args!(
+                "timer did not deliver 5 interrupts (observed {})",
+                pit::ticks()
+            ));
+        }
+    }
+    if irq::timer_uses_ioapic() {
+        kprintln!("pit: {} Hz, IOAPIC GSI2", pit::effective_hz());
+        kprintln!("console: COM1 receive interrupt enabled (IOAPIC GSI4)");
+    } else {
+        kprintln!("pit: {} Hz, IRQ0 unmasked", pit::effective_hz());
+        kprintln!("console: COM1 receive interrupt enabled (IRQ4)");
     }
     kprintln!("timer: {} ticks observed", pit::ticks());
 

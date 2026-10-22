@@ -1,6 +1,7 @@
 //! Legacy 8259A PIC initialisation and line masking. IRQ0 (PIT) and IRQ4
-//! (COM1) are used from bring-up; Phase 9 stage 6 adds device lines through
-//! crate::irq. The APIC/IOAPIC path remains a later milestone.
+//! (COM1) are normally routed through the IOAPIC in stage 8; the PIC remains
+//! the fallback and still carries PCI INTx lines such as the e1000. Device
+//! lines are managed through `crate::irq`.
 
 use super::io::{inb, io_wait, outb};
 
@@ -51,8 +52,4 @@ pub fn unmask_irq(line: u8) {
 
 pub fn unmask_irq0() {
     unmask_irq(0);
-}
-
-pub fn eoi_master() {
-    outb(0x20, 0x20);
 }

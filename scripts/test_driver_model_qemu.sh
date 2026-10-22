@@ -75,6 +75,9 @@ assert_line() {
 }
 assert_line "driver: registered 1 descriptor(s)"
 assert_line "driver: e1000 matched 00:02.0 8086:100e"
+assert_line "ioapic: version 0x20, 24 pins, id 0; timer GSI2, console GSI4"
+assert_line "pit: 100 Hz, IOAPIC GSI2"
+assert_line "console: COM1 receive interrupt enabled (IOAPIC GSI4)"
 assert_line "driver: e1000 state Running"
 assert_line "driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), irq 11 (legacy INTx)"
 assert_line "driver: 5 function(s) unmatched (no registered driver)"

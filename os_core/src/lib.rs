@@ -19,6 +19,7 @@ pub mod fb;
 pub mod font;
 pub mod frame;
 pub mod heap;
+pub mod ioapic;
 pub mod memmap;
 pub mod net;
 pub mod paging;

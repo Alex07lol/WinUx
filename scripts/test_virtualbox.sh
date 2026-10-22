@@ -6,12 +6,14 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 ISO="$ISO_PATH"
 FIRMWARE="bios"
 TIMEOUT=90
+REQUIRE_IOAPIC=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --firmware) FIRMWARE="${2:?missing firmware value}"; shift 2 ;;
         --timeout) TIMEOUT="${2:?missing timeout value}"; shift 2 ;;
+        --require-ioapic) REQUIRE_IOAPIC=1; shift ;;
         --help|-h)
-            log "usage: $0 [iso] [--firmware bios|efi] [--timeout seconds]"
+            log "usage: $0 [iso] [--firmware bios|efi] [--timeout seconds] [--require-ioapic]"
             exit 0
             ;;
         *) ISO="$1"; shift ;;
@@ -96,5 +98,17 @@ if [ "$FOUND" -ne 1 ]; then
 fi
 
 log "marker: $(grep -a 'PROJECT_OS_BOOT_SUCCESS:' "$SERIAL" | tail -1)"
+if [ "$REQUIRE_IOAPIC" -eq 1 ]; then
+    grep -aqE "^ioapic: version 0x[0-9a-f]+, [0-9]+ pins, id [0-9]+; timer GSI2, console GSI4$" "$SERIAL" \
+        || die "VirtualBox IOAPIC bring-up line missing (log: $SERIAL)"
+    grep -aqF "pit: 100 Hz, IOAPIC GSI2" "$SERIAL" \
+        || die "VirtualBox PIT is not routed through IOAPIC GSI2 (log: $SERIAL)"
+    grep -aqF "console: COM1 receive interrupt enabled (IOAPIC GSI4)" "$SERIAL" \
+        || die "VirtualBox COM1 is not routed through IOAPIC GSI4 (log: $SERIAL)"
+    if grep -aqF "fell back to 8259" "$SERIAL"; then
+        die "VirtualBox IOAPIC timer route timed out and fell back to the PIC (log: $SERIAL)"
+    fi
+    log "IOAPIC asserts: PIT GSI2, COM1 GSI4, no PIC fallback"
+fi
 log "serial log: $SERIAL"
 log "PASS: VirtualBox $FIRMWARE boot reached PROJECT_OS_BOOT_SUCCESS"

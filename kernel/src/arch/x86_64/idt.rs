@@ -9,7 +9,7 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{pic, pit};
+use super::pit;
 use crate::kprintln;
 use crate::serial;
 
@@ -273,8 +273,9 @@ pub fn init() {
         let ist = if vector == 8 { 1 } else { 0 };
         idt.0[vector] = IdtEntry::for_handler(*handler as usize as u64, ist, false);
     }
-    // PIC IRQ0..IRQ15 => vectors 32..47. Vectors 32 (timer) and 36 (COM1)
-    // keep dedicated dispatch paths; the rest go through `crate::irq`.
+    // Hardware IRQ0..IRQ15 => vectors 32..47. Vectors 32 (timer) and 36 (COM1)
+    // keep dedicated dispatch paths; the rest go through `crate::irq`. Stage 8
+    // delivers IRQ0/IRQ4 through IOAPIC GSIs 2/4 but keeps the same vectors.
     let irq_stubs: [unsafe extern "C" fn(); 16] = [
         isr_32, isr_33, isr_34, isr_35, isr_36, isr_37, isr_38, isr_39, isr_40, isr_41, isr_42,
         isr_43, isr_44, isr_45, isr_46, isr_47,
@@ -335,7 +336,7 @@ pub extern "C" fn exception_dispatch(frame: *mut InterruptFrame) {
     match frame.vector {
         32 => {
             pit::handle_interrupt();
-            pic::eoi_master();
+            crate::irq::eoi(0);
             crate::sched::on_timer_tick();
             // Perform a pending reschedule here, at the tail of the
             // dispatcher: the interrupted thread's frame stays on its stack
@@ -351,7 +352,7 @@ pub extern "C" fn exception_dispatch(frame: *mut InterruptFrame) {
         36 => {
             // COM1 receive (IRQ4).
             crate::console::on_rx_interrupt();
-            pic::eoi_master();
+            crate::irq::eoi(4);
         }
         33..=47 => crate::irq::dispatch((frame.vector - 32) as u8),
         128 => crate::syscall::dispatch(frame),

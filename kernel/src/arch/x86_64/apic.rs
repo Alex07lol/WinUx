@@ -1,4 +1,4 @@
-//! Local-APIC bring-up for the legacy 8259 path.
+//! Local-APIC bring-up for the 8259 and IOAPIC paths.
 //!
 //! A 64-bit VirtualBox guest always has an APIC, and the 8259's INT output is
 //! delivered through LAPIC LINT0. Firmware/Limine may leave LINT0 masked, which
@@ -7,8 +7,10 @@
 //! 1. maps the APIC MMIO page (see `paging::map_mmio_2m`), and
 //! 2. puts LINT0 into ExtINT delivery and unmasks it.
 //!
-//! Only LINT0 is unmasked; the APIC timer, IOAPIC and SMP startup belong to the
-//! later APIC milestone.
+//! Stage 8 additionally programs two IOAPIC redirection entries. LINT0 stays
+//! in ExtINT mode for the PIC fallback and for PCI lines that are not yet
+//! routed through the IOAPIC. The APIC timer and SMP startup remain later
+//! milestones.
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
@@ -22,6 +24,8 @@ const APIC_BASE_PHYSICAL: u64 = 0xfee0_0000;
 
 const SVR: usize = 0x0f0;
 const TPR: usize = 0x080;
+const EOI: usize = 0x0b0;
+const ID: usize = 0x020;
 const LVT_TIMER: usize = 0x320;
 const LVT_THERMAL: usize = 0x330;
 const LVT_PERF: usize = 0x340;
@@ -92,6 +96,16 @@ fn read32(base: *mut u32, offset: usize) -> u32 {
 fn write32(base: *mut u32, offset: usize, value: u32) {
     // SAFETY: as above.
     unsafe { write_volatile(base.add(offset / 4), value) };
+}
+
+/// The 8-bit physical local-APIC ID used as an IOAPIC destination.
+pub fn local_id(lapic: *mut u32) -> u8 {
+    (read32(lapic, ID) >> 24) as u8
+}
+
+/// Signal end-of-interrupt after an IOAPIC-delivered handler returns.
+pub fn eoi(lapic: *mut u32) {
+    write32(lapic, EOI, 0);
 }
 
 /// Unmask LINT0 for ExtINT delivery so the 8259 can reach the CPU.

@@ -8,14 +8,16 @@ FIRMWARE="bios"
 TIMEOUT=60
 MEMORY="${PROJECT_OS_MEMORY:-512M}"
 SERIAL_LOG_OVERRIDE=""
+REQUIRE_IOAPIC=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --firmware) FIRMWARE="${2:?missing firmware value}"; shift 2 ;;
         --timeout) TIMEOUT="${2:?missing timeout value}"; shift 2 ;;
         --memory) MEMORY="${2:?missing memory value}"; shift 2 ;;
         --serial-log) SERIAL_LOG_OVERRIDE="${2:?missing serial log path}"; shift 2 ;;
+        --require-ioapic) REQUIRE_IOAPIC=1; shift ;;
         --help|-h)
-            log "usage: $0 [iso] [--firmware bios|uefi] [--memory 512M] [--serial-log path] [--timeout seconds]"
+            log "usage: $0 [iso] [--firmware bios|uefi] [--memory 512M] [--serial-log path] [--timeout seconds] [--require-ioapic]"
             exit 0
             ;;
         *)
@@ -126,5 +128,19 @@ if [ "$STATUS" -ne 33 ]; then
 fi
 
 log "marker: $(grep -a 'PROJECT_OS_BOOT_SUCCESS:' "$SERIAL" | tail -1)"
+if [ "$REQUIRE_IOAPIC" -eq 1 ]; then
+    grep -aqE "^ioapic: version 0x[0-9a-f]+, [0-9]+ pins, id [0-9]+; timer GSI2, console GSI4$" "$SERIAL" \
+        || die "IOAPIC bring-up line missing (log: $SERIAL_OUT)"
+    grep -aqF "pit: 100 Hz, IOAPIC GSI2" "$SERIAL" \
+        || die "PIT is not routed through IOAPIC GSI2 (log: $SERIAL_OUT)"
+    grep -aqF "console: COM1 receive interrupt enabled (IOAPIC GSI4)" "$SERIAL" \
+        || die "COM1 is not routed through IOAPIC GSI4 (log: $SERIAL_OUT)"
+    grep -aqE "^timer: [1-9][0-9]* ticks observed$" "$SERIAL" \
+        || die "timer did not produce ticks through the IOAPIC (log: $SERIAL_OUT)"
+    if grep -aqF "fell back to 8259" "$SERIAL"; then
+        die "IOAPIC timer route timed out and fell back to the PIC (log: $SERIAL_OUT)"
+    fi
+    log "IOAPIC asserts: PIT GSI2, COM1 GSI4, timer ticks, no PIC fallback"
+fi
 log "serial log: $SERIAL_OUT"
 log "PASS: $FIRMWARE boot reached PROJECT_OS_BOOT_SUCCESS and exited via isa-debug-exit"

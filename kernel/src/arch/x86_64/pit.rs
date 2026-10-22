@@ -1,8 +1,8 @@
 //! 8254 programmable interval timer, channel 0, periodic mode.
 //!
-//! This is a bring-up timer for the first interrupt-driven milestone. The
-//! APIC timer with TSC calibration is the planned replacement once SMP and the
-//! IOAPIC exist.
+//! This is a bring-up timer for the first interrupt-driven milestone. Stage 8
+//! delivers its output through IOAPIC GSI2 (with an 8259 fallback). The APIC
+//! timer with TSC calibration is the planned replacement once SMP exists.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

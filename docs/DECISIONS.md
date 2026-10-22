@@ -1640,3 +1640,54 @@ a different discipline. Queue overflow is counted but the VM run did not force
 a drop; storm behavior, coalescing and MSI/IOAPIC remain untested. Frames are
 copied twice on the IRQ path (device buffer to queue, queue to dispatch
 buffer), a deliberate simplicity/latency trade-off that is not benchmarked.
+
+## ADR-0034 - IOAPIC bring-up with fixed ISA routes and a PIC fallback
+
+**Context.** The kernel could deliver PIT and COM1 interrupts only through the
+8259, even though Limine enables the local APIC and both target hypervisors
+expose an IOAPIC. Stage 6/7 added exclusive IRQ registration and an IRQ-driven
+e1000 RX queue, but the controller path itself was still unexercised. Moving
+the timer and console first gives the IOAPIC/EOI code a deterministic test
+without taking on PCI routing discovery at the same time.
+
+The current e1000 (`8086:100e`, QEMU 82540EM) has no MSI/MSI-X capability in
+QEMU 11.1.0's device model, so an MSI stage cannot be validated with the
+existing NIC. QEMU q35 also shows config-space interrupt line 11 for the NIC,
+while its ACPI `_PRT` in APIC mode maps the e1000's slot-2 INTA to GSI22 (the
+`GSIG` link), not GSI11. Treating the config line as an IOAPIC GSI would
+therefore route the wrong pin. ACPI MADT and `_PRT` parsing does not exist yet.
+
+**Decision.** Map the fixed `0xfec00000` IOAPIC window, probe ID/version/input
+count, mask every redirection entry, and route only PIT GSI2 (edge, active-high)
+and COM1 GSI4 (level, active-high) to the boot CPU's physical LAPIC ID.
+`os_core::ioapic::RedirectionEntry` owns the 64-bit encoding and is host-tested.
+The timer and COM1 IDT paths write a local-APIC EOI through `irq::eoi`; all PIC
+routes continue to use the 8259 EOI. If the fixed window cannot be mapped or
+probed, or if the timer does not start through the IOAPIC, the boot path masks
+GSI2/GSI4 and returns both lines to PIC IRQ0/IRQ4. The e1000 remains on its
+legacy INTx line for now.
+
+**Alternatives considered.** Keep the 8259 for PIT/COM1 (leaves the IOAPIC path
+untested); implement ACPI MADT/`_PRT` parsing and PCI routing in the same stage
+(larger and unverified failure surface); hardcode config line 11 as the e1000
+GSI (known to be wrong on q35); add an MSI-capable NIC first (new driver and
+device model); use the APIC timer (requires calibration and changes the
+scheduler tick source). The fixed two-route stage gives a small, testable
+controller milestone without claiming PCI discovery.
+
+**Evidence.** Host suite 297 (5 new IOAPIC-entry tests) passes. QEMU q35 BIOS:
+`ioapic: version 0x20, 24 pins, id 0; timer GSI2, console GSI4`,
+`pit: 100 Hz, IOAPIC GSI2`, `console: COM1 receive interrupt enabled (IOAPIC
+GSI4)`, 7 ticks, no fallback. VirtualBox 7.2.20 BIOS: the same IOAPIC/PIT/COM1
+lines, 6 ticks, no fallback. `test_boot_qemu.sh --require-ioapic`,
+`test_driver_model_qemu.sh` (which also types shell commands over COM1) and
+`test_virtualbox.sh --require-ioapic` pass. `scripts/test_all.sh` reports
+PASS=30 FAIL=0 SKIP=2.
+
+**Consequences.** PIT/COM1 delivery and EOI now use the IOAPIC/LAPIC path on
+QEMU and VirtualBox BIOS and fall back safely if the fixed controller window is
+unusable. The IOAPIC base is not discovered through ACPI, PCI INTx lines still
+use the 8259, and MSI/MSI-X, APIC timer, SMP, UEFI and physical hardware remain
+untested or unimplemented. The `level` choice for COM1 is deliberate: the UART
+interrupt remains asserted until serviced, and the IOAPIC can redeliver it
+after EOI. This is not physical-hardware validation.

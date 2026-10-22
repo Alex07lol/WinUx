@@ -59,8 +59,8 @@ static RX: IrqSpinLock<Ring> = IrqSpinLock::new(Ring::new());
 /// Bytes received while the ring was full.
 pub static RX_OVERRUNS: AtomicU64 = AtomicU64::new(0);
 
-/// Configure the UART for receive interrupts. The IRQ4 line must be unmasked
-/// at the PIC separately (`pic::unmask_irq(4)`).
+/// Configure the UART for receive interrupts. The boot path routes IRQ4
+/// through IOAPIC GSI4, with a fallback to `pic::unmask_irq(4)`.
 pub fn init() {
     // Drop anything stale in the receive register before enabling the
     // interrupt so a phantom byte cannot fire before the shell is ready.

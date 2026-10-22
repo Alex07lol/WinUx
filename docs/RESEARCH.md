@@ -1402,6 +1402,59 @@ design; SMP would need per-CPU queues or a different handoff. It does not claim
 lossless RX, storm-free operation, MSI/IOAPIC routing, coalescing tuning or a
 background protocol thread.
 
+## R-027 – IOAPIC delivery for PIT and COM1 without ACPI discovery
+
+**Question.** Can the kernel move the 8254 PIT and 16550 COM1 interrupt paths
+from the 8259 to the I/O APIC on the supported hypervisors, using a small,
+testable controller layer, without yet implementing ACPI MADT/`_PRT` discovery
+or PCI interrupt routing? What must the fallback do if the fixed controller
+window is unavailable or the timer route does not deliver?
+
+**Sources.** Intel 64 and IA-32 Architectures Software Developer's Manual,
+Volume 3A, local APIC and I/O APIC chapters (APIC MMIO, LINT0 ExtINT, LAPIC EOI,
+IOAPIC indirect registers, redirection-entry bit layout):
+<https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>.
+Intel 82093AA I/O Advanced Programmable Interrupt Controller datasheet
+(redirection table and mask semantics). ACPI Specification, Multiple APIC
+Description Table and PCI Routing Table (`_PRT`) sections:
+<https://uefi.org/specifications>. QEMU 11.1.0 source inspected for q35 ACPI
+routing and the e1000 model (`hw/i386/acpi-build.c`, `hw/net/e1000.c`): its
+`_PRT` maps the e1000's slot-2 INTA to GSI22 while config space reports line
+11, and the e1000 model exposes no MSI capability. VirtualBox 7.2.20 was
+exercised as a guest, not used as a specification. No Linux, Wine or ReactOS
+implementation code was read or copied.
+
+**Claim.** xAPIC and IOAPIC are separate MMIO interfaces: the LAPIC receives the
+vector and must be acknowledged at `0xB0`, while the IOAPIC holds the routing
+entry. A redirection entry selects vector, fixed delivery, physical destination,
+polarity, trigger mode and mask. The IOAPIC base is not fixed by architecture;
+ACPI MADT is the authoritative source, and PCI INTx GSI numbers come from
+`_PRT`, not from PCI config-space `INTERRUPT_LINE`. QEMU q35 uses base
+`0xfec00000`, 24 inputs, and maps the e1000's slot-2 INTA to GSI22 while config
+space reports line 11, so a fixed config-line-as-GSI assumption is wrong. On
+the supported hypervisors the PIT is GSI2 (edge, active-high); COM1 is GSI4,
+where level trigger is the safer choice because the UART line stays asserted
+until serviced. The QEMU 82540EM e1000 has no MSI capability, so MSI cannot be
+validated with the current NIC.
+
+**Experiment.** PASSED (2026-10-22), QEMU and VirtualBox BIOS only. Host tests
+encode timer, PCI-style level/low, mask and destination cases (5 tests; suite
+297). QEMU q35 logs `ioapic: version 0x20, 24 pins, id 0; timer GSI2, console
+GSI4`, `pit: 100 Hz, IOAPIC GSI2`, `console: COM1 receive interrupt enabled
+(IOAPIC GSI4)`, 7 ticks and no fallback. VirtualBox 7.2.20 logs the same routes,
+6 ticks and no fallback. The driver-model harness also types shell commands,
+exercising COM1 GSI4. `test_boot_qemu.sh --require-ioapic`,
+`test_virtualbox.sh --require-ioapic` and `scripts/test_all.sh` (PASS=30,
+FAIL=0, SKIP=2) pass. No UEFI, physical-hardware, PCI GSI, MSI or ACPI run was
+performed.
+
+**Conclusion.** Keep the fixed IOAPIC base and GSI2/GSI4 routes as an explicit
+QEMU/VirtualBox bring-up stage, with fully masked entries and a PIC fallback.
+The next interrupt step is ACPI MADT/`_PRT` parsing plus PCI INTx routing; MSI
+needs either an MSI-capable device/driver or a separately validated device
+model. Do not describe this as general IOAPIC discovery, PCI interrupt routing,
+MSI support or physical-hardware validation.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |
@@ -1410,7 +1463,7 @@ background protocol thread.
 | VirtualBox EFI boot | NOT ATTEMPTED | Enable EFI in an isolated VM; record serial evidence |
 | Real-hardware boot | NOT ATTEMPTED | Only on a disposable machine; no host disk/EFI changes |
 | 5-level paging | NOT IMPLEMENTED | Kernel requests max 4-level; revisit with 5-level page-table code |
-| APIC/IOAPIC/SMP | NOT IMPLEMENTED | LAPIC timer calibration, IOAPIC routing, SMP startup |
+| APIC/IOAPIC/SMP | PARTIAL | IOAPIC GSI2/GSI4 and LAPIC EOI verified; APIC timer, ACPI MADT/`_PRT`, PCI INTx routing, MSI and SMP not started |
 | KASLR | NOT REQUESTED | Needs relocatable kernel and slide handling |
 | Windows API/driver compatibility | NOT IMPLEMENTED | PE loader, compatibility corpus, object/syscall design |
 | NVIDIA acceleration | RESEARCH ONLY | Scoped port study and one named GPU target |

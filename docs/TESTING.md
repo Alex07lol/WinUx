@@ -126,9 +126,12 @@ and the kernel idles, so the same ISO can be booted manually.
    HHDM write/read-back, free, accounting restored, double-free rejected,
    non-power-of-two rejected.
 7. GDT/TSS/IST1 loaded; IDT loaded; deliberate `int3` reached the Rust handler.
-8. PIC remapped/masked, PIT programmed, IRQ0 unmasked, the APIC MMIO page mapped,
-   and LINT0 left in ExtINT delivery so the 8259 can reach the CPU.
-9. Five PIT ticks observed within a 2 s TSC-based bound (or bounded spin fallback).
+8. PIC remapped/masked; PIT programmed; APIC and IOAPIC pages mapped; PIT GSI2
+   and COM1 GSI4 routed through the IOAPIC with local-APIC EOI; LINT0 left in
+   ExtINT delivery for the PIC fallback and PCI INTx lines.
+9. Five PIT ticks observed through IOAPIC GSI2 within a 2 s TSC-based bound
+   (or bounded spin fallback); a timeout falls back to PIC IRQ0/IRQ4 and the
+   second wait must also pass.
 10. Kernel heap self-test: box allocation, `Vec` growth, a 1 MiB block, accounting restored.
 11. VM self-test: own 4-level tables active, map/unmap/translate, W^X and guard refusals, CR3 swap.
 12. Scheduler self-test: two yielding workers interleave; a CPU-bound spinner finishes under timer preemption.
@@ -289,6 +292,18 @@ key` path; the persistence session pins the reboot-load, rollback and
 fresh-format cases. Limits are enforced in the codec (host tests) and in the
 shell, never by truncation.
 
+## IOAPIC test details
+
+`scripts/test_all.sh` runs `scripts/test_boot_qemu.sh --require-ioapic` as the
+`boot-qemu-ioapic` step. The harness fails unless the BIOS/q35 serial log has
+the bring-up line, `pit: 100 Hz, IOAPIC GSI2`, the COM1 GSI4 line, at least
+one observed PIT tick, and no `fell back to 8259` line. `scripts/test_all.sh`
+also runs the VirtualBox step with `--require-ioapic`, so a silent PIC fallback
+is a test failure on both supported BIOS profiles. The driver-model harness
+asserts the same lines and then types shell commands, which exercises COM1 RX
+through IOAPIC GSI4. The 5 host-side IOAPIC tests cover the 64-bit
+redirection-entry layout, mask bit, vector reservation and destination field.
+
 ## Network test details
 
 `scripts/test_net_qemu.sh` (driver `scripts/test_net_qemu.py`) boots the
@@ -329,6 +344,13 @@ pending in the PIC (`IRR=0x01`, `ISR=0x00`) while IF=1, because LINT0 was
 masked and the APIC MMIO page is not part of Limine's HHDM. The kernel now maps
 that page through the live 4-level tables and configures LINT0 ExtINT; the
 serial log then shows `timer: 5 ticks observed` and the success marker.
+
+Stage 8 reran the same isolated VM with `--require-ioapic` on 2026-10-22. The
+serial log records `ioapic: version 0x20, 24 pins, id 0; timer GSI2, console
+GSI4`, `pit: 100 Hz, IOAPIC GSI2`, `console: COM1 receive interrupt enabled
+(IOAPIC GSI4)` and 6 timer ticks, with no PIC fallback; the script passed. This
+is evidence for PIT/COM1 IOAPIC delivery on VirtualBox BIOS, not for PCI INTx
+IOAPIC routing, MSI, UEFI or physical hardware.
 
 Networking in that VM is reported as observed, not claimed green: the kernel
 detected the NIC (`net: e1000 at 00:03.0 bar0 0xf0000000 size 128 KiB`, MAC

@@ -1,6 +1,8 @@
 # Driver registration, matching, lifecycle, resource ownership and restart
 
-Status: stages 2-7 implemented and verified (2026-10-22). Contract for
+Status: stages 2-7 implemented and verified (2026-10-22). Stage 8 routes the
+PIT and COM1 through the IOAPIC, but leaves the e1000 on PCI INTx through the
+PIC. Contract for
 `os_core::driver`, `os_core::queue`, `kernel/src/driver.rs`,
 `kernel/src/net.rs`, `kernel/src/e1000.rs`, `kernel/src/irq.rs`, the shell
 `drivers [stop|start]` command and the QEMU harnesses. Evidence is in section
@@ -23,10 +25,13 @@ line the driver keeps the original polled path. Stop masks and unregisters
 the line, clears the queue, disables the device, resets it, returns all ring
 frames, removes network state and releases every claim; start repeats the
 same path. A stop/restart cycle is exercised end to end on QEMU, including
-ICMP and queue delivery after the restart.
+ICMP and queue delivery after the restart. Stage 8 routes only the PIT and
+COM1 through IOAPIC GSIs 2/4; the driver's IRQ line stays on the 8259 because
+PCI GSI discovery is not implemented.
 
 Not claimed: MMIO unmapping (the HHDM mapping is kernel-lifetime and reused),
-MSI/IOAPIC routing (only legacy 8259 INTx is implemented), a background
+MSI or PCI INTx IOAPIC routing (only PIT/COM1 use the IOAPIC; the e1000 uses
+legacy 8259 INTx), a background
 network thread (protocol dispatch still runs from the service/poll path),
 hotplug, power management, IRPs, device stacks, WDM compatibility, dynamic
 driver loading, class filters, multiple NICs (one e1000; a second is unbound)
@@ -104,6 +109,9 @@ still run on the service path after the network lock is taken.
 Pinned q35 boot lines (pinned e1000 at 00:02.0):
 
 ```text
+ioapic: version 0x20, 24 pins, id 0; timer GSI2, console GSI4
+pit: 100 Hz, IOAPIC GSI2
+console: COM1 receive interrupt enabled (IOAPIC GSI4)
 driver: registered 1 descriptor(s)
 driver: e1000 matched 00:02.0 8086:100e
 net: e1000 at 00:02.0 bar0 0xfebc0000 size 128 KiB
@@ -199,26 +207,32 @@ Stop/restart now exercises the same path in reverse.
 
 ## 8. Evidence
 
-- Host suite 292 tests; `os_core::driver` has 17 tests covering binding,
-  exact page ownership, physical overlap, teardown and restart, and
-  `os_core::queue` has 5 tests including order, overflow, reset and a
-  20,000-item two-thread SPSC stress run.
+- Host suite 297 tests (292 driver/queue baseline plus 5 IOAPIC encoding
+  tests); `os_core::driver` has 17 tests covering binding, exact page
+  ownership, physical overlap, teardown and restart, and `os_core::queue`
+  has 5 tests including order, overflow, reset and a 20,000-item two-thread
+  SPSC stress run.
 - `scripts/test_driver_model_qemu.sh` PASS on q35 with a pinned e1000: the
-  six boot lines, `,driver`, no panic, QEMU exit 33.
+  IOAPIC/PIT/COM1 lines plus the six driver boot lines, `,driver`, no panic,
+  QEMU exit 33. The same harness types commands, so COM1 RX through IOAPIC
+  GSI4 is exercised.
 - `scripts/test_driver_restart_qemu.sh` PASS: stop freed 19 frames, restart
   reclaimed them, `net` inactive/active, ping after restart.
 - `scripts/test_net_qemu.sh` PASS: ARP/ICMP/UDP still work; the IRQ event
   count grows 2 -> 5 and queue delivery grows 2 -> 5 frames after `ping`.
   VirtualBox assigns line 9 and boots; its isolated NAT has no gateway reply,
   so no delivery count is claimed there.
-- `scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2 after the stage-7 changes.
+- `scripts/test_all.sh` PASS=30 FAIL=0 SKIP=2 after the stage-8 changes
+  (`boot-qemu-ioapic` and VirtualBox `--require-ioapic` added).
 - Recorded sessions: `artifacts/qemu-driver-session.log`,
   `artifacts/qemu-driver-restart-session.log`, `artifacts/qemu-net-session.log`,
   `artifacts/vbox-serial.log`.
 
 ## 9. Next stage (not claimed)
 
-APIC/IOAPIC/MSI routing, then a virtual GPU. The stage-7 handler drains up to
+PCI INTx IOAPIC routing with ACPI MADT/`_PRT` discovery and MSI/MSI-X, then a
+virtual GPU. Stage 8 deliberately leaves the e1000 on 8259 INTx because q35's
+config line 11 is not its ACPI GSI. The stage-7 handler drains up to
 one full 32-descriptor ring per interrupt into a 16-frame software queue and
 drops new frames when that queue is full; protocol work still runs on the
 service path, so this is not a background network thread. Queue-overflow and

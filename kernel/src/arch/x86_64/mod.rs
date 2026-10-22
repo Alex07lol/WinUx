@@ -3,6 +3,7 @@ pub mod context;
 pub mod gdt;
 pub mod idt;
 pub mod io;
+pub mod ioapic;
 pub mod paging;
 pub mod pic;
 pub mod pit;

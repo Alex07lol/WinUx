@@ -1,27 +1,48 @@
-//! Legacy 8259A IRQ dispatch and ownership (Phase 9 stage 6).
+//! Hardware IRQ dispatch, ownership and IOAPIC routing (Phase 9 stages 6-8).
 //!
-//! The timer (IRQ0) and COM1 (IRQ4) keep their dedicated paths in `idt.rs`.
-//! This module dispatches the remaining legacy lines to registered handlers,
-//! sends the 8259 end-of-interrupt sequence (slave first for lines 8..15),
-//! and masks/unmasks individual lines. Registration is exclusive and
-//! allocation-free; the driver resource ledger claims the same line so a
-//! second device cannot silently share it. See `docs/DRIVER_MODEL.md` and
-//! ADR-0032/R-025.
+//! The timer (IRQ0) and COM1 (IRQ4) keep dedicated IDT paths in `idt.rs`.
+//! Stage 8 routes those two ISA interrupts through IOAPIC GSIs 2 and 4 with
+//! local-APIC end-of-interrupt; `fallback_to_pic` returns both lines to the
+//! 8259 if timer delivery does not start. Every other legacy line still uses
+//! the 8259 until PCI INTx discovery exists. This module also dispatches those
+//! lines to registered handlers, masks/unmasks them, and keeps registration
+//! exclusive. See `docs/DRIVER_MODEL.md`, ADR-0034 and R-027.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use crate::arch::x86_64::io::{inb, outb};
+use os_core::ioapic::{Polarity, RedirectionEntry, TriggerMode};
+
+use crate::arch::x86_64::apic;
+use crate::arch::x86_64::io::inb;
+use crate::arch::x86_64::io::outb;
+use crate::arch::x86_64::ioapic::IoApic;
 
 pub const MAX_IRQ: u8 = 16;
 const TIMER_LINE: u8 = 0;
 const CONSOLE_LINE: u8 = 4;
+const TIMER_VECTOR: u8 = 32;
+const CONSOLE_VECTOR: u8 = 36;
+const TIMER_GSI: u8 = 2;
+const CONSOLE_GSI: u8 = 4;
+/// Route marker meaning "handled by the 8259", not an IOAPIC GSI.
+const PIC_ROUTE: u8 = 0xff;
 
 type Handler = fn();
 
 static HANDLERS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+static ROUTES: [AtomicU8; 16] = [const { AtomicU8::new(PIC_ROUTE) }; 16];
+static IOAPIC_BASE: AtomicUsize = AtomicUsize::new(0);
+static LAPIC_BASE: AtomicUsize = AtomicUsize::new(0);
 
-/// True when `line` is a legacy PIC line this module can route. Timer and
-/// COM1 are reserved and never handed to a device driver.
+/// Probed IOAPIC identity, for the one-line boot diagnostic.
+pub struct IoApicInfo {
+    pub version: u8,
+    pub pins: u8,
+    pub id: u8,
+}
+
+/// True when `line` is a legacy interrupt line this module can assign. Timer
+/// and COM1 are reserved and never handed to a device driver.
 pub fn usable(line: u8) -> bool {
     line < MAX_IRQ && line != TIMER_LINE && line != CONSOLE_LINE
 }
@@ -46,7 +67,8 @@ pub fn unregister(line: u8) -> bool {
     HANDLERS[line as usize].swap(0, Ordering::SeqCst) != 0
 }
 
-/// Dispatch one hardware IRQ: run the handler, then acknowledge the 8259.
+/// Dispatch one hardware IRQ: run the handler, then acknowledge it through the
+/// route that delivered it.
 pub fn dispatch(line: u8) {
     if line >= MAX_IRQ {
         return;
@@ -62,18 +84,35 @@ pub fn dispatch(line: u8) {
     eoi(line);
 }
 
-/// Non-specific end-of-interrupt for `line`; a slave line acknowledges the
-/// slave first, then the master cascade.
+/// End-of-interrupt for `line`. An IOAPIC route acknowledges the local APIC;
+/// a PIC route acknowledges the 8259 (slave first for lines 8..15).
 pub fn eoi(line: u8) {
+    if line >= MAX_IRQ {
+        return;
+    }
+    if route(line) != PIC_ROUTE {
+        let lapic = LAPIC_BASE.load(Ordering::Acquire);
+        if lapic != 0 {
+            apic::eoi(lapic as *mut u32);
+            return;
+        }
+    }
     if line >= 8 {
         outb(0xA0, 0x20);
     }
     outb(0x20, 0x20);
 }
 
-/// Mask one line at the 8259.
+/// Mask one line through its current route.
 pub fn mask(line: u8) {
     if line >= MAX_IRQ {
+        return;
+    }
+    let gsi = route(line);
+    if gsi != PIC_ROUTE {
+        if let Some(ioapic) = ioapic() {
+            let _ = ioapic.mask(gsi);
+        }
         return;
     }
     if line < 8 {
@@ -85,9 +124,17 @@ pub fn mask(line: u8) {
     }
 }
 
-/// Unmask one line, including the master cascade for slave lines.
+/// Unmask one line through its current route, including the PIC cascade for
+/// slave lines.
 pub fn unmask(line: u8) {
     if line >= MAX_IRQ {
+        return;
+    }
+    let gsi = route(line);
+    if gsi != PIC_ROUTE {
+        if let Some(ioapic) = ioapic() {
+            let _ = ioapic.unmask(gsi);
+        }
         return;
     }
     if line >= 8 {
@@ -99,4 +146,84 @@ pub fn unmask(line: u8) {
         let mask = inb(0x21) & !(1 << line);
         outb(0x21, mask);
     }
+}
+
+/// Program IOAPIC GSI 2 for the PIT and GSI 4 for COM1.
+///
+/// Every entry is masked first, then the two fixed routes are installed. On
+/// failure the table is left fully masked and the caller keeps the 8259 path.
+/// The PIT output is edge-triggered; the UART's interrupt line is level
+/// asserted, so COM1 uses level-high to avoid losing a byte that arrives while
+/// the handler is draining the FIFO.
+pub fn init_ioapic(base: *mut u32, lapic: *mut u32) -> Result<IoApicInfo, &'static str> {
+    let ioapic = IoApic::new(base)?;
+    ioapic.mask_all()?;
+    let destination = apic::local_id(lapic);
+    let timer = RedirectionEntry::fixed(
+        TIMER_VECTOR,
+        destination,
+        TriggerMode::Edge,
+        Polarity::ActiveHigh,
+        false,
+    )
+    .ok_or("timer vector is reserved")?;
+    let console = RedirectionEntry::fixed(
+        CONSOLE_VECTOR,
+        destination,
+        TriggerMode::Level,
+        Polarity::ActiveHigh,
+        false,
+    )
+    .ok_or("console vector is reserved")?;
+    ioapic.write_entry(TIMER_GSI, timer)?;
+    if let Err(error) = ioapic.write_entry(CONSOLE_GSI, console) {
+        let _ = ioapic.mask_all();
+        return Err(error);
+    }
+
+    let info = IoApicInfo {
+        version: ioapic.version(),
+        pins: ioapic.pins(),
+        id: ioapic.id(),
+    };
+    IOAPIC_BASE.store(base as usize, Ordering::Release);
+    LAPIC_BASE.store(lapic as usize, Ordering::Release);
+    ROUTES[TIMER_LINE as usize].store(TIMER_GSI, Ordering::Release);
+    ROUTES[CONSOLE_LINE as usize].store(CONSOLE_GSI, Ordering::Release);
+    Ok(info)
+}
+
+/// Return the PIT and COM1 lines to the 8259 after an IOAPIC timer-delivery
+/// timeout. The LAPIC stays enabled for LINT0 ExtINT.
+pub fn fallback_to_pic() {
+    if let Some(ioapic) = ioapic() {
+        let _ = ioapic.mask(TIMER_GSI);
+        let _ = ioapic.mask(CONSOLE_GSI);
+    }
+    ROUTES[TIMER_LINE as usize].store(PIC_ROUTE, Ordering::Release);
+    ROUTES[CONSOLE_LINE as usize].store(PIC_ROUTE, Ordering::Release);
+    IOAPIC_BASE.store(0, Ordering::Release);
+    LAPIC_BASE.store(0, Ordering::Release);
+    crate::arch::x86_64::pic::unmask_irq0();
+    crate::arch::x86_64::pic::unmask_irq(CONSOLE_LINE);
+}
+
+/// Whether the PIT is currently delivered through the IOAPIC.
+pub fn timer_uses_ioapic() -> bool {
+    route(TIMER_LINE) != PIC_ROUTE
+}
+
+fn route(line: u8) -> u8 {
+    if line >= MAX_IRQ {
+        return PIC_ROUTE;
+    }
+    ROUTES[line as usize].load(Ordering::Acquire)
+}
+
+fn ioapic() -> Option<IoApic> {
+    let base = IOAPIC_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    IoApic::new(base as *mut u32).ok()
 }

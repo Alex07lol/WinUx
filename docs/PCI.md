@@ -1,9 +1,10 @@
 # PCI bus-0 inventory (Phase 9, stage 1)
 
-Status: implemented and verified (2026-10-20). Contract for
-`os_core::pci` helper additions, `kernel/src/pci.rs`, the boot inventory,
-the shell `pci` command and `scripts/test_pci_qemu.sh`. Evidence is in
-section 7; ADR-0027 and R-020 record the decision and research.
+Status: implemented and verified (2026-10-20). Phase 9 stage 6 adds
+type-0 interrupt-line decoding (2026-10-22). Contract for `os_core::pci`
+helper additions, `kernel/src/pci.rs`, the boot inventory, the shell `pci`
+command and `scripts/test_pci_qemu.sh`. Evidence is in section 7;
+ADR-0027/0032 and R-020/025 record the decision and research.
 
 ## 1. Scope
 
@@ -24,11 +25,16 @@ In scope:
   BARs.
 - A fixed-capacity inventory (64 functions) with an explicit truncation
   result, a boot log, a self-test and the shell `pci` command.
+- For type-0 functions, the legacy `INTERRUPT_LINE`/`INTERRUPT_PIN` bytes at
+  config offset `0x3C` are recorded; `Function::irq_line()` exposes a line
+  only when the pin is 1-4 and the line is 1-15 (timer 0 and COM1 4 are
+  reserved by the kernel).
 
 Out of scope: bridge traversal beyond bus 0, MMCONFIG/ECAM, resource
-assignment or rebalancing, interrupt routing, capability lists, MSI,
-power management, hotplug, driver matching/lifecycle and any DMA policy.
-Those belong to later Phase 9 stages.
+assignment or rebalancing, interrupt routing or controller programming,
+capability lists, MSI, power management, hotplug, driver matching/lifecycle
+and any DMA policy. Those belong to later Phase 9 stages; stage 6 consumes the
+decoded legacy line through the 8259A path but does not change PCI routing.
 
 ## 2. Inventory model
 
@@ -38,6 +44,10 @@ device_id, class, subclass, interface, header, bar_count, bars[6] }`.
 implemented BAR; a 64-bit BAR uses two dword slots and therefore leaves
 the following entry `None`. A function is present iff its vendor is not
 `0xFFFF`.
+
+Each `Function` also stores `interrupt_line` and `interrupt_pin`. They are
+read once from `0x3C`; no routing is attempted and firmware's assignment is
+taken as-is. On q35 the pinned e1000 reports line 11, on VirtualBox line 9.
 
 The inventory lives in a `SpinLock<Vec<Function>>`, is rebuilt only by
 `pci::init()` at boot, and is read by the self-test, the boot printer, the

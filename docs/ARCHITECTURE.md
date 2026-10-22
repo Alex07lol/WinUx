@@ -93,13 +93,14 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/config.rs` | registry-like configuration store: `/etc/config` load or in-memory defaults, lazy save via the VFS dirty bit, boot self-test | working (ADR-0022) |
 | `kernel/src/registry.rs` | Win32 registry-shaped view over the config store: four-slot `HKLM` handle table (`0x1000 + slot`), case-insensitive prefix/value lookups, write mutations (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`) saved through `config::save()`, per-program reset | working (Phase 8 stages 3–4, ADR-0024/0025) |
 | `kernel/src/pci.rs` | PCI config mechanism #1: bus-0 function inventory (vendor/device/class/header, BAR sizing, multifunction scan), snapshot access, command-register enable | working (Phase 9 stage 1; bus 0 only) |
-| `kernel/src/driver.rs` | driver descriptors over the PCI inventory, deterministic binding, e1000 start/stop/restart through `net`, exact MMIO/DMA-page ownership ledger and structural self-test | working (Phase 9 stage 5; e1000 Running/Stopped) |
-| `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, polled, counters, ring teardown | working (QEMU/VirtualBox) |
-| `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch, `ping`, `udpecho`, status | working (static config) |
+| `kernel/src/driver.rs` | driver descriptors over the PCI inventory, deterministic binding, e1000 start/stop/restart through `net`, exact MMIO/DMA-page/IRQ ownership ledger and structural self-test | working (Phase 9 stage 6; e1000 Running/Stopped) |
+| `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, polled data path, legacy INTx acknowledge/count, counters, ring teardown | working (QEMU/VirtualBox) |
+| `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch, `ping`, `udpecho`, status, legacy IRQ event count | working (static config) |
+| `kernel/src/irq.rs` | exclusive legacy IRQ registration, PIC mask/unmask/EOI, dispatch | working (Phase 9 stage 6) |
 | `kernel/src/shell.rs` | serial shell builtins over kernel services, incl. `config get/set/del/list` | working (serial only) |
 | `kernel/src/arch/x86_64/gdt.rs` | GDT (kernel + user segments), TSS, IST1 double-fault stack | working |
-| `kernel/src/arch/x86_64/idt.rs` | exception gates, IRQ0, IRQ4, `int 0x80` gate, frame dispatcher | working |
-| `kernel/src/arch/x86_64/pic.rs` | 8259 remap/mask, per-line unmask, EOI | working |
+| `kernel/src/arch/x86_64/idt.rs` | exception gates, PIC IRQ0-15 (IRQ0/IRQ4 dedicated), `int 0x80` gate, frame dispatcher | working |
+| `kernel/src/arch/x86_64/pic.rs` | 8259 remap/mask and 16-line unmask with IRQ2 cascade | working |
 | `kernel/src/arch/x86_64/pit.rs` | 8254 channel 0 at 100 Hz, tick counter | working |
 | `kernel/src/arch/x86_64/context.rs` | register/RSP-swap context switch | working |
 | `kernel/src/arch/x86_64/paging.rs` | narrow uncached MMIO mapping through the live 4-level tables | working, not a VM manager |

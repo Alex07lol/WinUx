@@ -1,10 +1,11 @@
 # Driver registration, matching, lifecycle, resource ownership and restart
 
-Status: stages 2-5 implemented and verified (2026-10-21). Contract for
+Status: stages 2-6 implemented and verified (2026-10-22). Contract for
 `os_core::driver`, `kernel/src/driver.rs`, `kernel/src/net.rs`,
-`kernel/src/e1000.rs`, the shell `drivers [stop|start]` command and the QEMU
-harnesses. Evidence is in section 8; ADR-0028/0029/0030/0031 and
-R-021/022/023/024 record the decisions and research.
+`kernel/src/e1000.rs`, `kernel/src/irq.rs`, the shell `drivers [stop|start]`
+command and the QEMU harnesses. Evidence is in section 8;
+ADR-0028/0029/0030/0031/0032 and R-021/022/023/024/025 record the decisions
+and research.
 
 ## 1. Scope and non-claims
 
@@ -12,16 +13,20 @@ The model registers compile-time descriptors, matches them against the PCI
 inventory, binds deterministically, starts the matched e1000 through
 `net::init`, records the exact BAR0 and DMA page ranges the binding owns, and
 exposes explicit `Bound -> Running -> Stopped` and `-> Failed(reason)`
-transitions. Stop disables the device, resets it, returns all ring frames to
-the frame allocator, removes the network state and releases the ledger
-claims; start repeats the claim/start path. A stop/restart cycle is exercised
-end to end on QEMU, including ICMP after the restart.
+transitions. Stage 6 adds legacy INTx delivery: firmware's PCI interrupt
+line is claimed exclusively, the e1000 handler is registered before the line
+is unmasked, and a handler acknowledges `ICR` and counts events without
+touching the rings. Stop masks and unregisters the line, disables the device,
+resets it, returns all ring frames, removes network state and releases every
+claim; start repeats the same path. A stop/restart cycle is exercised end to
+end on QEMU, including ICMP and new interrupt events after the restart.
 
 Not claimed: MMIO unmapping (the HHDM mapping is kernel-lifetime and reused),
-interrupts/MSI (the driver is explicitly polled and claims no IRQ line),
-hotplug, power management, IRPs, device stacks, WDM compatibility, dynamic
-driver loading, class filters, multiple NICs (one e1000; a second is unbound)
-and any virtual GPU. A reset
+MSI/IOAPIC routing (only legacy 8259 INTx is implemented), interrupt-driven
+networking (RX frames are still drained by `poll()`; the handler only
+acknowledges and counts), hotplug, power management, IRPs, device stacks, WDM
+compatibility, dynamic driver loading, class filters, multiple NICs (one
+e1000; a second is unbound) and any virtual GPU. A reset
 timeout during stop intentionally leaks the ring frames rather than freeing
 memory the device might still DMA into; that path is reported as failure and
 leaves the binding `Failed`, so restart requires a clean stop.
@@ -45,8 +50,9 @@ leaves the binding `Failed`, so restart requires a clean stop.
   `DmaPages { base, pages }` are physical range claims; all physical claims
   are mutually overlap-checked, so a DMA page cannot alias MMIO or another
   driver's pages. DMA bases must be page-aligned, `pages` non-zero and the
-  range must not overflow. `Irq { line }` is a separate exclusive claim.
-  16 claims max; `release(owner)` drops all of a binding's claims and
+  range must not overflow. `Irq { line }` is a separate exclusive claim;
+  on QEMU/VirtualBox the e1000 now holds one alongside BAR0 and the four DMA
+  ranges. 16 claims max; `release(owner)` drops all of a binding's claims and
   returns the count; `mmio_owner(addr)`, `dma_owner(addr)`, `dma_pages(owner)`
   and `irq_owner(line)` resolve ownership.
 - `unmatched(devices, bindings)` reports unclaimed functions.
@@ -65,24 +71,28 @@ then:
 1. converts the snapshot to model devices and binds them;
 2. for each binding, finds the PCI function and claims BAR0's MMIO range
    **before** touching hardware;
-3. calls `net::init(&PciDevice, ..., claim)`, which enables memory/bus-master,
-   resets the e1000, allocates the RX/TX rings, then invokes the claim
-   callback with the four physical ranges (RX buffer run, TX descriptors, RX
-   descriptors, TX buffer; 19 pages) **before** `RCTL`/`TCTL` enable the
-   device. A claim failure frees the just-allocated rings and aborts start;
-4. on success configures RX/TX, reads the MAC, runs the polled loopback
-   selftest and installs the network state; any later failure frees the rings
-   and releases all claims;
-5. on success moves the binding to `Running`; on any failure releases the
-   claims and moves it to `Failed(reason)`;
+3. if firmware assigned a usable legacy line (pin 1-4, line 1-15), registers
+   the exclusive e1000 handler and claims `Irq { line }` in the ledger;
+4. calls `net::init(&PciDevice, ..., irq_line, claim)`, which enables
+   memory/bus-master, resets the e1000, allocates the RX/TX rings, then
+   invokes the claim callback with the four physical ranges (RX buffer run,
+   TX descriptors, RX descriptors, TX buffer; 19 pages) **before**
+   `RCTL`/`TCTL` enable the device. A claim failure frees the just-allocated
+   rings and aborts start. On success it programs `RDTR`, publishes the MMIO
+   base and enables `RXT0|RXDMT0` in `IMS`; the PIC line is still masked;
+5. after `net::init` returns, unmasks the line, moves the binding to
+   `Running`; on any failure masks/unregisters the IRQ, frees the rings and
+   releases all claims, then moves it to `Failed(reason)`;
 6. logs the binding, final state, resources, unmatched count and a
    structural self-test: descriptor indices, one binding per device, rules
    hold, single-instance honored, every matched device reached Running or
-   Failed, Running bindings own BAR0 plus exactly 19 DMA pages, Failed
-   bindings own nothing, and rebinding produces the same plan.
+   Failed, Running bindings own BAR0, exactly 19 DMA pages and (when a line
+   exists) the IRQ, Failed bindings own nothing, and rebinding produces the
+   same plan.
 
 A device is never started without a successful claim, and a failed start
-leaves no ledger entry. The e1000 uses polled I/O with no IRQ claim.
+leaves no ledger entry. The e1000's IRQ claim describes delivery only: RX/TX
+completion remains polled, so an interrupt does not run protocol code.
 
 Pinned q35 boot lines (pinned e1000 at 00:02.0):
 
@@ -90,7 +100,8 @@ Pinned q35 boot lines (pinned e1000 at 00:02.0):
 driver: registered 1 descriptor(s)
 driver: e1000 matched 00:02.0 8086:100e
 driver: e1000 state Running
-driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), polled
+net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX drain remains polled)
+driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), irq 11 (legacy INTx)
 driver: 5 function(s) unmatched (no registered driver)
 driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness, single-instance and resource ownership verified)
 ```
@@ -104,17 +115,19 @@ reprints the descriptor table, state, resources and claim count.
 
 `drivers stop` (shell, only from `Running`):
 
-1. `net::shutdown` removes and takes the network state first, then disables
-   RX/TX with `IMC`/`RCTL=0`/`TCTL=0`, resets the device and waits for the
-   reset to complete. A reset timeout returns an error **without freeing the
-   rings** (the device may still DMA); the driver still releases its ledger
-   claims and records `Failed`.
+1. masks the IRQ line first, then `net::shutdown` removes and takes the
+   network state, disables RX/TX with `IMC`/`RCTL=0`/`TCTL=0`, resets the
+   device and waits for the reset to complete. A reset timeout returns an
+   error **without freeing the rings** (the device may still DMA); the driver
+   still unregisters the handler, releases its ledger claims and records
+   `Failed`.
 2. On success the RX buffer run (16 pages) and the TX/RX descriptor and TX
    buffer frames (3) are returned with `memory::free_pages`, logging
    `net: stopped (19 DMA frame(s) released)`.
-3. The driver releases its 5 claims (`Mmio` plus four `DmaPages` ranges),
-   records `Stopped`, and logs `driver: e1000 state Stopped` plus
-   `driver: e1000 resources released (5 claim(s); mmio mapping retained)`.
+3. The driver unregisters the handler and releases its 6 claims (`Mmio`,
+   four `DmaPages` ranges and `Irq`), records `Stopped`, and logs
+   `driver: e1000 state Stopped` plus
+   `driver: e1000 resources released (6 claim(s); mmio mapping retained)`.
    The HHDM MMIO mapping is retained for the kernel lifetime because there is
    no unmap API; pages backing the mapping are firmware MMIO, not allocator
    frames.
@@ -122,7 +135,8 @@ reprints the descriptor table, state, resources and claim count.
 `drivers start` (only from `Stopped`) re-runs the same claim and
 `net::init` path: BAR0 is claimed again, the device is reset, rings are
 reallocated, their four exact ranges are claimed (19 pages total) before
-RX/TX enable, the MAC is re-read, the loopback selftest runs, and the
+RX/TX enable, the IRQ handler is registered and the line claimed again, the
+MAC is re-read, the loopback selftest runs, the line is unmasked, and the
 binding returns to `Running` with
 `driver: e1000 restarted (stop/start cycle ok)`. A machine without a run
 state or a failed driver is rejected, never silently restarted.
@@ -130,9 +144,10 @@ state or a failed driver is rejected, never silently restarted.
 The QEMU harness proves the accounting end to end: `mem` free frames increase
 by exactly 19 after stop and return to the pre-stop value after restart,
 `net` is inactive while stopped, `drivers` shows zero claims, and
-`ping 10.0.2.2 -c 1` succeeds after the restart. The ledger log names five
-claims, and the kernel self-test rejects a Running binding whose DMA pages do
-not sum to 19.
+`ping 10.0.2.2 -c 1` succeeds after the restart and the e1000 IRQ event
+count grows (2 -> 4 in the recorded run). The ledger log names six claims,
+and the kernel self-test rejects a Running binding whose DMA pages do not sum
+to 19 or whose IRQ line is owned by another claim.
 
 ## 5. Why the e1000 moved behind the model
 
@@ -161,9 +176,10 @@ Stop/restart now exercises the same path in reverse.
 - `scripts/test_driver_model_qemu.sh` boots with debug-exit and checks the
   boot lifecycle lines; it does not stop/restart.
 - `scripts/test_driver_restart_qemu.sh` boots the interactive ISO and drives
-  `mem`, `drivers stop`, `net`, `drivers`, `drivers start`,
-  `ping 10.0.2.2 -c 1` over paced serial. It asserts exactly 19 frames are
-  freed and reallocated, so a leak or double-free fails the test.
+  `net`, `mem`, `drivers stop`, `net`, `drivers`, `drivers start`,
+  `ping 10.0.2.2 -c 1`, `net` over paced serial. It asserts exactly 19 frames
+  are freed and reallocated and that the e1000 IRQ event count grows after the
+  restart, so a leak, double-free or unregistered handler fails the test.
 - Host tests cannot exercise the allocator or hardware; they cover the
   state/ledger rules, physical overlap, exact DMA page accounting and the
   stop/restart accounting contract.
@@ -177,16 +193,18 @@ Stop/restart now exercises the same path in reverse.
 - `scripts/test_driver_restart_qemu.sh` PASS: stop freed 19 frames, restart
   reclaimed them, `net` inactive/active, ping after restart.
 - `scripts/test_net_qemu.sh` PASS: the restart-capable driver did not
-  regress ARP/ICMP/UDP.
-- `scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2.
+  regress ARP/ICMP/UDP, and the e1000 IRQ event count grows after `ping`
+  (boot baseline 2). VirtualBox assigns line 9 and boots; its isolated NAT has
+  no gateway reply, so no delivery count is claimed there.
+- `scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2 after the stage-6 changes.
 - Recorded sessions: `artifacts/qemu-driver-session.log`,
-  `artifacts/qemu-driver-restart-session.log`.
+  `artifacts/qemu-driver-restart-session.log`, `artifacts/qemu-net-session.log`,
+  `artifacts/vbox-serial.log`.
 
 ## 9. Next stage (not claimed)
 
-IRQ/MSI allocation and a real interrupt path, then a virtual GPU. The current
-policy is explicit polling: the e1000 keeps `IMS` masked and no `Irq` claim is
-made, because the kernel has no IOAPIC routing or driver IRQ dispatch yet.
-`Resource::Irq` stays modeled and host-tested but unused in the kernel. MMIO
-unmapping and IOMMU isolation remain absent; DMA claims detect overlap in our
-ledger, they do not enforce isolation in hardware.
+A useful interrupt-driven RX path (deferred ring drain with bounded work),
+then APIC/IOAPIC/MSI routing, then a virtual GPU. The stage-6 handler is a
+delivery/ownership proof only: it reads `ICR` and counts, while protocol work
+remains polled. MMIO unmapping and IOMMU isolation remain absent; DMA claims
+detect overlap in our ledger, they do not enforce isolation in hardware.

@@ -90,7 +90,21 @@ ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
 ISR_NOERR 32
+ISR_NOERR 33
+ISR_NOERR 34
+ISR_NOERR 35
 ISR_NOERR 36
+ISR_NOERR 37
+ISR_NOERR 38
+ISR_NOERR 39
+ISR_NOERR 40
+ISR_NOERR 41
+ISR_NOERR 42
+ISR_NOERR 43
+ISR_NOERR 44
+ISR_NOERR 45
+ISR_NOERR 46
+ISR_NOERR 47
 ISR_NOERR 128
 
 isr_common:
@@ -171,7 +185,21 @@ unsafe extern "C" {
     fn isr_30();
     fn isr_31();
     fn isr_32();
+    fn isr_33();
+    fn isr_34();
+    fn isr_35();
     fn isr_36();
+    fn isr_37();
+    fn isr_38();
+    fn isr_39();
+    fn isr_40();
+    fn isr_41();
+    fn isr_42();
+    fn isr_43();
+    fn isr_44();
+    fn isr_45();
+    fn isr_46();
+    fn isr_47();
     fn isr_128();
 }
 
@@ -245,8 +273,15 @@ pub fn init() {
         let ist = if vector == 8 { 1 } else { 0 };
         idt.0[vector] = IdtEntry::for_handler(*handler as usize as u64, ist, false);
     }
-    // COM1 receive: IRQ4 => vector 36.
-    idt.0[36] = IdtEntry::for_handler(isr_36 as *const () as usize as u64, 0, false);
+    // PIC IRQ0..IRQ15 => vectors 32..47. Vectors 32 (timer) and 36 (COM1)
+    // keep dedicated dispatch paths; the rest go through `crate::irq`.
+    let irq_stubs: [unsafe extern "C" fn(); 16] = [
+        isr_32, isr_33, isr_34, isr_35, isr_36, isr_37, isr_38, isr_39, isr_40, isr_41, isr_42,
+        isr_43, isr_44, isr_45, isr_46, isr_47,
+    ];
+    for (line, stub) in irq_stubs.iter().enumerate() {
+        idt.0[32 + line] = IdtEntry::for_handler(*stub as *const () as usize as u64, 0, false);
+    }
     // Syscall gate: user-callable interrupt gate (DPL3) at vector 0x80.
     idt.0[128] = IdtEntry::for_handler(isr_128 as *const () as usize as u64, 0, true);
 
@@ -318,6 +353,7 @@ pub extern "C" fn exception_dispatch(frame: *mut InterruptFrame) {
             crate::console::on_rx_interrupt();
             pic::eoi_master();
         }
+        33..=47 => crate::irq::dispatch((frame.vector - 32) as u8),
         128 => crate::syscall::dispatch(frame),
         vector => {
             // A fault taken from CPL3 is a user-process fault, not a kernel

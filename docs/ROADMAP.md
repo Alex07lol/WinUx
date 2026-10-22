@@ -14,7 +14,7 @@ were run and observed. No dates or completion percentages are implied.
 | 6 | VFS, storage, console/shell, persistence, networking | **complete** (stages 1–5 implemented and verified, 2026-10-18) |
 | 7 | PE loader and minimal native Windows console compatibility | **complete (stages 1–3, acceptance met 2026-10-19)** — PE32+ parser/loader with DIR64 relocations, and a real import directory resolving eleven `kernel32.dll`-shaped services against our own kernel implementations (console surface plus program basics: `WriteFile`, per-thread `GetLastError`/`SetLastError`, `ExitThread`, synthetic IDs, `GetTickCount`, `GetCommandLineA`); broader API surface, real DLL loading, SEH, TLS and PE32 explicitly outside the phase and not started |
 | 8 | larger Win32/desktop, registry-like config, GUI/text/input | **partial (stages 1–5, 2026-10-20)** — a persisted registry-like key/value store (`os_core::config` POCF codec + `kernel/src/config.rs` + shell `config` builtin) rides the existing checkpoint slots with no format change, a blocking line-mode console `ReadFile` (service 14) lets a PE fixture consume typed serial input with echo and a CRLF-inclusive count (`docs/WIN32_INPUT.md`, ADR-0023), a read-only registry surface (`advapi32.dll` `RegOpenKeyExA`/`RegQueryValueExA`/`RegCloseKey`, services 15–17, four-slot handle table over the config store, first six-argument stub) lets a PE fixture read REG_SZ values (`docs/WIN32_REGISTRY.md`, ADR-0024), and a registry write surface (`RegCreateKeyExA`/`RegSetValueExA`/`RegDeleteValueA`, services 18–20, first nine-argument stub, writes persisted through `config::save()`) lets a PE fixture create keys, set/update/delete REG_SZ values and survive a save/read-back (`docs/WIN32_REGISTRY_WRITE.md`, ADR-0025), and a registry enumeration/deletion surface (`RegDeleteKeyA`/`RegEnumKeyExA`/`RegEnumValueA`, services 21–23, first eight- and two-argument stubs, deterministic canonical-order enumeration, non-recursive key deletion with the enumerate-first rule) lets a PE fixture enumerate keys/values and delete keys (`docs/WIN32_REGISTRY_ENUM.md`, ADR-0026); larger Win32 surface, GUI and the compatibility matrix not started |
-| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–4: PCI inventory, driver model, e1000 start/stop/restart + MMIO/DMA accounting, 2026-10-21) — real DMA page/IRQ ownership, MMIO unmap and VM display not started |
+| 9 | graphics/driver framework, PCI, MMIO/DMA/IRQ ownership, VM display | partial (stages 1–6: PCI inventory, driver model, e1000 start/stop/restart + exact MMIO/DMA/IRQ claims, 2026-10-22) — interrupt-driven RX, MSI/IOAPIC, MMIO unmap and VM display not started |
 | 10 | one scoped open-source GPU acceleration target or documented block | not started (research only) |
 | 11 | Windows WDDM/driver compatibility prototype or documented block | not started (research only) |
 
@@ -437,6 +437,28 @@ PASS; `scripts/test_net_qemu.sh` PASS; `scripts/test_all.sh` PASS=29 FAIL=0
 SKIP=2. Not claimed: IOMMU isolation, MMIO unmapping, IRQ/MSI delivery,
 allocation-failure injection, hotplug, power management or a virtual GPU. See
 `docs/DRIVER_MODEL.md`, ADR-0031, R-024.
+
+## Phase 9 stage 6 (2026-10-22): legacy INTx delivery and IRQ ownership
+
+The PCI inventory decodes type-0 `INTERRUPT_LINE`/`INTERRUPT_PIN` at config
+offset `0x3C`. A new `kernel/src/irq.rs` provides exclusive per-line handler
+registration, 8259A mask/unmask (including the IRQ2 cascade), non-specific EOI
+and dispatch; IDT gates for vectors 32-47 route device lines while IRQ0/IRQ4
+keep their dedicated handlers. The driver claims `Irq { line }`, registers the
+e1000 handler before `net::init`, enables `RXT0|RXDMT0` (with `RDTR`) only
+after all DMA claims, and unmasks the line only after the NIC is running.
+`E1000::handle_irq` reads `ICR` and increments a counter; it does not touch
+rings or take locks. Stop masks the line, disables/shuts down the NIC,
+unregisters the handler and releases six claims; restart repeats the claim and
+unmasks again. `net` status reports the event count.
+
+Evidence: q35 assigns line 11, two events before the harness ping and four
+after the restart ping; `scripts/test_driver_model_qemu.sh`,
+`scripts/test_driver_restart_qemu.sh` and `scripts/test_net_qemu.sh` PASS;
+VirtualBox assigns line 9 and boots. `scripts/test_all.sh` PASS=29 FAIL=0
+SKIP=2. Not claimed: interrupt-driven RX (protocol work remains polled),
+MSI/IOAPIC, shared lines, coalescing tuning, MMIO unmapping, IOMMU isolation or
+a virtual GPU. See `docs/DRIVER_MODEL.md`, `docs/NETWORK.md`, ADR-0032, R-025.
 
 ## Phase 8 acceptance (planned)
 

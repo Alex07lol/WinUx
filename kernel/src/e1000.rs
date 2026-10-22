@@ -9,6 +9,8 @@
 //! buffers come from the frame allocator and are mapped through the HHDM;
 //! device-visible addresses are the physical addresses of those frames.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use os_core::net::eth::{self, MacAddr};
 use os_core::pci::BarKind;
 
@@ -22,6 +24,7 @@ const MIN_BAR_BYTES: u64 = 128 * 1024;
 const CTRL: u32 = 0x0000;
 const EERD: u32 = 0x0014;
 const ICR: u32 = 0x00C0;
+const IMS: u32 = 0x00D0;
 const IMC: u32 = 0x00D8;
 const RCTL: u32 = 0x0100;
 const TCTL: u32 = 0x0400;
@@ -31,6 +34,7 @@ const RDBAH: u32 = 0x2804;
 const RDLEN: u32 = 0x2808;
 const RDH: u32 = 0x2810;
 const RDT: u32 = 0x2818;
+const RDTR: u32 = 0x2820;
 const TDBAL: u32 = 0x3800;
 const TDBAH: u32 = 0x3804;
 const TDLEN: u32 = 0x3808;
@@ -58,6 +62,13 @@ const TIPG_DEFAULT: u32 = 10 | (8 << 10) | (6 << 20);
 
 const RAH_ADDRESS_VALID: u32 = 1 << 31;
 
+/// RXDMT0 (descriptor minimum threshold) and RXT0 (receive timer). The timer
+/// register makes RXT0 useful for single-packet traffic; both are cleared by
+/// reading ICR in the interrupt handler.
+const IMS_RXDMT0: u32 = 1 << 4;
+const IMS_RXT0: u32 = 1 << 7;
+const RDTR_VALUE: u32 = 0x10;
+
 /// Transmit command: end of packet, insert FCS, report status.
 const TX_CMD_EOP_IFCS_RS: u8 = 0x01 | 0x02 | 0x08;
 const DESC_STATUS_DD: u8 = 0x01;
@@ -66,6 +77,11 @@ const DESC_STATUS_EOP: u8 = 0x02;
 const RX_DESCRIPTORS: usize = 32;
 const RX_BUFFER_BYTES: usize = 2048;
 const RX_PAGES: usize = RX_DESCRIPTORS * RX_BUFFER_BYTES / os_core::frame::PAGE_SIZE as usize;
+/// Virtual BAR0 base used by the interrupt handler; zero when no device is
+/// started. The handler only reads ICR to acknowledge the cause.
+static IRQ_MMIO: AtomicU64 = AtomicU64::new(0);
+static IRQ_EVENTS: AtomicU64 = AtomicU64::new(0);
+
 /// Pages the driver allocates before the device is usable: TX descriptors,
 /// TX buffer, RX descriptors and the RX buffer pages. Claimed as four exact
 /// physical ranges in the driver resource ledger before the device is enabled.
@@ -211,6 +227,42 @@ impl E1000 {
         Ok(nic)
     }
 
+    /// Enable RX interrupts and publish the MMIO base for the IRQ handler.
+    /// Called only after the IRQ line is claimed and the PIC is about to be
+    /// unmasked; the handler never touches the descriptor rings.
+    pub fn enable_interrupts(&self) {
+        self.write(RDTR, RDTR_VALUE);
+        IRQ_MMIO.store(self.registers as u64, Ordering::SeqCst);
+        self.write(IMS, IMS_RXDMT0 | IMS_RXT0);
+    }
+
+    /// Mask all device interrupts and detach the handler's MMIO context.
+    pub fn disable_interrupts(&self) {
+        self.write(IMC, u32::MAX);
+        IRQ_MMIO.store(0, Ordering::SeqCst);
+    }
+
+    /// Number of e1000 interrupt causes acknowledged by the IRQ handler.
+    pub fn irq_events() -> u64 {
+        IRQ_EVENTS.load(Ordering::Relaxed)
+    }
+
+    /// IRQ handler: read ICR (write-one-to-clear causes) and count non-zero
+    /// events. RX frames stay queued for the normal poll path; this handler
+    /// performs no allocation and takes no network lock.
+    pub fn handle_irq() {
+        let base = IRQ_MMIO.load(Ordering::Acquire);
+        if base == 0 {
+            return;
+        }
+        // SAFETY: `base` is the mapped BAR0 virtual address published by a
+        // running device; ICR is a valid 32-bit register at offset 0xC0.
+        let cause = unsafe { core::ptr::read_volatile((base + ICR as u64) as *const u32) };
+        if cause != 0 {
+            IRQ_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Physical DMA page ranges owned by this device: RX buffer run, TX
     /// descriptors, RX descriptors and the TX buffer.
     pub fn dma_ranges(&self) -> [(u64, u32); 4] {
@@ -228,7 +280,7 @@ impl E1000 {
     /// the free fails the rings are leaked rather than freed while the device
     /// may still be DMAing.
     pub fn shutdown(mut self) -> Result<(), &'static str> {
-        self.write(IMC, u32::MAX);
+        self.disable_interrupts();
         self.write(RCTL, 0);
         self.write(TCTL, 0);
         self.reset()?;

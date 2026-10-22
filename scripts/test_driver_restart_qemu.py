@@ -88,7 +88,7 @@ def main():
     boot_tokens = [
         b"driver: e1000 matched 00:02.0 8086:100e",
         b"driver: e1000 state Running",
-        b"driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), polled",
+        b"driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), irq 11 (legacy INTx)",
         b"driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness, single-instance and resource ownership verified)",
         b"net selftest: passed (arp resolved, icmp echo reply in ",
     ]
@@ -108,6 +108,24 @@ def main():
                 fail("boot marker without %r: %r" % (token, marker_line), session.data)
             )
 
+    def irq_events():
+        events = 0
+        for line in bytes(session.data).splitlines():
+            if line.startswith(b"net: mac "):
+                match = re.search(rb"irq (\d+) event", line)
+                if match:
+                    events = int(match.group(1))
+        return events
+
+    status = run_command(session, "net", [b"net: mac 52:54:00:", b"irq "])
+    if status:
+        return status
+    baseline_events = irq_events()
+    if baseline_events <= 0:
+        return session.finish(
+            fail("e1000 delivered no interrupt events before stop", session.data)
+        )
+
     before = mem_free(session)
     if before is None:
         return session.finish(fail("mem before stop did not report free frames", session.data))
@@ -118,7 +136,7 @@ def main():
         [
             b"net: stopped (19 DMA frame(s) released)",
             b"driver: e1000 state Stopped",
-            b"driver: e1000 resources released (5 claim(s); mmio mapping retained)",
+            b"driver: e1000 resources released (6 claim(s); mmio mapping retained)",
         ],
     )
     if status:
@@ -153,7 +171,7 @@ def main():
         [
             b"net: e1000 at 00:02.0 bar0 0xfebc0000 size 128 KiB",
             b"driver: e1000 state Running",
-            b"driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), polled",
+            b"driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), irq 11 (legacy INTx)",
             b"driver: e1000 restarted (stop/start cycle ok)",
         ],
     )
@@ -183,9 +201,23 @@ def main():
     if status:
         return status
 
+    status = run_command(session, "net", [b"net: mac 52:54:00:", b"irq "])
+    if status:
+        return status
+    restarted_events = irq_events()
+    if restarted_events <= baseline_events:
+        return session.finish(
+            fail(
+                "e1000 IRQ count did not grow after restart (%d -> %d)"
+                % (baseline_events, restarted_events),
+                session.data,
+            )
+        )
+
     print(
         "driver restart: stop freed %d frames, restart reclaimed them, "
-        "ping after restart passed" % FREED_FRAMES
+        "ping and IRQ delivery after restart passed (%d -> %d events)"
+        % (FREED_FRAMES, baseline_events, restarted_events)
     )
     return session.finish(0)
 

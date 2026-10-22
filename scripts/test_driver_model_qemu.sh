@@ -5,8 +5,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 # Boots the default ISO on q35 with a pinned e1000 and asserts the Phase 9
 # stage-3 driver lifecycle: one registered descriptor, the e1000 binding,
-# a successful start (state Running), its resource claim (BAR0 MMIO range and
-# exact DMA page ranges, polled), the unmatched count, the structural self-test and
+# a successful start (state Running), its resource claim (BAR0 MMIO range,
+# exact DMA page ranges and the q35 legacy INTx line), the unmatched count, the structural self-test and
 # the marker's `driver` check. Stop/restart is not exercised (not implemented).
 SERIAL_OUT="$ROOT_DIR/artifacts/qemu-driver-session.log"
 QEMU_LOG="$ROOT_DIR/artifacts/qemu-driver.log"
@@ -76,7 +76,7 @@ assert_line() {
 assert_line "driver: registered 1 descriptor(s)"
 assert_line "driver: e1000 matched 00:02.0 8086:100e"
 assert_line "driver: e1000 state Running"
-assert_line "driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), polled"
+assert_line "driver: e1000 resources mmio 0xfebc0000..0xfebe0000 (131072 B), 4 DMA range(s)/19 page(s), irq 11 (legacy INTx)"
 assert_line "driver: 5 function(s) unmatched (no registered driver)"
 assert_line "driver selftest: passed (1 binding(s), 5 unmatched; match rules, uniqueness, single-instance and resource ownership verified)"
 grep -aq "PROJECT_OS_BOOT_SUCCESS:.*checks=.*driver" "$SERIAL_OUT" \

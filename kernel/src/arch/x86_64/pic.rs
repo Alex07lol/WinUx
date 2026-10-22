@@ -1,5 +1,6 @@
-//! Legacy 8259A PIC initialisation. The first milestone uses IRQ0 only; the
-//! APIC/IOAPIC path is a later milestone (documented in docs/ROADMAP.md).
+//! Legacy 8259A PIC initialisation and line masking. IRQ0 (PIT) and IRQ4
+//! (COM1) are used from bring-up; Phase 9 stage 6 adds device lines through
+//! crate::irq. The APIC/IOAPIC path remains a later milestone.
 
 use super::io::{inb, io_wait, outb};
 
@@ -30,13 +31,22 @@ pub fn remap_and_mask_all() {
     outb(0xa1, 0xff);
 }
 
-/// Unmask one master-PIC line (0..=7); callers must have a handler installed
-/// for the corresponding vector (32 + line).
+/// Unmask one PIC line (0..=15); callers must have a handler installed for
+/// the corresponding vector (32 + line). Slave lines also unmask the master
+/// cascade (IRQ2).
 pub fn unmask_irq(line: u8) {
-    debug_assert!(line < 8);
-    let bit = 1u8 << (line & 7);
-    let mask = inb(0x21);
-    outb(0x21, mask & !bit);
+    debug_assert!(line < 16);
+    if line < 8 {
+        let bit = 1u8 << line;
+        let mask = inb(0x21);
+        outb(0x21, mask & !bit);
+    } else {
+        let cascade = inb(0x21) & !(1 << 2);
+        outb(0x21, cascade);
+        let bit = 1u8 << (line - 8);
+        let mask = inb(0xA1);
+        outb(0xA1, mask & !bit);
+    }
 }
 
 pub fn unmask_irq0() {

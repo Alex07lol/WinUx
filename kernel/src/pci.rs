@@ -50,6 +50,22 @@ pub struct Function {
     pub header: u8,
     pub bar_count: u8,
     pub bars: [Option<BarInfo>; BAR_SLOTS],
+    /// PCI interrupt line (0..15) and pin (1=A..4=D); both zero when the
+    /// function has no legacy INTx assignment.
+    pub interrupt_line: u8,
+    pub interrupt_pin: u8,
+}
+
+impl Function {
+    /// Legacy INTx line if the firmware assigned a usable line (1..15) and
+    /// the function declares an interrupt pin.
+    pub fn irq_line(&self) -> Option<u8> {
+        (self.interrupt_pin != 0
+            && self.interrupt_pin <= 4
+            && self.interrupt_line > 0
+            && self.interrupt_line < 16)
+            .then_some(self.interrupt_line)
+    }
 }
 
 /// One located function with its decoded BAR0 (e1000 bring-up shape).
@@ -60,6 +76,8 @@ pub struct PciDevice {
     pub function: u8,
     pub bar0: pci::Bar,
     pub bar0_size: u64,
+    /// Legacy INTx line when the firmware assigned one, else None.
+    pub irq_line: Option<u8>,
 }
 
 fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
@@ -181,6 +199,11 @@ fn scan_function(bus: u8, device: u8, function: u8) -> Option<Function> {
         };
         index += if is_64_bit { 2 } else { 1 };
     }
+    let (interrupt_line, interrupt_pin) = if header == 0 {
+        interrupt_assignment(bus, device, function)
+    } else {
+        (0, 0)
+    };
     Some(Function {
         bus,
         device,
@@ -193,7 +216,15 @@ fn scan_function(bus: u8, device: u8, function: u8) -> Option<Function> {
         header,
         bar_count: recorded,
         bars,
+        interrupt_line,
+        interrupt_pin,
     })
+}
+
+/// Decode the type-0 INTERRUPT_LINE/INTERRUPT_PIN bytes at 0x3C.
+fn interrupt_assignment(bus: u8, device: u8, function: u8) -> (u8, u8) {
+    let value = read_u32(bus, device, function, 0x3C);
+    ((value & 0xFF) as u8, ((value >> 8) & 0xFF) as u8)
 }
 
 fn push(function: Function) -> bool {

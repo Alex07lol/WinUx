@@ -38,6 +38,7 @@ static DESCRIPTORS: &[Descriptor] = &[Descriptor {
 static SELFTEST_PASSED: AtomicBool = AtomicBool::new(false);
 static STATE: AtomicU8 = AtomicU8::new(STATE_NONE);
 static RUNNING_OWNER: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RUNNING_IRQ: AtomicU8 = AtomicU8::new(u8::MAX);
 static HHDM: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static LEDGER: SpinLock<Ledger> = SpinLock::new(Ledger::new());
@@ -62,6 +63,7 @@ fn pci_device_of(function: &pci::Function) -> Option<pci::PciDevice> {
         function: function.function,
         bar0: bar0.bar,
         bar0_size: bar0.size,
+        irq_line: function.irq_line(),
     })
 }
 
@@ -90,6 +92,18 @@ fn claim_mmio(owner: usize, function: &pci::Function) -> Result<(), driver::Erro
             len: bar0.size,
         },
     )
+}
+
+/// Register the exclusive handler and claim `line` in the resource ledger.
+/// On a ledger conflict the handler registration is rolled back.
+fn claim_irq(owner: usize, line: u8) -> Result<(), &'static str> {
+    crate::irq::register(line, crate::e1000::E1000::handle_irq)?;
+    if LEDGER.lock().claim(owner, Resource::Irq { line }).is_err() {
+        crate::irq::unregister(line);
+        return Err("IRQ resource conflict");
+    }
+    RUNNING_IRQ.store(line, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Claim the four physical DMA ranges (19 pages total) reported by the
@@ -127,14 +141,25 @@ fn log_resources(name: &str, function: &pci::Function) {
     let Some(bar0) = function.bars.iter().flatten().find(|bar| bar.index == 0) else {
         return;
     };
-    crate::kprintln!(
-        "driver: {} resources mmio {:#x}..{:#x} ({} B), 4 DMA range(s)/{} page(s), polled",
-        name,
-        bar0.bar.base,
-        bar0.bar.base + bar0.size,
-        bar0.size,
-        crate::e1000::DMA_PAGE_TOTAL
-    );
+    match function.irq_line() {
+        Some(line) => crate::kprintln!(
+            "driver: {} resources mmio {:#x}..{:#x} ({} B), 4 DMA range(s)/{} page(s), irq {} (legacy INTx)",
+            name,
+            bar0.bar.base,
+            bar0.bar.base + bar0.size,
+            bar0.size,
+            crate::e1000::DMA_PAGE_TOTAL,
+            line
+        ),
+        None => crate::kprintln!(
+            "driver: {} resources mmio {:#x}..{:#x} ({} B), 4 DMA range(s)/{} page(s), polled",
+            name,
+            bar0.bar.base,
+            bar0.bar.base + bar0.size,
+            bar0.size,
+            crate::e1000::DMA_PAGE_TOTAL
+        ),
+    }
 }
 
 fn log_unmatched(bindings: &[Binding], devices: usize) {
@@ -197,6 +222,13 @@ fn check(
             }
             State::Running if LEDGER.lock().dma_pages(index) != crate::e1000::DMA_PAGE_TOTAL => {
                 return Err("running binding does not own its 19 DMA pages");
+            }
+            State::Running
+                if function
+                    .irq_line()
+                    .is_some_and(|line| LEDGER.lock().irq_owner(line) != Some(index)) =>
+            {
+                return Err("running binding does not own its IRQ line");
             }
             _ => {}
         }
@@ -280,11 +312,25 @@ fn start_at(
         driver::Error::InvalidResource => "invalid resource descriptor",
         _ => "resource conflict",
     })?;
-    if let Err(reason) = crate::net::init(&device, hhdm_offset, tsc_frequency, |ranges| {
-        claim_dma(index, ranges)
-    }) {
+    let irq_line = device.irq_line;
+    if let Some(line) = irq_line
+        && let Err(reason) = claim_irq(index, line)
+    {
         LEDGER.lock().release(index);
         return Err(reason);
+    }
+    if let Err(reason) = crate::net::init(&device, hhdm_offset, tsc_frequency, irq_line, |ranges| {
+        claim_dma(index, ranges)
+    }) {
+        if let Some(line) = irq_line {
+            crate::irq::unregister(line);
+            RUNNING_IRQ.store(u8::MAX, Ordering::SeqCst);
+        }
+        LEDGER.lock().release(index);
+        return Err(reason);
+    }
+    if let Some(line) = irq_line {
+        crate::irq::unmask(line);
     }
     let _ = binding.start();
     RUNNING_OWNER.store(index, Ordering::SeqCst);
@@ -300,7 +346,14 @@ pub fn stop() -> Result<(), &'static str> {
         return Err("driver is not running");
     }
     let owner = RUNNING_OWNER.load(Ordering::SeqCst);
+    let irq_line = RUNNING_IRQ.swap(u8::MAX, Ordering::SeqCst);
+    if irq_line != u8::MAX {
+        crate::irq::mask(irq_line);
+    }
     let result = crate::net::shutdown();
+    if irq_line != u8::MAX {
+        crate::irq::unregister(irq_line);
+    }
     let released = LEDGER.lock().release(owner);
     RUNNING_OWNER.store(usize::MAX, Ordering::SeqCst);
     if let Err(reason) = result {

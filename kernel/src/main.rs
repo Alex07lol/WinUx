@@ -20,6 +20,7 @@ mod driver;
 mod e1000;
 mod fbcon;
 mod heap;
+mod irq;
 mod limine;
 mod loader;
 mod memory;
@@ -419,7 +420,7 @@ pub extern "C" fn kmain() -> ! {
     arch::x86_64::gdt::init();
     kprintln!("gdt: loaded (kernel code/data, TSS, IST1 double-fault stack)");
     idt::init();
-    kprintln!("idt: loaded (32 exception gates + IRQ0 + int 0x80 syscall gate)");
+    kprintln!("idt: loaded (32 exception gates + PIC IRQ0-15 + int 0x80 syscall gate)");
 
     // Deliberate breakpoint: exercises the gate, stub, Rust dispatcher and
     // iretq before interrupts are enabled.

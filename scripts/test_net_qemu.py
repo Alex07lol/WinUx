@@ -18,6 +18,7 @@ Exit status: 0 on pass, 1 on any failed assertion, 2 on usage error.
 """
 
 import os
+import re
 import socket
 import sys
 import time
@@ -97,6 +98,7 @@ def main():
         b" KiB",
         b"net: mac 52:54:00:",
         b"net: ip 10.0.2.15/24 gw 10.0.2.2",
+        b"net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX drain remains polled)",
         b"net: loopback selftest: ",
         b"net selftest: passed (arp resolved, icmp echo reply in ",
     ]
@@ -136,6 +138,21 @@ def main():
     if status:
         return status
 
+    def irq_events():
+        events = 0
+        for line in bytes(session.data).splitlines():
+            if line.startswith(b"net: mac "):
+                match = re.search(rb"irq (\d+) event", line)
+                if match:
+                    events = int(match.group(1))
+        return events
+
+    baseline_events = irq_events()
+    if baseline_events <= 0:
+        return session.finish(
+            fail("e1000 delivered no interrupt events after boot", session.data)
+        )
+
     # ---- Shell: ARP + ICMP through the slirp gateway ---------------------
     status = run_command(
         session,
@@ -149,6 +166,19 @@ def main():
     )
     if status:
         return status
+
+    status = run_command(session, "net", [b"net: mac 52:54:00:", b"irq "])
+    if status:
+        return status
+    after_events = irq_events()
+    if after_events <= baseline_events:
+        return session.finish(
+            fail(
+                "e1000 IRQ count did not grow after ping (%d -> %d)"
+                % (baseline_events, after_events),
+                session.data,
+            )
+        )
 
     # ---- Shell: host->guest UDP datagram echoed back ---------------------
     client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

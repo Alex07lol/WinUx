@@ -1,7 +1,8 @@
 # e1000 networking (Phase 6, stage 5) — design spec
 
 Status: **approved 2026-10-18 (scope chosen by the user); implemented and
-verified 2026-10-18.** This document is the contract for the stage: code, tests
+verified 2026-10-18.** Phase 9 stage 6 (2026-10-22) adds legacy INTx delivery
+and ownership; packet I/O remains polled (see section 12). This document is the contract for the stage: code, tests
 and logs must match it, and any deviation is recorded in §11 (observed results,
 a corrected loopback assumption and one harness-found defect are recorded
 there).
@@ -21,8 +22,9 @@ Deliberately **not** in this stage:
   VirtualBox NAT defaults), no DNS, no routing beyond the local subnet;
 - no TCP, no sockets API: UDP is exercised through a bounded shell fixture
   (`udpecho`), not a general socket layer;
-- no interrupts/MSI: the driver is polled; packets are processed while a
-  command waits for them, not in a background thread;
+- no interrupt-driven packet processing and no MSI: stage 6 accepts and
+  acknowledges the legacy INTx line, but packets are still processed while a
+  command polls, not in a background thread;
 - no IPv6, no fragment reassembly (fragmented packets are rejected), no
   checksum offload, no VLAN, no jumbo frames;
 - one NIC, bus 0 only, device `8086:100E` only (`e1000e` 82574L and others are
@@ -178,19 +180,22 @@ bad checksums, zero-length UDP payload boundary), MAC formatting.
   (reason ∈ {reset timeout, mac unavailable, ring allocation, loopback
   state}); the probe is then `net selftest: skipped (no NIC)`.
 - Counters: `frames_tx`, `frames_rx`, `errors` (timeouts, descriptor errors).
-- No IRQ: `IMS` stays masked, no `Irq` claim is made and `poll()` is called
-  from the stack when a command is waiting. This is an explicit polled policy,
-  not interrupt support.
+- No IRQ in the original stage: `IMS` stayed masked and `poll()` was called
+  from the stack when a command waited. Phase 9 stage 6 enables `RXT0|RXDMT0`
+  and claims the legacy line, but the handler only reads `ICR` and counts; the
+  packet path is unchanged and still polled. See section 12 and R-025.
 
 ## 7. Stack and shell (`kernel/src/net.rs`, `kernel/src/shell.rs`)
 
-- `net::init(device, hhdm, tsc) -> Result` runs from the driver model after
-  the PCI inventory and resource claim:
+- `net::init(device, hhdm, tsc, irq_line, claim) -> Result` runs from the
+  driver model after the PCI inventory, MMIO/DMA claims and IRQ registration:
   - no binding/claim: `net: inactive (no supported e1000 NIC)`; every entry
     point becomes a no-op (except `net` status printing inactive);
   - started NIC: pinned line
     `net: e1000 at {bus:02x}:{dev:02x}.{fn} bar0 {:#x} size {} KiB`, then
-    `net: mac {mac}` and `net: ip 10.0.2.15/24 gw 10.0.2.2`.
+    `net: mac {mac}`, `net: ip 10.0.2.15/24 gw 10.0.2.2` and either
+    `net: e1000 irq {line} (legacy INTx, RXT0/RXDMT0; RX drain remains polled)`
+    or `net: e1000 irq unavailable; polled only`.
 - `net::selftest() -> Selftest`, exactly one line:
   - `net selftest: skipped (no NIC)`;
   - `net selftest: no gateway reply ({reason})` — non-fatal (a NIC on a
@@ -282,7 +287,8 @@ VirtualBox: `scripts/test_virtualbox.sh` gains
 - Static addressing and no routing: only the slirp/NAT subnet is reachable.
 - Polled driver: no background RX; packets that arrive while no command polls
   wait in the ring (and can be dropped by the ring wrapping — counted by
-  hardware, not by us). No IRQ path, no MSI.
+  hardware, not by us). Stage 6 delivers and counts legacy INTx but does no
+  deferred work; MSI/IOAPIC are absent.
 - One datagram at a time for `udpecho`; no sockets, no TCP, no DHCP/DNS.
 - Fragmented IPv4 is rejected; UDP payloads over 1024 bytes are dropped;
   frames larger than the 2048-byte RX buffer are dropped by the hardware.
@@ -317,3 +323,29 @@ VirtualBox: `scripts/test_virtualbox.sh` gains
   frame, ARP request, echo request) and `rx 2 frames` (ARP reply, echo reply)
   with `arp 1/8 entries, errors 0` — expected, recorded for interpretability.
 - Host tests: 51 new (`128 → 179`), above the §4 target of 45.
+
+## 12. Phase 9 stage 6: legacy INTx delivery and ownership
+
+The PCI inventory decodes the type-0 `INTERRUPT_LINE`/`INTERRUPT_PIN` bytes at
+config offset `0x3C`; a line is usable only with pin 1-4 and line 1-15, so the
+reserved timer (0) and COM1 (4) lines are never handed to a device. q35 assigns
+the pinned e1000 line 11; VirtualBox assigns line 9.
+
+`kernel/src/irq.rs` owns one handler per line, masks/unmasks through the
+8259A (unmasking IRQ2 for slave lines) and sends a non-specific EOI (slave
+first). `idt.rs` installs stubs for vectors 32-47; vectors 32 (PIT) and 36
+(COM1) keep dedicated paths, the rest dispatch to the registered handler.
+
+The driver claims `Irq { line }` before `net::init`, registers
+`E1000::handle_irq`, and unmasks only after the NIC is running. The handler
+reads `ICR` (read-to-clear) and increments an event counter; it takes no
+lock and does not touch the rings. `net` status appends
+`irq {events} event(s)`. Stop masks the line, shuts the NIC down, unregisters
+the handler and releases 6 claims; restart registers/claims/unmasks again.
+
+Verified on QEMU q35 with the pinned e1000: 2 interrupt events before the
+harness ping, 4 after the restart ping; the restart harness fails if the count
+does not grow. VirtualBox boots with line 9 but its isolated NAT has no
+gateway, so no delivery count is claimed there. Not claimed: MSI, IOAPIC
+routing, deferred RX work, interrupt coalescing tuning or shared interrupt
+lines.

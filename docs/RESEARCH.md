@@ -1312,6 +1312,50 @@ requested or delivered.
 unused until a real interrupt path exists. This establishes bookkeeping, not
 hardware isolation (no IOMMU) and not interrupt-driven I/O.
 
+## R-025 - Legacy PCI INTx discovery, PIC dispatch and e1000 interrupt acknowledgement
+
+**Question.** How can the kernel route the e1000's legacy interrupt without an
+IOAPIC/MSI stack, and what must the handler and ownership rules do so the
+claim is honest?
+
+**Sources.** *PCI Local Bus Specification 3.0* (reused from R-012/R-020):
+type-0 configuration header, `INTERRUPT_LINE` at `0x3C` bits 7:0 and
+`INTERRUPT_PIN` at bits 15:8, pin encodings 1=INTA# through 4=INTD#. Intel
+8254x SDM (reused from R-012): `ICR` (0xC0, interrupt-cause read-to-clear), `IMS` (0xD0), `IMC` (0xD8), `RDTR` (0x2820), `RXDMT0` (bit 4) and
+`RXT0` (bit 7). Intel 64 SDM and the 8259A programming model (reused from the
+timer/console work): vector remap, IMR mask bits, OCW2 non-specific EOI, and
+the IRQ2 cascade between master and slave. Our `R-024` establishes that an
+IRQ must not be claimed without a delivery path.
+
+On the 8254x, reading `ICR` returns the latched interrupt causes and clears
+them; our handler performs that read and counts non-zero causes.
+
+**Claim.** Legacy INTx is usable only if firmware assigned a line and the
+kernel owns that line. A type-0 function with pin 1-4 and line 1-15 can be
+claimed; line 0 (PIT) and line 4 (COM1) must be reserved. The 8259 must be
+unmasked for the line, including IRQ2 for slave lines, and the handler must
+send a non-specific EOI (slave first). The e1000 asserts INTx when an enabled
+cause occurs in `IMS`; reading `ICR` acknowledges the cause. Enabling
+`RXT0|RXDMT0` with a non-zero `RDTR` therefore yields observable interrupt
+delivery without changing the polled data path. Exclusive ownership in the
+ledger plus one handler per line prevents a silent shared-line claim.
+
+**Experiment.** PASSED (2026-10-22). QEMU q35 (`-device e1000`) reports PCI
+line 11 for 00:02.0; the kernel logs `net: e1000 irq 11`, claims 6 resources
+(MMIO, four DMA ranges, IRQ), and reports 2 interrupt events before the
+harness ping. `ping 10.0.2.2 -c 3` and a UDP echo succeed; the IRQ event count
+grows. `drivers stop` masks/unregisters the line, releases 6 claims and frees
+19 frames; `drivers start` re-registers line 11 and a post-restart ping grows
+the count 2 -> 4. VirtualBox assigns line 9 and boots; its isolated NAT has no
+gateway, so no delivery count is claimed there. `scripts/test_all.sh`
+PASS=29 FAIL=0 SKIP=2.
+
+**Conclusion.** Use legacy INTx for delivery/ownership now, with exclusive
+handler registration and ledger claims. Keep RX/TX polled until a bounded
+deferred-work design exists. Do not claim MSI, IOAPIC routing, shared lines,
+interrupt-driven networking or storm-free operation under sustained load; the
+handler only acknowledges `ICR`, and no backlog is queued.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |

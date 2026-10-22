@@ -1534,3 +1534,53 @@ released/reclaimed, exactly 19 pages freed/reallocated and ICMP after restart;
 a software registry: without an IOMMU it cannot prevent a buggy device from
 DMAing outside its claimed pages. MMIO unmapping, interrupt delivery/MSI,
 hotplug and allocation-failure fault injection remain unclaimed.
+
+## ADR-0032 - Legacy INTx delivery with exclusive IRQ ownership, polled data path retained
+
+**Context.** Stage 5 claimed exact DMA pages but deliberately left the e1000
+interrupt masked and unclaimed because the kernel had no driver IRQ dispatch.
+That made the `Irq` resource a model-only abstraction and meant the NIC could
+not report completion without polling. Phase 9 needs a real, testable
+interrupt path before IOAPIC/MSI or interrupt-driven RX is credible. The
+kernel already runs the 8259A PIC with IRQ0 (PIT) and IRQ4 (COM1) and routes
+them through LINT0 ExtINT, so legacy INTx is the smallest honest next step.
+
+**Decision.** Decode the type-0 PCI `INTERRUPT_LINE`/`INTERRUPT_PIN` bytes at
+config offset `0x3C` in the inventory. Expose a line only for pin 1-4 and line
+1-15; reserve the timer (0) and COM1 (4). Add `kernel/src/irq.rs` with one
+handler per line, exclusive registration, PIC mask/unmask including the IRQ2
+cascade, non-specific EOI (slave first), and dispatch. Install IDT stubs for
+vectors 32-47; keep IRQ0 and IRQ4 on their dedicated paths and send the rest
+to `irq::dispatch`. The driver registers the e1000 handler and claims
+`Resource::Irq { line }` before `net::init`, enables `RXT0|RXDMT0` with a
+non-zero `RDTR` only after the DMA claims, and unmasks the PIC line only after
+the NIC is running. The handler reads `ICR` (acknowledge) and increments an
+event counter; it takes no lock, performs no allocation and does not touch
+the rings. Stop masks the line, shuts the NIC down, unregisters the handler
+and releases all six claims; restart repeats the claim/register/unmask
+sequence. `net` status reports the accumulated event count.
+
+**Alternatives considered.** Keep polling only (leaves delivery untested and
+the `Irq` resource unused); jump directly to APIC/IOAPIC or MSI (more code and
+new controllers before the basic delivery path is proven); claim the line
+without a handler (false capability); let the handler drain RX (would need a
+lock-free or IRQ-safe queue and changes the measured data path in the same
+step); share lines between drivers (requires dispatch chaining and a
+spurious-interrupt policy, deferred).
+
+**Evidence.** Host suite unchanged at 287 tests (kernel-only change). QEMU
+q35 with the pinned e1000 reports line 11; boot logs two e1000 interrupt
+events, `ping 10.0.2.2 -c 3` raises the count, and stop/restart logs 6 claims
+released/reclaimed with the count growing 2 -> 4 after the restart ping.
+`scripts/test_driver_model_qemu.sh`, `scripts/test_driver_restart_qemu.sh` and
+`scripts/test_net_qemu.sh` PASS; `scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2.
+VirtualBox assigns line 9 and boots (isolated NAT has no gateway, so no
+delivery count is claimed there).
+
+**Consequences.** The kernel now has a real legacy IRQ path with tested
+ownership and teardown. It is not interrupt-driven I/O: RX/TX still progress
+only when polled, and the handler is a delivery/accounting probe. MSI,
+IOAPIC routing, shared lines, interrupt coalescing, deferred work and
+concurrent stop safety remain unclaimed. An interrupt storm is bounded only
+by reading `ICR`; there is no queue or backlog because no deferred work is
+queued.

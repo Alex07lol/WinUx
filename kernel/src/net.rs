@@ -61,15 +61,16 @@ static NET: IrqSpinLock<Option<NetState>> = IrqSpinLock::new(None);
 static SELFTEST_PASSED: AtomicBool = AtomicBool::new(false);
 static TSC_FREQUENCY: AtomicU64 = AtomicU64::new(0);
 
-/// Probe PCI for the NIC and bring it up. Logs the pinned `net:` lines.
 /// Start the NIC that the driver model has already matched and claimed.
-/// `Ok` means the MAC is read, the loopback selftest ran and the polled
-/// network state is installed; `Err` carries a stable reason for the driver
-/// binding's `Failed` state. A machine without a NIC never calls this.
+/// `Ok` means the MAC is read, the loopback selftest ran, optional legacy
+/// interrupts were enabled and the network state is installed; `Err` carries
+/// a stable reason for the driver binding's `Failed` state. A machine without
+/// a NIC never calls this.
 pub fn init<F>(
     device: &crate::pci::PciDevice,
     hhdm_offset: u64,
     tsc_frequency: Option<u64>,
+    irq_line: Option<u8>,
     claim: F,
 ) -> Result<(), &'static str>
 where
@@ -96,6 +97,16 @@ where
     };
     crate::kprintln!("net: mac {}", nic.mac());
     crate::kprintln!("net: ip {}/{} gw {}", IP_ADDRESS, SUBNET_PREFIX, GATEWAY);
+    match irq_line {
+        Some(line) => {
+            nic.enable_interrupts();
+            crate::kprintln!(
+                "net: e1000 irq {} (legacy INTx, RXT0/RXDMT0; RX drain remains polled)",
+                line
+            );
+        }
+        None => crate::kprintln!("net: e1000 irq unavailable; polled only"),
+    }
 
     let outcome = nic.loopback_selftest();
     crate::kprintln!(
@@ -116,8 +127,8 @@ where
     Ok(())
 }
 
-/// Stop the polled NIC and release its ring frames. The network state is
-/// removed first, so even a teardown failure leaves the network inactive.
+/// Stop the NIC and release its ring frames. The network state is removed
+/// first, so even a teardown failure leaves the network inactive.
 pub fn shutdown() -> Result<(), &'static str> {
     let Some(state) = NET.lock().take() else {
         return Err("network is not running");
@@ -170,7 +181,7 @@ pub fn status() -> Option<String> {
     let state = guard.as_ref()?;
     let (tx, rx, errors) = state.nic.counters();
     Some(alloc::format!(
-        "net: mac {}, ip {}/{} gw {}; tx {} frames, rx {} frames, arp {}/{} entries, errors {}",
+        "net: mac {}, ip {}/{} gw {}; tx {} frames, rx {} frames, arp {}/{} entries, errors {}, irq {} event(s)",
         state.nic.mac(),
         IP_ADDRESS,
         SUBNET_PREFIX,
@@ -179,7 +190,8 @@ pub fn status() -> Option<String> {
         rx,
         state.cache.len(),
         ARP_ENTRIES,
-        errors
+        errors,
+        E1000::irq_events()
     ))
 }
 

@@ -264,8 +264,30 @@ VirtualBox assigned line 9 and booted. Evidence: suite 287,
 PASS, `scripts/test_net_qemu.sh` PASS, `scripts/test_all.sh` PASS=29 FAIL=0
 SKIP=2 (`docs/DRIVER_MODEL.md`, `docs/NETWORK.md`, ADR-0032, R-025). Stage
 commit `03c97fc`, docs follow-up `a19ef24`, pushed with this progress commit.
-RX/TX remains polled;
-MSI/IOAPIC, shared lines, deferred work and a virtual GPU are not claimed.
+Stage 6 itself left RX/TX polled; stage 7 adds the deferred queue below.
+MSI/IOAPIC, shared lines and a virtual GPU are not claimed.
+
+**Phase 9 stage 7** - bounded interrupt-driven RX - is implemented and
+verified: the INTx handler now drains completed e1000 RX descriptors (at most
+32 per interrupt) into a host-tested single-producer/single-consumer queue
+(`os_core::queue::SpscQueue`, 16 frames of 1536 bytes, ~24 KiB BSS). A valid
+end-of-packet frame is copied into the queue; a full queue drops the newest
+frame and increments a counter, then the descriptor is rearmed. The network
+stack consumes up to eight frames per observation (`rxq` depth/capacity and
+`delivered`/`dropped` appear in `net` status), and the loopback self-test runs
+before interrupts are enabled so it cannot race the handler. Stop/restart
+masks the line and resets queue state and counters; the consumer is called
+with interrupts disabled and assumes a single CPU. QEMU q35 net evidence:
+delivery `2 -> 5` frames and events `2 -> 5` after ping, zero drops; restart
+evidence: events `2 -> 4`, delivery `2 -> 0-reset -> 2`, 19 frames
+freed/reclaimed. VirtualBox assigned line 9 and booted; its isolated NAT has
+no gateway, so no delivery count is claimed there. Evidence: suite 292 (5 new
+queue tests), `scripts/test_driver_model_qemu.sh` PASS,
+`scripts/test_driver_restart_qemu.sh` PASS, `scripts/test_net_qemu.sh` PASS,
+`scripts/test_all.sh` PASS=29 FAIL=0 SKIP=2 (`docs/DRIVER_MODEL.md`,
+`docs/NETWORK.md`, ADR-0033, R-026). Stage commit `3792d5b`, pushed with this
+progress commit. MSI/IOAPIC, shared lines, coalescing/storm tuning, a
+background RX thread, IOMMU isolation and a virtual GPU are not claimed.
 
 ## Repository state
 
@@ -333,6 +355,9 @@ MSI/IOAPIC, shared lines, deferred work and a virtual GPU are not claimed.
   `a19ef24` (`docs: align the stage 6 boot example with the observed q35
   log`) corrects the example order. Both are pushed together with this
   progress follow-up, same commit-then-record pattern as earlier stages.
+  The Phase 9 stage-7 commit is `3792d5b` (`phase9: hand off e1000 rx through
+  a bounded irq queue`), 13 files changed; it is pushed together with this
+  progress follow-up, same commit-then-record pattern.
   Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
@@ -1065,6 +1090,24 @@ MSI/IOAPIC, shared lines, deferred work and a virtual GPU are not claimed.
   claims, the restart harness proves 2 -> 4 IRQ events, the net harness proves
   strict event growth after ping; DRIVER_MODEL/NETWORK/PCI/TESTING/ROADMAP/
   ARCHITECTURE, ADR-0032 and R-025 record delivery, ownership and limits.
+- Phase 9 stage 7 - host queue (`os_core/src/queue.rs`, `lib.rs`):
+  `SpscQueue<T: Copy, N>` with monotonic atomic head/tail indices, release/
+  acquire publication, `try_push` rejection, `try_pop`, depth queries and a
+  quiescent `reset`; five tests cover FIFO order, full rejection, wraparound,
+  reset and a 20,000-item two-thread stress.
+- Phase 9 stage 7 - e1000 RX path (`kernel/src/e1000.rs`): an IRQ-owned RX
+  context, 16-frame queue, 32-descriptor per-interrupt budget, 1536-byte
+  frames, drop-newest-on-full accounting, descriptor rearm and exact DD
+  clearing; `irq_rx_active/stats/depth/pop_into` expose it, and `counters()`
+  folds IRQ-produced frames/errors into the status line.
+- Phase 9 stage 7 - network integration (`kernel/src/net.rs`): loopback
+  self-test moved before `enable_interrupts`, `drain_rx` consumes up to eight
+  queued frames when interrupts are active and retains the polled fallback;
+  status reports `irq N event(s), rxq D/16 (delivered, dropped)`.
+- Phase 9 stage 7 - harness/docs: both harnesses require queue delivery
+  (`2 -> 5` net, `2 -> 0-reset -> 2` restart) and the boot queue line;
+  DRIVER_MODEL/NETWORK/TESTING/ROADMAP/ARCHITECTURE, ADR-0033 and R-026 record
+  policy, evidence and limits.
 
 ## Exact commands and results
 
@@ -1736,50 +1779,87 @@ suite so fixture ISOs cannot remain in the default path); driver session
 session `ec75ff02...` 9,768 B; interactive ISO `4e3dcf45...`; VirtualBox
 serial `d3938b67...` 10,654 B (line 9 assigned; isolated NAT has no gateway,
 so no delivery count is claimed). Full suite 29 PASS / 0 FAIL / 2 SKIP, 287
-unit tests. Limits: legacy 8259 INTx only, no MSI/IOAPIC, shared lines,
-interrupt-driven RX, coalescing tuning, IOMMU isolation, MMIO unmap or
-virtual GPU; the handler only acknowledges `ICR`, so no deferred backlog is
-queued.
+unit tests. At stage 6 the limits were legacy 8259 INTx only, no MSI/IOAPIC,
+shared lines, interrupt-driven RX, coalescing tuning, IOMMU isolation, MMIO
+unmap or virtual GPU; the handler only acknowledged `ICR`, so no deferred
+backlog was queued. Stage 7 supersedes the RX/backlog limitation below.
+
+Phase 9 stage 7 (final runs, 2026-10-22):
+
+```sh
+scripts/format.sh                   # PASS
+scripts/lint.sh                     # PASS
+scripts/build.sh                    # PASS -> kernel 2,146,112 bytes
+scripts/test_unit.sh                # PASS (292/292)
+scripts/test_driver_model_qemu.sh   # PASS (exit 33)
+scripts/test_driver_restart_qemu.sh # PASS (IRQ events 2 -> 4; queue 2 -> 0 -> 2)
+scripts/test_net_qemu.sh            # PASS (IRQ events 2 -> 5; delivery 2 -> 5)
+scripts/test_all.sh                 # PASS=29 FAIL=0 SKIP=2
+```
+
+The q35 net boot logs `net: loopback selftest: unsupported` before
+`net: e1000 irq 11 (legacy INTx, RXT0/RXDMT0; RX queue 16 frames,
+drop-newest)`; the net harness then observes
+`net: mac 52:54:00:12:34:56, ip 10.0.2.15/24 gw 10.0.2.2; tx 3 frames,
+rx 2 frames, arp 1/8 entries, errors 0, irq 2 event(s), rxq 0/16
+(2 delivered, 0 dropped)`, and after its ping the counts reach 5/5 with zero
+drops. The restart harness logs 2 -> 4 events and 2 -> 0-reset -> 2 delivered
+frames while exactly 19 frames are freed and reclaimed. VirtualBox assigned
+line 9 and booted; its isolated NAT has no gateway, so no delivery count is
+claimed. Final artifacts: kernel `8b8b86c4...` 2,146,112 B (build id
+`0.1.0-36fd2c64`); default ISO `b6a49130...` 8,181,760 B; driver session
+`ab5cfc6c...` 10,331 B; restart session `150827f5...` 10,833 B; network
+session `66848185...` 9,868 B; interactive ISO `70e46248...` 8,181,760 B;
+VirtualBox serial `345b0fb9...` 10,662 B. Full suite 29 PASS / 0 FAIL / 2
+SKIP, 292 unit tests. Limits: legacy 8259 INTx only; no MSI/IOAPIC, shared
+lines, storm/coalescing tuning, background consumer, IOMMU isolation, MMIO
+unmap or virtual GPU. The 16-frame queue drops the newest frame when full
+(drop path counted but not forced in the VM), and the consumer's single-CPU,
+interrupts-disabled assumption is not SMP-safe.
 
 ## Artifact
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 1,837,776 bytes (Phase 9 stage 6) |
-| Kernel SHA-256 | `e1d5a6f59826f2528a0cbc49974baa59438856bd35d629d3f3559550f50f512c` (build id `0.1.0-73249ef8`) |
+| Kernel ELF | `artifacts/kernel.elf`, 2,146,112 bytes (Phase 9 stage 7) |
+| Kernel SHA-256 | `8b8b86c46ce4ba10b192b6b3d39d812ef0f448f5cbf0a5c07cc7b1891d81e9ba` (build id `0.1.0-36fd2c64`) |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
 | PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1`; `artifacts/pebasics.exe` (Phase 7 stage 3: 5 sections, 1 relocation, nine imports `kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile`), 4096 bytes, SHA-256 `4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`; `artifacts/pebadfn2.exe` (`GetTickCount` → `Sleep` pattern patch), 4096 bytes, SHA-256 `9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d`; `artifacts/peinput.exe` (Phase 8 stage 2: 5 sections, 1 relocation, five imports `kernel32.dll:ExitThread,GetLastError,GetStdHandle,ReadFile,WriteFile`), 4096 bytes, SHA-256 `a2ab21aa4ea7e282c79e2ed1b437c72cee0a21e7b706ba4d0b007a46d5167de0`; `artifacts/pereg.exe` (Phase 8 stage 3: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegOpenKeyExA,RegQueryValueExA;kernel32.dll:ExitThread,WriteFile`), 5120 bytes, SHA-256 `0ca37e2e762035bc98729b102d3a1d53340214e67365eba91daa72866fd3b3d4` (pehello/pebad hash-stable from clean rebuilds; the existing eight artifacts' hashes were unchanged by the stage-3 rebuild; `pereg.exe` was built once and recorded); `artifacts/peregw.exe` (Phase 8 stage 4: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegCreateKeyExA,RegDeleteValueA,RegQueryValueExA,RegSetValueExA;kernel32.dll:ExitThread,WriteFile`), 5632 bytes, SHA-256 `3b00b91a8677ce733f62af242809abe146005c853bb23e99d0c0d00135d5df01` (the nine pre-existing artifacts' hashes were unchanged by the stage-4 rebuild) |
 | ISO | `artifacts/project-os.iso` (default: seven PE modules) |
-| ISO size | 7,874,560 bytes |
-| ISO SHA-256 | `277b2061c0264b37a8f509ad2e069545dbbc763762a284a92067f0cf56f71570` (default ISO rebuilt after the final stage-6 `test_all.sh` run; `mkisofs` timestamps make byte-for-byte reproducibility impossible) |
+| ISO size | 8,181,760 bytes |
+| ISO SHA-256 | `b6a491305da7ea5f313bcc579e827a0a2555f2bdac26a642a46c0a3550e8ea64` (default ISO rebuilt after the final stage-7 `test_all.sh` run; `mkisofs` timestamps make byte-for-byte reproducibility impossible) |
 | Registry ISO | `artifacts/project-os-registry.iso` (`make_iso.sh --registry-fixture`: kernel + three ELF modules + eight PE modules incl. `pereg.exe`, `debug_exit` kept) |
-| Registry ISO size / SHA-256 | 7,909,376 bytes / `d6d909a6c499f58d534cbc5a62b8b8365020dd83215c0abfaedb13246efcdf22` (rebuilt in the final stage-4 `test_all.sh` run; the stage-4 kernel grows the image) |
+| Registry ISO size / SHA-256 | 8,187,904 bytes / `6c5b1fca903dc43f0ab418aac8437970ce840f84ed1ee9b70f17cba2e24a1879` (rebuilt in the final stage-7 `test_all.sh` run) |
+| Registry-enum ISO | `artifacts/project-os-registry-enum.iso` (`make_iso.sh --registry-enum-fixture`: kernel + three ELF modules + nine PE modules incl. `peregen.exe`, `debug_exit` kept) |
+| Registry-enum ISO size / SHA-256 | 8,189,952 bytes / `65a9c751d36c5d61ebc5712c3adffd2a5bae0e7dbdb671b5f303f071d5564a4d` (rebuilt in the final stage-7 `test_all.sh` run) |
 | Registry-write ISO | `artifacts/project-os-registry-write.iso` (`make_iso.sh --registry-write-fixture`: kernel + three ELF modules + eight PE modules incl. `peregw.exe`, `debug_exit` kept) |
-| Registry-write ISO size / SHA-256 | 7,909,376 bytes / `527757b0529e5a52159090382201bdfe4b37f3661cb6dc6c930690b2e414f1aa` (built by the stage-4 registry-write harness inside the final `test_all.sh` run) |
+| Registry-write ISO size / SHA-256 | 8,187,904 bytes / `d6c56b15b29205cb49c0002c92b0d34652d04c42b594021ff7c7d2e9971b882a` (built by the registry-write harness inside the final stage-7 `test_all.sh` run) |
 | Input ISO | `artifacts/project-os-input.iso` (`make_iso.sh --input-fixture`: kernel + three ELF modules + eight PE modules incl. `peinput.exe`, `debug_exit` kept; built by `scripts/test_input_qemu.sh` with `--no-build`) |
-| Input ISO size / SHA-256 | 7,907,328 bytes / `d988d81f5a03bcbb55705f551ece3bb15b604536dfed6df10fbb3308b69e47fa` (rebuilt in the final stage-4 `test_all.sh` run) |
+| Input ISO size / SHA-256 | 8,185,856 bytes / `7db2c7633b077470ae585b18ee3c9b9533734fbe7d76ffe3b303483fc509e584` (rebuilt in the final stage-7 `test_all.sh` run) |
 | Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline; rebuilt by each session harness) |
-| Interactive ISO size / SHA-256 | 7,874,560 bytes / `4e3dcf4508ab17f45a9b523856aa4c0a84a6a2c1c58a5de165d7ec6aaf6477fe` (rebuilt during the final stage-6 `test_all.sh` run; the shell/persistence/restart runs each rebuild it, so each harness log names its own build) |
-| Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `07b98cd5ab99065048fa6e607465ba3ce3ad0c848aab1c500a52beab28041bed`; checker PASS (rebuilt in the final stage-4 `test_all.sh` run) |
-| Framebuffer session log | `artifacts/qemu-console-session.log`, 8,932 bytes, SHA-256 `293b6853ef9c1e547376d74f8d48322f3af2cd7b3b6dbcbbd81232d7fc0ea665` (rebuilt in the final stage-4 `test_all.sh` run) |
-| Net session log | `artifacts/qemu-net-session.log`, 9,768 bytes, SHA-256 `ec75ff02288249ae7a3e3bfc4c971e62186055446631f69d15cee44d7f7ef8c9` (rebuilt in the final stage-6 `test_all.sh` run; IRQ events 2 -> 5); `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
-| Driver model session log | `artifacts/qemu-driver-session.log`, 10,323 bytes, SHA-256 `ab40bc5f7be1ac9ed395473df62f1c0a6054b7d96d14b7548c96691d5c038667` (paced TCP serial transcript from the final stage-6 `test_all.sh` run) |
-| Driver restart session log | `artifacts/qemu-driver-restart-session.log`, 10,704 bytes, SHA-256 `ad32986cce432b51391028226b9e5e56cdde998f91712cc0623d9d0f066b7368` (paced TCP serial transcript from the final stage-6 `test_all.sh` run; IRQ events 2 -> 4) |
+| Interactive ISO size / SHA-256 | 8,181,760 bytes / `70e46248de50f19657d3970c7d25d8beb9a01ce02f24710818c5ef30fd234d59` (rebuilt during the final stage-7 `test_all.sh` run; the shell/persistence/restart runs each rebuild it, so each harness log names its own build) |
+| Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `f01a147e351531eeabca81b2a4ab9c3c3437c2c992b16eff050ffd062dc33327`; checker PASS (rebuilt in the final stage-7 `test_all.sh` run) |
+| Framebuffer session log | `artifacts/qemu-console-session.log`, 10,204 bytes, SHA-256 `e48a552ab8e380fa1abce88d30af55c298ed343976fcafbe849ae8b7d5da9900` (rebuilt in the final stage-7 `test_all.sh` run) |
+| Net session log | `artifacts/qemu-net-session.log`, 9,868 bytes, SHA-256 `66848185b7dc061d9a6ad655858d6e8d5f2c1761b9a62d3799744e140d87643d` (rebuilt in the final stage-7 `test_all.sh` run; IRQ events 2 -> 5, delivery 2 -> 5); `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
+| Driver model session log | `artifacts/qemu-driver-session.log`, 10,331 bytes, SHA-256 `ab5cfc6c9ecaa3281941fcbfdcb860aec61652427d932205ad2b0783c4872f92` (paced TCP serial transcript from the final stage-7 `test_all.sh` run) |
+| Driver restart session log | `artifacts/qemu-driver-restart-session.log`, 10,833 bytes, SHA-256 `150827f591a36b9cce811c67d2c0c2c02cb72b3e14ec2b21d4b8d146cf7b6011` (paced TCP serial transcript from the final stage-7 `test_all.sh` run; events 2 -> 4, queue 2 -> 0-reset -> 2) |
 | Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the stage-2 Phase 8 4-boot regression: fresh format, slot A seq 0, defaults reseeded — byte-identical to the stage-1 final state), SHA-256 `05d2d3ad26aa59c8140d1195e6e8423e19206895c6ed4dbe7c0aff0c0c245d22` |
-| Input session log | `artifacts/qemu-input-session.log`, 9,463 bytes, SHA-256 `c00321a4b992330917c045f8179a46d651a3549195c48ddd28c0e2ea5678250b` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-4 `test_all.sh` run); `artifacts/qemu-input.log`, 192 bytes, SHA-256 `a9eed819f1f42c84f2b77080b139b3a6ec7c3646a36488bf3b071e467c1c8127` (only QEMU's `wait=on` connection-info line) |
-| Registry session log | `artifacts/qemu-registry-session.log`, 10,578 bytes, SHA-256 `bed88828899f67035a4057585a6ff6873b939600c7ba319e688e1eeddd8f2dea` (rebuild in the final stage-4 `test_all.sh` run); `artifacts/qemu-registry.log`, 192 bytes, SHA-256 `0bad30e9fa07e4386a3cd8701a650d59d897ad908e0e9be0a00b9e164c53ef30` (only QEMU's `wait=on` connection-info line) |
-| Registry-write session log | `artifacts/qemu-registry-write-session.log`, 10,407 bytes, SHA-256 `4c03490bed58031e65eea434a5ba4b0cb2698d49919fb1726af68535c7a16077` (paced TCP serial transcript, exit-33 run); `artifacts/qemu-registry-write.log`, 192 bytes, SHA-256 `84de33eb93aa7f275002f0f0ee660531a9634341b1f4b34bf9251480a8907fed` (only QEMU's `wait=on` connection-info line) |
+| Input session log | `artifacts/qemu-input-session.log`, 10,735 bytes, SHA-256 `db43367e56dea60ac1d5d171d41ec6b1de51b0740c4794f949f2ac42f1d5d082` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-7 `test_all.sh` run); `artifacts/qemu-input.log`, 192 bytes, SHA-256 `a9eed819f1f42c84f2b77080b139b3a6ec7c3646a36488bf3b071e467c1c8127` (only QEMU's `wait=on` connection-info line) |
+| Registry session log | `artifacts/qemu-registry-session.log`, 11,850 bytes, SHA-256 `d765721044297ec7b8449226acddaa935a1e94c5e490d070809b79bc9c8d2139` (rebuild in the final stage-7 `test_all.sh` run); `artifacts/qemu-registry.log`, 192 bytes, SHA-256 `0bad30e9fa07e4386a3cd8701a650d59d897ad908e0e9be0a00b9e164c53ef30` (only QEMU's `wait=on` connection-info line) |
+| Registry-write session log | `artifacts/qemu-registry-write-session.log`, 11,679 bytes, SHA-256 `a721bf2b9f419ed163f27b4fd9c1461811c022f996c49c53fabd0f78840e267d` (paced TCP serial transcript, exit-33 run); `artifacts/qemu-registry-write.log`, 192 bytes, SHA-256 `84de33eb93aa7f275002f0f0ee660531a9634341b1f4b34bf9251480a8907fed` (only QEMU's `wait=on` connection-info line) |
+| Registry-enum session log | `artifacts/qemu-registry-enum-session.log`, 12,646 bytes, SHA-256 `419b791f18a9ee31eaddf7f35b87c757764a04cd714103c8565ded7a912dbec0` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-7 `test_all.sh` run) |
 | ISO boot entries | BIOS platform 0x00 (4 sectors), UEFI platform 0xEF (6144 sectors), both no-emulation, verified by `scripts/verify_iso.py` |
 | Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session, rebuilt in the final stage-4 `test_all.sh` run), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot; stage-4 regression log 8,707 bytes, SHA-256 `f88f06a9270e73229cb30de7492616010814a0143835cb80f72ffa2ee29eac1d`), `artifacts/qemu-input-session.log` (Win32 console-input session), `artifacts/qemu-registry-session.log` (Win32 registry session), `artifacts/qemu-registry-write-session.log` (Win32 registry-write session), `artifacts/qemu-net-session.log` (e1000 network session) |
-| VirtualBox result | `artifacts/vbox-test.log` / `artifacts/vbox-serial.log` (10,654 bytes, SHA-256 `d3938b674387d769e8c9fcfbb27f7c4db2e1aa274fabf7351f3585a52e6a0602`): VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed; with the 82540EM NAT NIC the kernel detected the NIC and reported `net: loopback selftest: unsupported` + `net selftest: no gateway reply (arp timeout)` — non-fatal, no VirtualBox networking claim |
+| VirtualBox result | `artifacts/vbox-test.log` / `artifacts/vbox-serial.log` (10,662 bytes, SHA-256 `345b0fb98ac224953ec2ed36988cf5c3e94bde96b5794d2cbb0a2fc7a1e0243f`): VirtualBox 7.2.20 BIOS PASS, marker, 5 ticks, `fbcon: enabled 85x48` and console selftest observed; the NIC was detected, `net: loopback selftest: unsupported` and the stage-7 queue boot line were logged with IRQ 9, but the isolated NAT has no gateway (`arp timeout`), so no RX delivery is claimed |
 
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
 The kernel and fixture builds are deterministic for identical sources, flags
 and build ID. The main kernel/ISO/session checksums above are from the final
-Phase 9 stage-6 `scripts/test_all.sh` run (29 PASS / 0 FAIL / 2 SKIP, unit
-suite 287 passed); older fixture-ISO rows retain the stage that rebuilt them.
+Phase 9 stage-7 `scripts/test_all.sh` run (29 PASS / 0 FAIL / 2 SKIP, unit
+suite 292 passed); rows that were not rebuilt retain the stage that produced
+them.
 The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
@@ -1879,21 +1959,29 @@ This is a host model, not a kernel or Linux comparison.
   eighteen-name two-DLL (`kernel32.dll` + `advapi32.dll`) allowlist; see the
   stage-1/stage-2/stage-3 and Phase 8 stage-2/stage-3/stage-4 limits bullets
   below.
-  Networking exists as stage 5 (one polled e1000 with static addressing);
-  there is no general on-disk filesystem: persistence is the
-  whole-tree checkpoint image (stage 2) described above.
+  Networking is one e1000 at stage 7 (legacy INTx, a bounded RX queue and
+  static addressing); there is no general on-disk filesystem: persistence is
+  the whole-tree checkpoint image (stage 2) described above.
 - Phase 9 stage 5 limits: DMA ownership is a software ledger, not IOMMU
   isolation; exact page ranges are checked only within the kernel ledger.
-  Interrupts remain polled with `IMS` masked and no `Irq` claim; there is no
-  IRQ/MSI delivery, MMIO unmap, allocation-failure injection or hardware
-  fault isolation. A claim failure frees freshly allocated rings, but an
-  earlier partial ring-allocation failure is not fault-injected.
+  At stage 5 interrupts remained polled with `IMS` masked and no `Irq` claim;
+  there was no IRQ/MSI delivery, MMIO unmap, allocation-failure injection or
+  hardware fault isolation. A claim failure frees freshly allocated rings,
+  but an earlier partial ring-allocation failure is not fault-injected.
 - Phase 9 stage 6 limits: only legacy 8259 INTx is routed; MSI/IOAPIC,
-  shared lines, interrupt-driven RX, coalescing tuning and spurious-IRQ
-  accounting are absent. The handler acknowledges `ICR` and counts but does
-  no deferred work, so sustained traffic is still bounded by explicit polls.
-  No storm/fault injection was run, and IOMMU isolation/MMIO unmap remain
-  unclaimed.
+  shared lines, coalescing tuning and spurious-IRQ accounting are absent.
+  At stage 6 the handler only acknowledged `ICR` and counted events, so
+  sustained traffic was still bounded by explicit polls; stage 7 now hands
+  frames to a bounded queue. No storm/fault injection was run, and IOMMU
+  isolation/MMIO unmap remain unclaimed.
+- Phase 9 stage 7 limits: the queue is single-producer/single-consumer and
+  assumes one CPU with interrupts disabled around the consumer; SMP needs
+  per-CPU queues or another discipline. A full 16-frame queue drops the
+  newest frame (counted, but the drop path was not forced in the VM), and
+  the device-to-queue-to-dispatch path copies frames twice. There is no
+  background RX thread, coalescing/NAPI-style budget, MSI/IOAPIC, shared-line
+  support, storm recovery, IOMMU isolation, MMIO unmap or virtual GPU; the
+  24 KiB queue increases BSS and has no measured throughput/latency result.
 - Phase 9 stage 4 limits: stop/restart is a single-threaded shell operation
   with no lock against concurrent network users; MMIO is never unmapped (the
   HHDM window is retained); a reset timeout leaks rings by design and was not
@@ -2135,20 +2223,22 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 8 stages 1-5 and Phase 9 stages 1-6 are complete: configuration store
+Phase 8 stages 1-5 and Phase 9 stages 1-7 are complete: configuration store
 (ADR-0022), Win32 console input (ADR-0023, R-016), read-only registry
 (ADR-0024, R-017), registry write (ADR-0025, R-018), registry
 enumeration/deletion (ADR-0026, R-019), the PCI bus-0 inventory
 (docs/PCI.md, ADR-0027, R-020), the driver binding model
 (docs/DRIVER_MODEL.md, ADR-0028, R-021), e1000 start with MMIO/DMA ownership
 (ADR-0029, R-022), e1000 stop/restart with 19-frame teardown/restart
-accounting (ADR-0030, R-023), exact DMA page ownership (ADR-0031, R-024) and
-legacy INTx delivery/ownership with six claims (ADR-0032, R-025). Final
-verified state: 29 PASS / 0 FAIL / 2 SKIP; unit suite 287; kernel e1d5a6f5...,
-default ISO 277b2061..., restart session ad32986c...
-Single best next action: **Phase 9 stage 7 - bounded interrupt-driven RX**,
-using the delivered IRQ to drain a small IRQ-safe queue with a documented
-backlog/drop policy, then evaluating APIC/IOAPIC/MSI routing; only after that
-consider a virtual-GPU target. MMIO unmapping, IOMMU isolation, reset-timeout
-recovery, concurrent stop safety and the Phase 8/9 acceptance matrices remain
-open and are not claimed.
+accounting (ADR-0030, R-023), exact DMA page ownership (ADR-0031, R-024),
+legacy INTx delivery/ownership with six claims (ADR-0032, R-025) and bounded
+interrupt-driven RX through the 16-frame SPSC queue (ADR-0033, R-026). Final
+verified state: 29 PASS / 0 FAIL / 2 SKIP; unit suite 292; kernel 8b8b86c4...,
+default ISO b6a49130..., restart session 150827f5...
+Single best next action: **Phase 9 stage 8 - APIC/IOAPIC/MSI routing**,
+starting with a spec-first design for IOAPIC redirection entries and PCI MSI/
+MSI-X capability negotiation, then moving the e1000 from legacy INTx in an
+isolated VM. Only after that consider the virtual-GPU target. MMIO unmapping,
+IOMMU isolation, reset-timeout recovery, concurrent stop safety, queue-drop
+injection and the Phase 8/9 acceptance matrices remain open and are not
+claimed.

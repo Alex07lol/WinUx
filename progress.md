@@ -1,6 +1,6 @@
 # Progress
 
-Last updated: **2026-10-22**
+Last updated: **2026-10-23**
 
 ## Current milestone
 
@@ -313,6 +313,29 @@ GSI2/GSI4, no ACPI MADT/`_PRT`, PCI INTx IOAPIC routing, MSI/MSI-X, APIC
 timer, SMP, UEFI or physical-hardware validation; the e1000 remains on the
 8259.
 
+**Phase 9 stage 9** - ACPI MADT discovery - is implemented and verified:
+Limine's RSDP is converted from an HHDM address, the RSDP/root table/every
+consumed table is validated against Limine's ACPI reclaimable/NVS or
+reserved-mapped regions, and the allocation-free `os_core::acpi` parser walks
+both RSDT and XSDT, finds exactly one MADT, selects one IOAPIC covering both
+routes, and resolves bus-0 ISA overrides field by field. The fixed stage-8
+base/routes remain the fallback for discovery failure; controller failure uses
+the 8259 rather than mixing guessed routes. `ioapic::map` now takes a physical
+base and rejects misalignment/window crossing; `irq` programs a kernel-side
+`LegacyRoute`. The `,acpi` marker is appended only after the IOAPIC starts with
+a validated ACPI summary, and the boot self-test fails on a discovered versus
+programmed GSI mismatch. Evidence: 312 host tests (15 ACPI parser tests); QEMU
+11.1.0 q35 logs RSDP revision 0 / RSDT / 5 tables, MADT revision 3, IOAPIC 0 at
+`0xfec00000`, 5 overrides, PIT GSI2 and COM1 GSI4, 7 ticks and `acpi selftest:
+passed`; VirtualBox 7.2.20 logs RSDP revision 2 / XSDT / 3 tables, MADT
+revision 2, IOAPIC ID 1, 2 overrides, the same routes, 5 ticks and the
+self-test; `test_boot_qemu.sh --require-acpi`, `test_virtualbox.sh
+--require-ioapic --require-acpi` and `test_all.sh` PASS=31 FAIL=0 SKIP=2
+(`boot-qemu-acpi` added). Stage commit `38ba09c`, pushed to `orgin/main`.
+Limits: no AML/`_PRT`, PCI INTx IOAPIC routing, MSI/MSI-X, APIC timer,
+SMP, ACPI reclaim, UEFI or physical-hardware validation; the e1000 remains on
+the 8259. See `docs/ACPI.md`, ADR-0035, R-028.
+
 ## Repository state
 
 - Workspace root: this thread's local checkout.
@@ -385,6 +408,14 @@ timer, SMP, UEFI or physical-hardware validation; the e1000 remains on the
   The Phase 9 stage-8 commit is `d62966f` (`phase9: route pit and com1 through
   the ioapic`), 22 files changed; it is pushed together with this progress
   follow-up, same commit-then-record pattern.
+  The Phase 9 stage-9 commit is `38ba09c` (`phase9: discover ioapic and isa
+  routes from acpi madt`), 20 files changed; it adds `os_core/src/acpi.rs`,
+  `kernel/src/acpi.rs`, `docs/ACPI.md` and the approved design spec, and
+  updates `os_core/src/lib.rs`, `kernel/src/limine.rs`,
+  `kernel/src/arch/x86_64/ioapic.rs`, `kernel/src/irq.rs`,
+  `kernel/src/main.rs`, the three test scripts, the stage docs and `README.md`.
+  It is pushed to `orgin/main` (`a757080..38ba09c`); this progress update is
+  the follow-up commit.
   Nothing was reset or discarded.
 - Generated inputs (`target/`, `third_party/`, `boot/limine/`, `artifacts/*`) are
   Git-ignored.
@@ -1152,6 +1183,28 @@ timer, SMP, UEFI or physical-hardware validation; the e1000 remains on the
   `boot-qemu-ioapic` step; the driver harness asserts the new boot lines.
   ROADMAP/ARCHITECTURE/DRIVER_MODEL/NETWORK/TESTING, ADR-0034 and R-027 record
   the fixed-base/GSI assumptions, evidence and deferred ACPI/PCI/MSI scope.
+- Phase 9 stage 9 - ACPI parser (`os_core/src/acpi.rs`, `lib.rs`): RSDP v1/v2,
+  RSDT/XSDT entry lists and MADT IOAPIC/ISA-override parsing with checksums,
+  lengths, alignment, duplicates, reserved flags, capacity caps and
+  allocation-free output; 15 tests, including `read_sdt_length` and explicit
+  conforming/active-high/active-low polarity plus edge/level trigger
+  assertions.
+- Phase 9 stage 9 - discovery (`kernel/src/acpi.rs`, `limine.rs`, `main.rs`):
+  Limine RSDP request, HHDM conversion, ACPI memory-map range checks, exactly
+  one MADT, first IOAPIC covering PIT/COM1, field-wise route fallback, boot
+  diagnostics, route/self-test wiring and conditional `,acpi` marker.
+- Phase 9 stage 9 - controller/routing (`arch/x86_64/ioapic.rs`, `irq.rs`):
+  caller-selected base with alignment and 2 MiB window checks, dynamic
+  `LegacyRoute` GSI/trigger/polarity programming, duplicate/PIC-route
+  rejection, discovered GSI masking on fallback and `IoApicInfo` GSI fields.
+- Phase 9 stage 9 - harness/docs: `--require-acpi` in the QEMU and VirtualBox
+  scripts, `boot-qemu-acpi` in `test_all.sh`, and `docs/ACPI.md`,
+  ROADMAP/ARCHITECTURE/TESTING/NETWORK/DRIVER_MODEL, ADR-0035 and R-028;
+  README status/verification snapshot and the ARCHITECTURE status line were
+  refreshed to the stage-9 evidence. Final review corrected the MADT polarity
+  encoding in ACPI/DECISIONS (0 conforming/local high, 1 high, 3 low),
+  extended the parser assertions accordingly, and refreshed the DRIVER_MODEL
+  host-suite count.
 
 ## Exact commands and results
 
@@ -1890,51 +1943,107 @@ build. Limits are fixed QEMU/VirtualBox IOAPIC base and GSI2/GSI4, no ACPI
 MADT/`_PRT`, PCI INTx IOAPIC routing, MSI/MSI-X, APIC timer, SMP, UEFI or
 physical-hardware validation; the e1000 remains on legacy PIC INTx.
 
+Phase 9 stage 9 (final runs, 2026-10-23):
+
+```sh
+scripts/format.sh                   # PASS
+scripts/lint.sh                     # PASS
+scripts/test_unit.sh                # PASS (312/312)
+scripts/test_all.sh                 # PASS=31 FAIL=0 SKIP=2
+```
+
+The first full-suite run after the stage-9 code passed all 31 steps and is
+recorded in `artifacts/test-all.log` (116,548 bytes, SHA-256
+`fbeab2db3eb2179f2e0df1616ff5d9e9f3e768354300ab53c6f3f49c82bc4509`). It
+rebuilt the kernel and ISO and ran the QEMU BIOS matrix, IOAPIC, ACPI,
+ELF/PE, memory, VFS, graphics, console, network, persistence, PCI/driver,
+VirtualBox, shell, input, registry and framebuffer-console steps in one
+invocation. The two SKIPs are UEFI (no OVMF) and the virtual GPU.
+
+QEMU q35 BIOS recorded `acpi: RSDP revision 0, RSDT with 5 table(s)`, MADT
+revision 3 with one IOAPIC and five overrides, IOAPIC 0 at `0xfec00000` with
+GSI base 0, PIT GSI2 edge/active-high, COM1 GSI4 level/active-high,
+`ioapic: version 0x20, 24 pins, id 0; timer GSI2, console GSI4`,
+`acpi selftest: passed (timer GSI2, console GSI4)`, `pit: 100 Hz, IOAPIC
+GSI2`, the COM1 GSI4 line and the `,acpi` marker. VirtualBox 7.2.20 BIOS
+recorded RSDP revision 2 / XSDT / 3 tables, MADT revision 2 with IOAPIC ID 1
+at the same base and two overrides, the same routes, 5 ticks, the selftest and
+the marker. Neither ACPI run contains `acpi: unavailable` or `fell back to
+8259`. The firmware IOAPIC ID and the controller's ID register differ in
+VirtualBox (1 versus 0), so they are reported as separate facts.
+
+The bare QEMU boot harness has no NIC, so its marker has `,pci,driver,acpi`
+without `,net` and logs `net selftest: skipped (no NIC)`. The separate network
+step attached the pinned e1000, passed the ARP/ICMP/UDP checks and required
+`,net`; this is not a regression in the ACPI marker order.
+
+After the final documentation review corrected the MADT polarity description
+and extended the existing parser test with conforming/active-high/active-low
+and edge/level assertions, `scripts/format.sh`, `scripts/lint.sh` and
+`scripts/test_unit.sh` were rerun and passed (312/312). This was a test-only
+change in `os_core`; the full `test_all.sh` evidence above predates it, and
+the kernel/ISO artifacts are unchanged.
+
+A post-review QEMU q35 BIOS ACPI boot of the current ISO also passed with
+`--require-acpi`: RSDP revision 0 / RSDT / 5 tables, MADT revision 3, IOAPIC 0
+at `0xfec00000`, PIT GSI2/COM1 GSI4, the ACPI self-test, 7 ticks and the
+`,acpi` marker. Log: `artifacts/qemu-serial-review.log`, 10,351 bytes, SHA-256
+`eb921107f17b66fa10816ea342f1271d75ded1d1ec782772424446cd02659d18`.
+
+Stage-9 artifacts: kernel `artifacts/kernel.elf` 2,062,984 bytes / SHA-256
+`cd07c4ea3bfb128a9e3055def540465cb27b6abd63411f2b71f1d9abf988076d` (build id
+`0.1.0-a757080d`); default ISO `artifacts/project-os.iso` 8,099,840 bytes /
+SHA-256 `53ea35a477d228fe9661b8a528206106063d36bfd654629b7a2a2f66578f33cb`;
+ACPI serial `artifacts/qemu-serial-acpi.log` 10,351 bytes / SHA-256
+`272ccb992ace6ce122a0e06be4fe5a95695cf1d350162eca192711868d6730dc`;
+VirtualBox serial `artifacts/vbox-serial.log` 11,034 bytes / SHA-256
+`82048ad3e3763b244d5e002e95e34bee79faa401bd24eb6672bbfc6f58de2223`.
+
 ## Artifact
 
 | Item | Value |
 |---|---|
-| Kernel ELF | `artifacts/kernel.elf`, 2,160,592 bytes (Phase 9 stage 8) |
-| Kernel SHA-256 | `ccf8b27a092fe1a77e2135d8034e83642317c217c0927daae79e16a6b26ea491` (build id `0.1.0-37f8eb31`, built before the stage-8 commit) |
+| Kernel ELF | `artifacts/kernel.elf`, 2,062,984 bytes (Phase 9 stage 9) |
+| Kernel SHA-256 | `cd07c4ea3bfb128a9e3055def540465cb27b6abd63411f2b71f1d9abf988076d` (build id `0.1.0-a757080d`, built before the stage-9 commit) |
 | Kernel ELF entry | `0xffffffff80000000` (verified with `readelf`) |
 | userland modules | `artifacts/hello.elf` SHA-256 `f4ae1ae1a5bb1479f0fbf99a65991d1e5e12abb3b72537f6ffc0dac4f9f9a960`; `artifacts/fault.elf` SHA-256 `46c45ce6eca4bd67e2a1e06cc85b2ef79a68be4a5bf9d1b1af84a11d0c0c23f0`; `artifacts/bad.elf` SHA-256 `a8bec8d1c4b866fc0d0fd2e81a71cda920fc95da0c87c64286cb4c7b45f9006d` (hash-stable from a clean rebuild) |
 | PE fixtures | `artifacts/pehello.exe`, 3072 bytes (entry RVA `0x1000`, base `0x140000000`, 4 sections, 1 DIR64 relocation), SHA-256 `96e2e6d6ff69db3ce5204a215defaa9996fe964224eb5fd0bc2d2ef72d577e41`; `artifacts/pebad.exe` (signature zeroed), 3072 bytes, SHA-256 `a0f8a2b401ec904eead12ba520bb9d0063e7ea212547457ab2a1439a017e453d`; `artifacts/peconsole.exe` (Phase 7 stage 2: 5 sections incl. `.idata`, 1 DIR64 relocation, imports `kernel32.dll:ExitProcess,GetStdHandle,WriteConsoleA`), 3584 bytes, SHA-256 `1e72a7b3d32421a5883b1c8344b1b1e149aa35a81b18648fcdba1e54e74eb406`; `artifacts/pebadimp.exe` (`kernel32.dll` → `user32.dll` pattern patch), 3584 bytes, SHA-256 `95c93ae440a10dbf8fc8b6bddc418752b06c4f5dc4fe68b8d0f76b889e0214e3`; `artifacts/pebadfn.exe` (`WriteConsoleA` → `WriteConsoleB` pattern patch), 3584 bytes, SHA-256 `4811ccf6488777b90b32c91e9f27fa212cf33fba1fc1c06404e16f4abebc2ab1`; `artifacts/pebasics.exe` (Phase 7 stage 3: 5 sections, 1 relocation, nine imports `kernel32.dll:ExitThread,GetCommandLineA,GetCurrentProcessId,GetCurrentThreadId,GetLastError,GetStdHandle,GetTickCount,SetLastError,WriteFile`), 4096 bytes, SHA-256 `4a4aa956a3f5519875b43d8a31e91177e3392fa4316ef2ed4d98d70bdea8341b`; `artifacts/pebadfn2.exe` (`GetTickCount` → `Sleep` pattern patch), 4096 bytes, SHA-256 `9d6082b9792859eba6d4b4ca1eae70c09c46314e79588757cbb74c37e6cd473d`; `artifacts/peinput.exe` (Phase 8 stage 2: 5 sections, 1 relocation, five imports `kernel32.dll:ExitThread,GetLastError,GetStdHandle,ReadFile,WriteFile`), 4096 bytes, SHA-256 `a2ab21aa4ea7e282c79e2ed1b437c72cee0a21e7b706ba4d0b007a46d5167de0`; `artifacts/pereg.exe` (Phase 8 stage 3: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegOpenKeyExA,RegQueryValueExA;kernel32.dll:ExitThread,WriteFile`), 5120 bytes, SHA-256 `0ca37e2e762035bc98729b102d3a1d53340214e67365eba91daa72866fd3b3d4` (pehello/pebad hash-stable from clean rebuilds; the existing eight artifacts' hashes were unchanged by the stage-3 rebuild; `pereg.exe` was built once and recorded); `artifacts/peregw.exe` (Phase 8 stage 4: 5 sections, 1 relocation, imports `advapi32.dll:RegCloseKey,RegCreateKeyExA,RegDeleteValueA,RegQueryValueExA,RegSetValueExA;kernel32.dll:ExitThread,WriteFile`), 5632 bytes, SHA-256 `3b00b91a8677ce733f62af242809abe146005c853bb23e99d0c0d00135d5df01` (the nine pre-existing artifacts' hashes were unchanged by the stage-4 rebuild) |
 | ISO | `artifacts/project-os.iso` (default: seven PE modules) |
-| ISO size | 8,196,096 bytes |
-| ISO SHA-256 | `9d2bcba00b64ed63e861a32bade9ad9b2689a25876348a5c36cee85f27a1c9f0` (default ISO rebuilt after the final stage-8 `test_all.sh` run; `mkisofs` timestamps make byte-for-byte reproducibility impossible) |
+| ISO size | 8,099,840 bytes |
+| ISO SHA-256 | `53ea35a477d228fe9661b8a528206106063d36bfd654629b7a2a2f66578f33cb` (default ISO rebuilt in the final stage-9 `test_all.sh` run; `mkisofs` timestamps make byte-for-byte reproducibility impossible) |
 | Registry ISO | `artifacts/project-os-registry.iso` (`make_iso.sh --registry-fixture`: kernel + three ELF modules + eight PE modules incl. `pereg.exe`, `debug_exit` kept) |
-| Registry ISO size / SHA-256 | 8,202,240 bytes / `8dd54b9ecb03dd890a021a9d4eceb105a4ad2f6d78791e6496caf6d2a88636c3` (rebuilt in the final stage-8 `test_all.sh` run) |
+| Registry ISO size / SHA-256 | 8,105,984 bytes / `243704a44acbbd4c348d106d432e2388845ba9d155951621fd9150914fc3f425` (rebuilt in the final stage-9 `test_all.sh` run) |
 | Registry-enum ISO | `artifacts/project-os-registry-enum.iso` (`make_iso.sh --registry-enum-fixture`: kernel + three ELF modules + nine PE modules incl. `peregen.exe`, `debug_exit` kept) |
-| Registry-enum ISO size / SHA-256 | 8,204,288 bytes / `dcf4f8d5cd1ef13e54059f0aa3bfa182a25a9db657dd451865b414d3aa69f128` (rebuilt in the final stage-8 `test_all.sh` run) |
+| Registry-enum ISO size / SHA-256 | 8,108,032 bytes / `65f083fb09c475267ba6047f2125764a13ccc69124aa923752d0945576819a67` (rebuilt in the final stage-9 `test_all.sh` run) |
 | Registry-write ISO | `artifacts/project-os-registry-write.iso` (`make_iso.sh --registry-write-fixture`: kernel + three ELF modules + eight PE modules incl. `peregw.exe`, `debug_exit` kept) |
-| Registry-write ISO size / SHA-256 | 8,202,240 bytes / `874b6739fe2b1fdef1a06bd6f9663d643e95e12aa41176af882d0eda3dfc79c6` (built by the registry-write harness inside the final stage-8 `test_all.sh` run) |
+| Registry-write ISO size / SHA-256 | 8,105,984 bytes / `061de6ca26979b441012b2e735f990fbb6d9cf108d0a27475afd1bf13d338f45` (built by the registry-write harness inside the final stage-9 `test_all.sh` run) |
 | Input ISO | `artifacts/project-os-input.iso` (`make_iso.sh --input-fixture`: kernel + three ELF modules + eight PE modules incl. `peinput.exe`, `debug_exit` kept; built by `scripts/test_input_qemu.sh` with `--no-build`) |
-| Input ISO size / SHA-256 | 8,200,192 bytes / `b178121ac451e79c7846405820e3c304dd437a6780bdea3a562166cafc928468` (rebuilt in the final stage-8 `test_all.sh` run) |
+| Input ISO size / SHA-256 | 8,103,936 bytes / `bc97ef53266fa190b7c228ff96a5098ebced26cc73c6b97d2eae0c1664b36300` (rebuilt in the final stage-9 `test_all.sh` run) |
 | Interactive ISO | `artifacts/project-os-interactive.iso` (same bytes but `debug_exit` stripped from the cmdline; rebuilt by each session harness) |
-| Interactive ISO size / SHA-256 | 8,196,096 bytes / `9234fc3640eb758a6727c15a42e771e50da3e6f881b68731a5d5909677126f77` (rebuilt during the final stage-8 `test_all.sh` run; the shell/persistence/restart runs each rebuild it, so each harness log names its own build) |
-| Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `9d8f05e69c31cb938c28d932abc7128b2a609ff8d083b37344ede302912e3b47`; checker PASS (rebuilt in the final stage-8 `test_all.sh` run) |
-| Framebuffer session log | `artifacts/qemu-console-session.log`, 10,272 bytes, SHA-256 `730cb23a50881dbf878d6acaa3ae7db6838833a3faf3088e782abd0f03ecf8ff` (rebuilt in the final stage-8 `test_all.sh` run) |
-| Net session log | `artifacts/qemu-net-session.log`, 9,961 bytes, SHA-256 `2842d7c5d41fa85384b78502ae4d73e34019f2ec6272f4c7196ad0b05e3c278a` (rebuilt in the final stage-8 `test_all.sh` run; IRQ events 2 -> 5, delivery 2 -> 5); `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
-| Driver model session log | `artifacts/qemu-driver-session.log`, 10,399 bytes, SHA-256 `7fc9b5ef2ea4453db4e0abb8c270178d08c5e637457b59cc41abc454771f4da3` (paced TCP serial transcript from the final stage-8 `test_all.sh` run; IOAPIC GSI2/GSI4 and 7 ticks) |
-| Driver restart session log | `artifacts/qemu-driver-restart-session.log`, 10,931 bytes, SHA-256 `94871ba4e4359111f26a29e26bfb316aa7fd2f853836ca07f799763a443d9ac3` (paced TCP serial transcript from the final stage-8 `test_all.sh` run; events 2 -> 4, queue 2 -> 0-reset -> 2) |
+| Interactive ISO size / SHA-256 | 8,099,840 bytes / `7dadefff472e68fd9158408db310e9c33873f1fc2149f500c705f6987c79a69e` (rebuilt during the final stage-9 `test_all.sh` run; the shell/persistence/restart runs each rebuild it, so each harness log names its own build) |
+| Screendump | `artifacts/console-screendump.ppm`, 3,072,016 bytes (1280x800 P6), SHA-256 `ad79046dd03649fc58f6523baa2da8fa2514d3e277511c0229ad9aa1c4ec0873`; checker PASS (rebuilt in the final stage-9 `test_all.sh` run) |
+| Framebuffer session log | `artifacts/qemu-console-session.log`, 10,576 bytes, SHA-256 `195cc58c60949ab9799f83569603069de648aa0bb17e81437690b4bec2afb185` (rebuilt in the final stage-9 `test_all.sh` run) |
+| Net session log | `artifacts/qemu-net-session.log`, 10,160 bytes, SHA-256 `ddad94d41c5b9b9a2a7afc70c98fd1c7e029949073d15c5c33b1dd96f4ff50ee` (rebuilt in the final stage-9 `test_all.sh` run; IRQ events 2 -> 5, delivery 2 -> 5); `artifacts/qemu-net.log` is empty (0 bytes, no QEMU errors) |
+| Driver model session log | `artifacts/qemu-driver-session.log`, 10,703 bytes, SHA-256 `9c16e7b8debe8f1518afeade7d01b13f58b44f02f7ca601c18c6a70ea134bf96` (paced TCP serial transcript from the final stage-9 `test_all.sh` run; ACPI-selected IOAPIC GSI2/GSI4 and 7 ticks) |
+| Driver restart session log | `artifacts/qemu-driver-restart-session.log`, 11,152 bytes, SHA-256 `4088fc0d457ab0b066e62a9f4946e448d29d8ee4f0735a744d40a12cd2b47f14` (paced TCP serial transcript from the final stage-9 `test_all.sh` run; events 2 -> 4, queue 2 -> 0-reset -> 2) |
 | Checkpoint disk image | `artifacts/persist-disk.img`, 8,388,608 bytes (raw; final state after the stage-2 Phase 8 4-boot regression: fresh format, slot A seq 0, defaults reseeded — byte-identical to the stage-1 final state), SHA-256 `05d2d3ad26aa59c8140d1195e6e8423e19206895c6ed4dbe7c0aff0c0c245d22` |
-| Input session log | `artifacts/qemu-input-session.log`, 10,803 bytes, SHA-256 `05931695cbb62ffd2d3fb3351d7cb9b79e5518235bebd3858c076a586514acfd` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-8 `test_all.sh` run); `artifacts/qemu-input.log`, 192 bytes, SHA-256 `a9eed819f1f42c84f2b77080b139b3a6ec7c3646a36488bf3b071e467c1c8127` (only QEMU's `wait=on` connection-info line) |
-| Registry session log | `artifacts/qemu-registry-session.log`, 11,918 bytes, SHA-256 `a033ab53a3d9d6bfbe8994d28b588fd86b5114c36f7b78b8b76886cfc4e50f0c` (rebuilt in the final stage-8 `test_all.sh` run); `artifacts/qemu-registry.log`, 192 bytes, SHA-256 `0bad30e9fa07e4386a3cd8701a650d59d897ad908e0e9be0a00b9e164c53ef30` (only QEMU's `wait=on` connection-info line) |
-| Registry-write session log | `artifacts/qemu-registry-write-session.log`, 11,747 bytes, SHA-256 `c74cd67428f48d7e14b708b8c5e3ab1832750b32f2bd0e87efcc7ba2039d14d3` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-8 `test_all.sh` run); `artifacts/qemu-registry-write.log`, 192 bytes, SHA-256 `84de33eb93aa7f275002f0f0ee660531a9634341b1f4b34bf9251480a8907fed` (only QEMU's `wait=on` connection-info line) |
-| Registry-enum session log | `artifacts/qemu-registry-enum-session.log`, 12,714 bytes, SHA-256 `77547cf5f1a3bc80182bb34040d79f4192ae69079305aa8b60f994d6d4d323af` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-8 `test_all.sh` run) |
+| Input session log | `artifacts/qemu-input-session.log`, 11,107 bytes, SHA-256 `5968822b3646870a815b08463785bd17a9420e767944929f0d0b4595803cbcb1` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-9 `test_all.sh` run); `artifacts/qemu-input.log`, 192 bytes, SHA-256 `78dfbbf60ef91b5cf71427e3df84e9c56438b55478a9c0ee04783039184fac41` (only QEMU's `wait=on` connection-info line) |
+| Registry session log | `artifacts/qemu-registry-session.log`, 12,222 bytes, SHA-256 `c2f3eeb220f3b9968c722d3a1ee93e7736f413bf3d8b8507070bb97d3decbab9` (rebuilt in the final stage-9 `test_all.sh` run); `artifacts/qemu-registry.log`, 192 bytes, SHA-256 `4c3b31caa69ba1b89cd6a6e4c94f9e3393a1f0bde35f94727ec7bdb0dd7bff14` (only QEMU's `wait=on` connection-info line) |
+| Registry-write session log | `artifacts/qemu-registry-write-session.log`, 12,051 bytes, SHA-256 `ea9fbddf6b6d119496a52f11f96e2199d4c249ab6b801b7a5394465eb6174901` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-9 `test_all.sh` run); `artifacts/qemu-registry-write.log`, 192 bytes, SHA-256 `586d6fe08b35ee295ddc7db8812cd1444d3f8235979c421dcfb3a1c734fe517d` (only QEMU's `wait=on` connection-info line) |
+| Registry-enum session log | `artifacts/qemu-registry-enum-session.log`, 13,018 bytes, SHA-256 `0a7f4916a989b8535e1a75a03a073f8b2011ae9c9dd01586b3fd45ddeb1bd654` (paced TCP serial transcript, exit-33 run, rebuilt in the final stage-9 `test_all.sh` run) |
 | ISO boot entries | BIOS platform 0x00 (4 sectors), UEFI platform 0xEF (6144 sectors), both no-emulation, verified by `scripts/verify_iso.py` |
-| Serial logs | `artifacts/qemu-serial-256m.log`, `-512m.log`, `-1g.log`, `artifacts/qemu-serial-ioapic.log` (stage-8 route proof), `artifacts/qemu-serial.log` (memory test), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session, rebuilt in the final stage-4 `test_all.sh` run), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot; stage-4 regression log 8,707 bytes, SHA-256 `f88f06a9270e73229cb30de7492616010814a0143835cb80f72ffa2ee29eac1d`), `artifacts/qemu-input-session.log` (Win32 console-input session), `artifacts/qemu-registry-session.log` (Win32 registry session), `artifacts/qemu-registry-write-session.log` (Win32 registry-write session), `artifacts/qemu-net-session.log` (e1000 network session) |
-| VirtualBox result | `artifacts/vbox-test.log` / `artifacts/vbox-serial.log` (10,730 bytes, SHA-256 `e357e8533f303ead94e07e8f82c4fd3574bab9c24524a69c3449ffd26589d476`): VirtualBox 7.2.20 BIOS PASS, marker, 6 ticks, `ioapic: version 0x20, 24 pins, id 0; timer GSI2, console GSI4`, PIT/COM1 routes, no PIC fallback, `fbcon: enabled 85x48` and console selftest observed; the NIC was detected on legacy IRQ 9 and the queue boot line logged, but the isolated NAT has no gateway (`arp timeout`), so no RX delivery is claimed |
-| Suite log | `artifacts/test-all.log`, 111,256 bytes, SHA-256 `0e7862a84da1d251c3689b1c6740de2554e94ade76b0251c8aea99329a22f935` (final stage-8 run; `PASS=30 FAIL=0 SKIP=2`, unit 297) |
+| Serial logs | `artifacts/qemu-serial-256m.log` (10,349 bytes, SHA-256 `65bfd2c045fd46c2b50f18c25b93d41aa52c73013887b4fe80aa15013b81f5a7`), `-512m.log` (10,351 bytes, `eb921107f17b66fa10816ea342f1271d75ded1d1ec782772424446cd02659d18`), `-1g.log` (10,352 bytes, `16345cb61afdd3858bba23154ab0f8d96bee571ee375cb69bdf1fa098416cfdf`), `artifacts/qemu-serial-ioapic.log` (stage-8 route proof, 10,351 bytes, `3069816623a11d55adba04f38ec03fe68231c1847cb686f581c7296b08f63483`), `artifacts/qemu-serial-acpi.log` (stage-9 ACPI proof, 10,351 bytes, `272ccb992ace6ce122a0e06be4fe5a95695cf1d350162eca192711868d6730dc`), `artifacts/qemu-serial.log` (memory test, 10,351 bytes, `1ba174e4480c9e4ee360275f10cc9e90f93b6abb2d9587b8377d73e5240b658c`), `artifacts/vbox-serial.log` (VirtualBox), `artifacts/qemu-shell-session.log` (interactive session), `artifacts/qemu-console-session.log` (framebuffer console), `artifacts/qemu-persist-boot{1,2,3,4}.log` + `qemu-persist.log` (4-boot durability), `artifacts/qemu-serial-elf.log` (ELF64 module boot), `artifacts/qemu-serial-pe.log` (PE32+/Win32 module boot), `artifacts/qemu-input-session.log` (Win32 console-input session), `artifacts/qemu-registry-session.log` (Win32 registry session), `artifacts/qemu-registry-write-session.log` (Win32 registry-write session), `artifacts/qemu-net-session.log` (e1000 network session) |
+| VirtualBox result | `artifacts/vbox-test.log` / `artifacts/vbox-serial.log` (11,034 bytes, SHA-256 `82048ad3e3763b244d5e002e95e34bee79faa401bd24eb6672bbfc6f58de2223`): VirtualBox 7.2.20 BIOS PASS with `--require-ioapic --require-acpi`, marker, 5 ticks, RSDP revision 2 / XSDT / 3 tables, MADT revision 2 with IOAPIC ID 1 at `0xfec00000`, 2 overrides, `acpi selftest: passed`, `ioapic: version 0x20, 24 pins, id 0; timer GSI2, console GSI4`, PIT/COM1 routes, no PIC fallback, `fbcon: enabled 85x48` and console selftest observed; the NIC was detected on legacy IRQ 9 and the queue boot line logged, but the isolated NAT has no gateway (`arp timeout`), so no RX delivery is claimed |
+| Suite log | `artifacts/test-all.log`, 116,548 bytes, SHA-256 `fbeab2db3eb2179f2e0df1616ff5d9e9f3e768354300ab53c6f3f49c82bc4509` (final stage-9 run; `PASS=31 FAIL=0 SKIP=2`, unit 312) |
 
 
 ISO byte-for-byte reproducibility is not claimed: `mkisofs` embeds file
 timestamps, so a rebuild changes the ISO checksum even with unchanged sources.
 The kernel and fixture builds are deterministic for identical sources, flags
 and build ID. The main kernel/ISO/session checksums above are from the final
-Phase 9 stage-8 `scripts/test_all.sh` run (30 PASS / 0 FAIL / 2 SKIP, unit
-suite 297 passed); rows that were not rebuilt retain the stage that produced
-them.
+Phase 9 stage-9 `scripts/test_all.sh` run (31 PASS / 0 FAIL / 2 SKIP, unit
+suite 312 passed); PE fixture hashes are deterministic from their build stage,
+and the checkpoint image is unchanged because its content did not change.
 The ISO includes
 `/licenses/LICENSE`, `/licenses/LICENSES.md`, `/licenses/limine-LICENSE`,
 `/licenses/limine-3RDPARTY.md` and `/licenses/rust/*`, because it redistributes
@@ -2035,10 +2144,10 @@ This is a host model, not a kernel or Linux comparison.
   imports against an eighteen-name two-DLL (`kernel32.dll` + `advapi32.dll`)
   allowlist; see the stage-1/stage-2/stage-3 and Phase 8 stage-2/stage-3/
   stage-4 limits bullets below.
-  Networking is one e1000 at stage 8 (PIT/COM1 on the IOAPIC, e1000 still on
-  legacy PIC INTx, a bounded RX queue and static addressing); there is no
-  general on-disk filesystem: persistence is the whole-tree checkpoint image
-  (stage 2) described above.
+  Networking is one e1000 at stage 9 (PIT/COM1 on the ACPI-selected IOAPIC,
+  e1000 still on legacy PIC INTx, a bounded RX queue and static addressing);
+  there is no general on-disk filesystem: persistence is the whole-tree
+  checkpoint image (stage 2) described above.
 
 - Phase 9 stage 5 limits: DMA ownership is a software ledger, not IOMMU
   isolation; exact page ranges are checked only within the kernel ledger.
@@ -2060,15 +2169,23 @@ This is a host model, not a kernel or Linux comparison.
   background RX thread, coalescing/NAPI-style budget, MSI/IOAPIC, shared-line
   support, storm recovery, IOMMU isolation, MMIO unmap or virtual GPU; the
   24 KiB queue increases BSS and has no measured throughput/latency result.
-- Phase 9 stage 8 limits: only the fixed `0xfec00000` IOAPIC and GSI2/GSI4
-  (PIT/COM1) are supported on the boot CPU; the base, 24-pin count and GSI
-  assignments are QEMU/VirtualBox assumptions, not ACPI-derived. No MADT or
-  `_PRT` parsing, PCI INTx IOAPIC routing, MSI/MSI-X, APIC timer, SMP,
+- Phase 9 stage 9 limits: only the first MADT and first IOAPIC covering both
+  PIT/COM1 routes are used; only bus-0 ISA overrides are stored and GSIs must
+  fit 8 bits. There is no AML/`_PRT` evaluator, PCI INTx IOAPIC routing,
+  MSI/MSI-X, APIC timer, SMP or ACPI reclaim. The kernel borrows ACPI tables
+  for its lifetime because it never reclaims that memory. The self-test
+  compares programmed GSIs only, not trigger, polarity, vector or destination.
+  Only QEMU q35 and VirtualBox BIOS were exercised; UEFI and physical hardware
+  are untested. The discovery-failure and controller-failure fallbacks were
+  not forced in the final VM runs. The e1000 remains on the 8259.
+- Phase 9 stage 8 limits (historical): only the fixed `0xfec00000` IOAPIC and
+  GSI2/GSI4 (PIT/COM1) were supported on the boot CPU; the base, 24-pin count
+  and GSI assignments were QEMU/VirtualBox assumptions, not ACPI-derived. No
+  MADT or `_PRT` parsing, PCI INTx IOAPIC routing, MSI/MSI-X, APIC timer, SMP,
   shared/serialized lines, IOMMU isolation, UEFI or physical-hardware
   validation. The e1000 remains on the 8259, and the level/remote-IRR path
-  was not fault-injected or storm-tested. The timer-timeout fallback can
-  mask GSI2/GSI4 and return to PIC IRQ0/IRQ4, but that fallback path was not
-  forced in the final VM runs.
+  was not fault-injected or storm-tested. Stage 9 now discovers the base/ISA
+  routes from MADT; the timer-timeout fallback remains unforced.
 - Phase 9 stage 4 limits: stop/restart is a single-threaded shell operation
   with no lock against concurrent network users; MMIO is never unmapped (the
   HHDM window is retained); a reset timeout leaks rings by design and was not
@@ -2310,7 +2427,7 @@ This is a host model, not a kernel or Linux comparison.
 
 ## Single best next action
 
-Phase 8 stages 1-5 and Phase 9 stages 1-8 are complete: configuration store
+Phase 8 stages 1-5 and Phase 9 stages 1-9 are complete: configuration store
 (ADR-0022), Win32 console input (ADR-0023, R-016), read-only registry
 (ADR-0024, R-017), registry write (ADR-0025, R-018), registry
 enumeration/deletion (ADR-0026, R-019), the PCI bus-0 inventory
@@ -2319,15 +2436,17 @@ enumeration/deletion (ADR-0026, R-019), the PCI bus-0 inventory
 (ADR-0029, R-022), e1000 stop/restart with 19-frame teardown/restart
 accounting (ADR-0030, R-023), exact DMA page ownership (ADR-0031, R-024),
 legacy INTx delivery/ownership with six claims (ADR-0032, R-025), bounded
-interrupt-driven RX through the 16-frame SPSC queue (ADR-0033, R-026), and
-IOAPIC bring-up with PIT GSI2/COM1 GSI4 (ADR-0034, R-027). Final verified
-state: 30 PASS / 0 FAIL / 2 SKIP; unit suite 297; kernel ccf8b27a...,
-default ISO 9d2bcba0..., restart session 94871ba4...
-Single best next action: **Phase 9 acceptance - ACPI MADT/`_PRT` discovery**,
-to derive the IOAPIC base and PCI INTx routes from firmware tables, then move
-the e1000 from legacy PIC line 11 to its q35 GSI22 route in an isolated VM.
-MSI stays deferred because the QEMU 82540EM e1000 exposes no MSI capability;
-the virtual-GPU target follows the Phase 9 acceptance matrix. MMIO unmapping,
-IOMMU isolation, reset-timeout recovery, concurrent stop safety, queue-drop
-injection and the Phase 8/9 acceptance matrices remain open and are not
-claimed.
+interrupt-driven RX through the 16-frame SPSC queue (ADR-0033, R-026),
+IOAPIC bring-up with PIT GSI2/COM1 GSI4 (ADR-0034, R-027), and ACPI MADT
+discovery of the IOAPIC base and ISA routes (docs/ACPI.md, ADR-0035, R-028).
+Final verified state: 31 PASS / 0 FAIL / 2 SKIP; unit suite 312; kernel
+cd07c4ea..., default ISO 53ea35a4..., ACPI serial 272ccb99..., VirtualBox
+serial 82048ad3...
+Single best next action: **Phase 9 acceptance - AML/`_PRT` PCI INTx routing**,
+to evaluate the QEMU `_PRT` method (or an equivalent scoped AML evaluator),
+move the e1000 from legacy PIC line 11 to its q35 GSI22 route, and prove IRQ
+delivery in an isolated VM. MSI stays deferred because the QEMU 82540EM e1000
+exposes no MSI capability; the virtual-GPU target follows the Phase 9
+acceptance matrix. MMIO unmapping, IOMMU isolation, reset-timeout recovery,
+concurrent stop safety, queue-drop injection and the Phase 8/9 acceptance
+matrices remain open and are not claimed.

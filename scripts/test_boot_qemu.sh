@@ -9,6 +9,7 @@ TIMEOUT=60
 MEMORY="${PROJECT_OS_MEMORY:-512M}"
 SERIAL_LOG_OVERRIDE=""
 REQUIRE_IOAPIC=0
+REQUIRE_ACPI=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --firmware) FIRMWARE="${2:?missing firmware value}"; shift 2 ;;
@@ -16,8 +17,9 @@ while [ "$#" -gt 0 ]; do
         --memory) MEMORY="${2:?missing memory value}"; shift 2 ;;
         --serial-log) SERIAL_LOG_OVERRIDE="${2:?missing serial log path}"; shift 2 ;;
         --require-ioapic) REQUIRE_IOAPIC=1; shift ;;
+        --require-acpi) REQUIRE_ACPI=1; shift ;;
         --help|-h)
-            log "usage: $0 [iso] [--firmware bios|uefi] [--memory 512M] [--serial-log path] [--timeout seconds] [--require-ioapic]"
+            log "usage: $0 [iso] [--firmware bios|uefi] [--memory 512M] [--serial-log path] [--timeout seconds] [--require-ioapic] [--require-acpi]"
             exit 0
             ;;
         *)
@@ -141,6 +143,24 @@ if [ "$REQUIRE_IOAPIC" -eq 1 ]; then
         die "IOAPIC timer route timed out and fell back to the PIC (log: $SERIAL_OUT)"
     fi
     log "IOAPIC asserts: PIT GSI2, COM1 GSI4, timer ticks, no PIC fallback"
+fi
+if [ "$REQUIRE_ACPI" -eq 1 ]; then
+    grep -aqE "^acpi: RSDP revision [0-9]+, (RSDT|XSDT) with [1-9][0-9]* table\\(s\\)$" "$SERIAL" \
+        || die "ACPI RSDP/root-table line missing (log: $SERIAL_OUT)"
+    grep -aqE "^acpi: MADT revision [0-9]+, local APIC 0x[0-9a-f]+, [1-9][0-9]* IOAPIC\\(s\\), [0-9]+ ISA override\\(s\\)$" "$SERIAL" \
+        || die "ACPI MADT line missing (log: $SERIAL_OUT)"
+    grep -aqE "^acpi: IOAPIC [0-9]+ at 0x[0-9a-f]+, GSI base [0-9]+$" "$SERIAL" \
+        || die "ACPI IOAPIC selection line missing (log: $SERIAL_OUT)"
+    grep -aqE "^acpi: PIT IRQ0 -> GSI[0-9]+ \\((edge|level), (active-high|active-low)\\); COM1 IRQ4 -> GSI[0-9]+ \\((edge|level), (active-high|active-low)\\)$" "$SERIAL" \
+        || die "ACPI ISA route line missing (log: $SERIAL_OUT)"
+    grep -aqE "^acpi selftest: passed \\(timer GSI[0-9]+, console GSI[0-9]+\\)$" "$SERIAL" \
+        || die "ACPI selftest did not pass (log: $SERIAL_OUT)"
+    grep -aqF ",acpi" "$SERIAL" \
+        || die "boot marker does not include ,acpi (log: $SERIAL_OUT)"
+    if grep -aqF "acpi: unavailable" "$SERIAL"; then
+        die "ACPI discovery reported unavailable (log: $SERIAL_OUT)"
+    fi
+    log "ACPI asserts: RSDP/root, MADT, IOAPIC, ISA routes, selftest, marker"
 fi
 log "serial log: $SERIAL_OUT"
 log "PASS: $FIRMWARE boot reached PROJECT_OS_BOOT_SUCCESS and exited via isa-debug-exit"

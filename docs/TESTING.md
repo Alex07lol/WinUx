@@ -30,16 +30,17 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 
 | Command | Proves | Recorded result |
 |---|---|---|
-| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 29 PASS, 0 FAIL, 2 SKIP |
+| `scripts/test_all.sh` | orchestrates everything below and summarises | PASS: 31 PASS, 0 FAIL, 2 SKIP |
 | `scripts/bootstrap.sh` | required tools and Rust targets (incl. `x86_64-pc-windows-msvc` and `rust-lld`) exist | PASS |
 | `scripts/format.sh` | `rustfmt --check` clean (kernel workspace, userland, `userland/pe`) | PASS |
 | `scripts/lint.sh` | Clippy `-D warnings` for os_core, membench, kernel, userland, `userland/pe` | PASS |
-| `scripts/test_unit.sh` | 269 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), configuration store codec (POCF incl. all rejection vectors), ELF64 parser incl. all rejection vectors, PE32+ parser incl. all rejection vectors, relocation walk and import directory (descriptors, ILT/IAT fallback, names, ordinals, caps), PCI config/BAR math, Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (269/269) |
+| `scripts/test_unit.sh` | 312 host tests: memmap, framebuffer, font/text-grid/renderer, allocator, PRNG, paging math, heap, path validation, checkpoint format (pofs), configuration store codec (POCF incl. all rejection vectors), ELF64 parser incl. all rejection vectors, PE32+ parser incl. all rejection vectors, relocation walk and import directory (descriptors, ILT/IAT fallback, names, ordinals, caps), PCI config/BAR math, IOAPIC entry encoding, ACPI RSDP/RSDT/XSDT/MADT parsing (checksums, lengths, entries, alignment, duplicates, capacity, flags), Ethernet/ARP/IPv4/ICMP/UDP codecs and checksums | PASS (312/312) |
 | `scripts/build.sh` | kernel builds; ELF entry and Limine requests verified | PASS |
 | `scripts/build_user.sh` | userland workspace builds; `hello`/`fault` pass the header checker; `bad.elf` fails with `bad magic` | PASS |
 | `scripts/build_user_pe.sh` | `userland/pe` builds via rust-lld; `pehello.exe`/`peconsole.exe`/`pebasics.exe`/`peinput.exe` (Phase 8 stage 2, `ReadFile` imports), `pereg.exe` (Phase 8 stage 3, `advapi32.dll` reads) and `peregw.exe` (Phase 8 stage 4, `advapi32.dll` writes) pass `check_user_pe.py` (imports included); `pebad.exe` fails with `bad signature`; the `pebadimp`/`pebadfn`/`pebadfn2` mutants patch a unique byte pattern each and stay structurally valid | PASS (10 artifacts) |
 | `scripts/make_iso.sh` | ISO built (kernel + three ELF modules + seven PE modules); both El Torito entries verified; `--input-fixture` variant adds `peinput.exe` as an eighth PE module (`project-os-input.iso`); `--registry-fixture` adds `pereg.exe` instead (`project-os-registry.iso`); `--registry-write-fixture` adds `peregw.exe` (`project-os-registry-write.iso`) | PASS |
 | `scripts/test_boot_qemu.sh` | BIOS boot at 256 MiB, 512 MiB and 1 GiB; marker; no panic; debug-exit 33 | PASS (all three) |
+| `scripts/test_boot_qemu.sh --require-acpi` | ACPI MADT discovery on q35: RSDP/root line, MADT line, selected IOAPIC, PIT/COM1 ISA routes, `acpi selftest: passed`, `,acpi` marker, no `acpi: unavailable` | PASS |
 | `scripts/test_boot_qemu.sh --firmware uefi` | UEFI boot | SKIP (no `OVMF_FD`) |
 | `scripts/test_elf_qemu.sh` | ELF64 module self-test: 3 modules present, ring-3 greeting from the ELF, exit 0, one isolated fault, `bad.elf` rejected, `,elf` marker | PASS |
 | `scripts/test_pe_qemu.sh` | PE32+/Win32 self-test (stages 1–3): 7 modules present, pehello load line (4 sections, 1 relocation) + greeting + relocation verified, `pebad.exe` rejected (`bad signature`), peconsole load line (5 sections, 1 relocation), the seven `win32:` console lines, `pebadimp.exe` rejected (`unknown import dll`), `pebadfn.exe` rejected (`unknown import function`), `win32 selftest: passed`, pebasics load line (5 sections, 1 relocation), the full `win32:` program-basics block (incl. `WriteFile(0) -> 0 (invalid handle)`, `WriteFile(1, 28 bytes, overlapped) -> 0 (invalid parameter)`, `GetCommandLineA() -> "/boot/pebasics.exe"`), `pebadfn2.exe` rejected (`unknown import function`), `win32 program selftest: passed`, `pe`+`win32` markers | PASS |
@@ -53,7 +54,7 @@ missing), any other = failure. `test_all.sh` treats `2` as SKIP, never PASS.
 | `scripts/test_persistence_qemu.sh` | four-boot durability on a raw 8 MiB disk (format/save, reboot load, CRC fallback incl. configuration rollback, fresh format with defaults reseeded) | PASS (4 boots) |
 | `scripts/test_net_qemu.sh` | e1000 end-to-end on q35 with a pinned `model=e1000` slirp NIC: pinned `net:` lines including legacy IRQ 11 and the 16-frame RX queue, `,net` marker, `net` counters including `rxq`, `ping 10.0.2.2 -c 3` (3/3), IRQ event count and queue delivery both strictly grow after the ping, host-forwarded 19-byte UDP echo round trip | PASS |
 | `scripts/test_graphics_host.sh` | framebuffer geometry/colour tests | PASS |
-| `scripts/test_virtualbox.sh` | VirtualBox BIOS boot with an Intel 82540EM NAT NIC attached; kernel detects the NIC (`net: e1000 at 00:03.0`), loopback `unsupported`, gateway ARP unanswered — non-fatal | PASS (7.2.20; marker + 5 ticks) |
+| `scripts/test_virtualbox.sh` | VirtualBox BIOS boot with an Intel 82540EM NAT NIC attached; ACPI RSDP/XSDT/MADT discovery, selected IOAPIC, PIT/COM1 routes and self-test; kernel detects the NIC (`net: e1000 at 00:03.0`), loopback `unsupported`, gateway ARP unanswered — non-fatal | PASS (7.2.20; marker + 5 ticks) |
 | `scripts/test_pci_qemu.sh` | PCI bus-0 inventory (Phase 9 stage 1): 6 functions/7 BARs on q35 with a pinned e1000, host-bridge/LPC/e1000+BAR0 lines, power-of-two BAR invariants, `pci selftest: passed`, marker `pci`, QEMU exit 33 | PASS |
 | `scripts/test_driver_model_qemu.sh` | driver lifecycle, exact resource and IRQ ownership (Phase 9 stage 6): one descriptor registered, e1000 `Running` at 00:02.0, BAR0 MMIO `0xfebc0000..0xfebe0000`, four DMA ranges/19 pages and legacy IRQ 11 claimed, five unmatched functions, structural self-test, marker `driver`, QEMU exit 33 | PASS |
 | `scripts/test_driver_restart_qemu.sh` | e1000 stop/restart with exact page and IRQ claims (Phase 9 stage 6): `drivers stop` frees exactly 19 DMA frames and releases 6 claims, `net` inactive, `drivers` shows Stopped/0 claims, `drivers start` reclaims 19 frames and re-registers IRQ 11, `ping 10.0.2.2 -c 1` succeeds and the IRQ event count grows (2 -> 4) | PASS |
@@ -126,10 +127,12 @@ and the kernel idles, so the same ISO can be booted manually.
    HHDM write/read-back, free, accounting restored, double-free rejected,
    non-power-of-two rejected.
 7. GDT/TSS/IST1 loaded; IDT loaded; deliberate `int3` reached the Rust handler.
-8. PIC remapped/masked; PIT programmed; APIC and IOAPIC pages mapped; PIT GSI2
-   and COM1 GSI4 routed through the IOAPIC with local-APIC EOI; LINT0 left in
-   ExtINT delivery for the PIC fallback and PCI INTx lines.
-9. Five PIT ticks observed through IOAPIC GSI2 within a 2 s TSC-based bound
+8. ACPI discovery validates the RSDP/root table/MADT and selects the IOAPIC
+   base and PIT/COM1 routes; failure retains the fixed stage-8 configuration.
+   PIC remapped/masked; PIT programmed; APIC and selected IOAPIC pages mapped;
+   the discovered (or fixed) routes are programmed with local-APIC EOI; LINT0
+   stays in ExtINT delivery for the PIC fallback and PCI INTx lines.
+9. Five PIT ticks observed through the IOAPIC GSI within a 2 s TSC-based bound
    (or bounded spin fallback); a timeout falls back to PIC IRQ0/IRQ4 and the
    second wait must also pass.
 10. Kernel heap self-test: box allocation, `Vec` growth, a 1 MiB block, accounting restored.
@@ -304,6 +307,30 @@ asserts the same lines and then types shell commands, which exercises COM1 RX
 through IOAPIC GSI4. The 5 host-side IOAPIC tests cover the 64-bit
 redirection-entry layout, mask bit, vector reservation and destination field.
 
+## ACPI test details
+
+`scripts/test_all.sh` runs `scripts/test_boot_qemu.sh --require-acpi` as the
+`boot-qemu-acpi` step, writing `artifacts/qemu-serial-acpi.log`. The harness
+fails unless the q35 serial log contains:
+
+- `acpi: RSDP revision <n>, (RSDT|XSDT) with <n> table(s)`;
+- `acpi: MADT revision <n>, local APIC 0x..., <n> IOAPIC(s), <n> ISA override(s)`;
+- `acpi: IOAPIC <id> at 0x..., GSI base <n>`;
+- the combined PIT/COM1 route line with a trigger and polarity for each;
+- `acpi selftest: passed (timer GSI<n>, console GSI<n>)`;
+- `,acpi` in the success marker and no `acpi: unavailable`.
+
+`scripts/test_all.sh` also passes `--require-ioapic --require-acpi` to the
+VirtualBox step, so the same firmware-derived lines and routes are required in
+that VM. The QEMU and VirtualBox profiles select different root-table kinds
+(RSDT versus XSDT), revisions and override counts, but both resolve GSI2/GSI4.
+The bare QEMU boot harness has no NIC, so its marker omits `,net`; the separate
+`test_net_qemu.sh` step covers the network path.
+
+The 15 host ACPI tests are listed in the unit-test row above. They use synthetic
+RSDP/RSDT/XSDT/MADT byte buffers; they do not exercise firmware tables. The VM
+steps supply the firmware evidence.
+
 ## Network test details
 
 `scripts/test_net_qemu.sh` (driver `scripts/test_net_qemu.py`) boots the
@@ -351,6 +378,16 @@ GSI4`, `pit: 100 Hz, IOAPIC GSI2`, `console: COM1 receive interrupt enabled
 (IOAPIC GSI4)` and 6 timer ticks, with no PIC fallback; the script passed. This
 is evidence for PIT/COM1 IOAPIC delivery on VirtualBox BIOS, not for PCI INTx
 IOAPIC routing, MSI, UEFI or physical hardware.
+
+Stage 9 reran the isolated VM with `--require-ioapic --require-acpi` on
+2026-10-23. The log records RSDP revision 2 / XSDT / 3 tables, MADT revision 2
+with IOAPIC ID 1 at `0xfec00000` and 2 overrides, PIT GSI2 and COM1 GSI4,
+`acpi selftest: passed (timer GSI2, console GSI4)`, the same hardware IOAPIC
+line (`version 0x20, 24 pins, id 0`), 5 timer ticks and no PIC fallback. The
+firmware IOAPIC ID and the controller's register ID need not match; routing
+uses the boot CPU's local-APIC ID. This is evidence for ACPI MADT discovery on
+VirtualBox BIOS, not for AML/`_PRT`, PCI GSI routing, UEFI or physical
+hardware.
 
 Networking in that VM is reported as observed, not claimed green: the kernel
 detected the NIC (`net: e1000 at 00:03.0 bar0 0xf0000000 size 128 KiB`, MAC
@@ -412,3 +449,7 @@ in `progress.md` before claiming a UEFI boot.
   the 82540EM NAT NIC and the kernel detected it, but the headless NAT did not
   answer the gateway ARP within the 3 s budget; no VirtualBox network claim is
   made (`docs/NETWORK.md` §11).
+- ACPI discovery is verified on QEMU q35 and VirtualBox BIOS only. There is no
+  AML/`_PRT` evaluator, PCI INTx IOAPIC routing, MSI, APIC timer or SMP; the
+  fallback and timer-timeout paths were not forced in the final runs. UEFI and
+  physical hardware remain untested.

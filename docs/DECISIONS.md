@@ -1691,3 +1691,62 @@ use the 8259, and MSI/MSI-X, APIC timer, SMP, UEFI and physical hardware remain
 untested or unimplemented. The `level` choice for COM1 is deliberate: the UART
 interrupt remains asserted until serviced, and the IOAPIC can redeliver it
 after EOI. This is not physical-hardware validation.
+
+## ADR-0035 - ACPI MADT discovery with validated tables and fixed fallback
+
+**Context.** Stage 8 hardcoded `0xfec00000`, PIT GSI2 and COM1 GSI4. Both
+supported hypervisors expose those values, but the IOAPIC base is not fixed by
+the architecture and a different firmware profile can choose other GSIs.
+Firmware already publishes the authoritative base and legacy ISA overrides in
+the ACPI MADT. QEMU q35 and VirtualBox also differ in RSDP revision and root
+table (QEMU uses an RSDT, VirtualBox an XSDT), so both encodings must work
+before discovery can be called tested. PCI `_PRT` cannot be consumed yet:
+QEMU emits it as AML, not a static table.
+
+**Decision.** Request the RSDP through Limine (base revision 6), convert its
+HHDM address to physical, and validate the RSDP, root table and every consumed
+table against Limine memory-map regions of type ACPI reclaimable, ACPI NVS or
+reserved-mapped before dereferencing. Parse the RSDP, RSDT/XSDT and MADT in
+allocation-free `os_core::acpi`; require exactly one MADT, select one IOAPIC
+covering both routes, and resolve bus-0 interrupt-source overrides field by
+field. A malformed table, missing MADT/IOAPIC or unusable GSI falls back to the
+stage-8 base/routes. A controller mapping/probe failure uses the 8259 path.
+Keep the IOAPIC on PIT/COM1 only; leave PCI INTx and MSI for later.
+
+Route defaults are PIT GSI2 edge/active-high and COM1 GSI4 level/active-high.
+An override's trigger field value 0 ("conforming") keeps the local default
+rather than rejecting the entry; 1 is edge, 3 is level, and 2 is reserved.
+Polarity value 0 is "conforming" and keeps the local active-high default; 1 is
+active-high, 3 is active-low, and 2 is reserved. This avoids discarding a
+usable override merely because one field defers to the bus.
+
+**Alternatives considered.** Keep hardcoded values (no firmware validation and
+wrong on other profiles); scan physical memory for the RSDP signature (Limine
+already provides the pointer; scanning adds unsafe heuristic reads); implement
+full AML/`_PRT` now (much larger, unverified surface and changes the e1000
+route at the same time); trust ACPI tables without memory-map checks (a bad
+pointer can read arbitrary memory); use ACPI only with no fixed fallback (loses
+the verified stage-8 path and makes firmware regressions fatal); reject any
+override that is not fully conforming (drops usable routes when one field means
+"conforming"). The chosen scope is the smallest change that removes the fixed
+assumptions while preserving a tested fallback.
+
+**Evidence.** Host suite 312 (15 ACPI parser tests covering RSDP v1/v2, bad
+checksums/lengths, truncated entries, misaligned/duplicate IOAPICs, capacity,
+reserved flags, non-bus-0 overrides and `read_sdt_length`). QEMU 11.1.0 q35:
+RSDP revision 0 / RSDT / 5 tables, MADT revision 3, IOAPIC 0 at `0xfec00000`,
+5 overrides, PIT GSI2, COM1 GSI4, 7 ticks, `acpi selftest: passed`. VirtualBox
+7.2.20: RSDP revision 2 / XSDT / 3 tables, MADT revision 2, IOAPIC ID 1,
+2 overrides, same routes, 5 ticks, self-test passed. `test_boot_qemu.sh
+--require-acpi`, `test_virtualbox.sh --require-ioapic --require-acpi` and
+`test_all.sh` pass (`PASS=31 FAIL=0 SKIP=2`). No UEFI, physical-hardware, PCI
+GSI, MSI or fault-injected ACPI run was performed.
+
+**Consequences.** The IOAPIC base and PIT/COM1 GSIs now come from firmware and
+both RSDP revisions and root-table encodings are exercised. The kernel still
+borrows ACPI tables for its lifetime and never reclaims them; reclaiming would
+require copying or narrowing those slices. Only one MADT and the first covering
+IOAPIC are used, only bus-0 overrides are stored, and GSIs must fit 8 bits.
+The self-test compares programmed GSIs only, not trigger, polarity, vector or
+destination. `_PRT`/AML, PCI INTx IOAPIC routing, MSI/MSI-X, APIC timer, SMP,
+UEFI and physical hardware remain out of scope. The e1000 stays on the 8259.

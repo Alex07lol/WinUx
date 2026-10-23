@@ -1455,6 +1455,64 @@ needs either an MSI-capable device/driver or a separately validated device
 model. Do not describe this as general IOAPIC discovery, PCI interrupt routing,
 MSI support or physical-hardware validation.
 
+## R-028 – ACPI MADT discovery for the IOAPIC and legacy ISA routes
+
+**Question.** Can the kernel obtain the IOAPIC MMIO base and the PIT/COM1 GSI,
+trigger and polarity from ACPI firmware on QEMU q35 and VirtualBox, using a
+small host-testable parser and bounded kernel discovery, without an AML
+interpreter or PCI `_PRT` routing? What must happen when the tables are
+missing, malformed, outside the memory map, or describe an unusable controller?
+
+**Sources.** ACPI Specification 6.6, RSDP, RSDT/XSDT, MADT (`APIC`) and
+interrupt-source override sections: <https://uefi.org/specifications>. Intel
+64 and IA-32 Architectures Software Developer's Manual, Volume 3A, local APIC
+and I/O APIC chapters (redirection-entry fields, mask semantics):
+<https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>.
+Limine protocol base revision 6, RSDP feature and pointer semantics:
+<https://github.com/limine-bootloader/limine/blob/v12.x/PROTOCOL.md>.
+Limine passes an HHDM virtual address; the kernel subtracts the HHDM offset.
+QEMU 11.1.0 and VirtualBox 7.2.20 were exercised as guests. QEMU q35's `_PRT`
+is an AML method, not a static table. No Linux, Wine or ReactOS implementation
+code was read or copied.
+
+**Claim.** The MADT is the authoritative firmware description of the IOAPIC
+base, GSI base, ID and bus-0 ISA interrupt-source overrides. The RSDP may be
+revision 0/1 with an RSDT or revision 2+ with an XSDT; both root-table entries
+are physical addresses and must be range-validated before use. An IOAPIC
+address is page-aligned; the kernel must know the redirection-table size (256
+inputs here) to decide whether a GSI is routable. An interrupt-source override
+with all flags zero means "conforming", so a local default is still required
+for trigger/polarity. PCI config-space `INTERRUPT_LINE` remains unrelated to
+the `_PRT` GSI; without an AML evaluator the e1000 cannot move to GSI22.
+Firmware IOAPIC ID and the controller's ID register are separate values.
+
+**Experiment.** PASSED (2026-10-23), QEMU q35 and VirtualBox BIOS. Host suite
+312, including 15 synthetic ACPI tests: RSDP v1/v2 checksums and lengths,
+truncated tables/entries, RSDT/XSDT entry sizes, MADT checksum and record
+bounds, misaligned/duplicate IOAPICs, capacity limits, duplicate overrides,
+reserved flags, ignored non-bus-0 records, and prefix length reads. QEMU 11.1.0
+q35 with BIOS: `acpi: RSDP revision 0, RSDT with 5 table(s)`; MADT revision 3,
+local APIC `0xfee00000`, one IOAPIC, five overrides; IOAPIC 0 at `0xfec00000`,
+GSI base 0; PIT GSI2 edge/active-high and COM1 GSI4 level/active-high; 7 ticks;
+`acpi selftest: passed (timer GSI2, console GSI4)`; marker `...,acpi`.
+VirtualBox 7.2.20 BIOS: RSDP revision 2, XSDT with 3 tables; MADT revision 2,
+IOAPIC ID 1 at the same base, two overrides; same routes, 5 ticks, self-test
+passed. VirtualBox's hardware IOAPIC ID register reads 0 while the MADT ID is
+1, so the IDs are reported separately and not assumed equal.
+`test_boot_qemu.sh --require-acpi`, `test_virtualbox.sh --require-ioapic
+--require-acpi` and `scripts/test_all.sh` (PASS=31, FAIL=0, SKIP=2) pass.
+No fallback path was forced in the final VM runs, and no UEFI, physical
+hardware, PCI GSI, MSI or fault-injected ACPI run was performed.
+
+**Conclusion.** Parse the RSDP/RSDT/XSDT/MADT ourselves, validate every byte
+range against the Limine memory map, select one covering IOAPIC, and resolve
+the bus-0 overrides with local trigger/polarity defaults. Keep the fixed
+stage-8 base/routes as a fallback for discovery failure and the 8259 path for
+controller failure; do not mix guessed routes after a controller error. Defer
+AML/`_PRT`, PCI INTx IOAPIC routing, MSI/MSI-X, ACPI reclaim and physical
+hardware. The tables are borrowed for kernel lifetime, which is safe only
+because ACPI memory is never reclaimed.
+
 ## Open questions / BLOCKED items
 
 | Item | State | Next evidence needed |
@@ -1463,7 +1521,7 @@ MSI support or physical-hardware validation.
 | VirtualBox EFI boot | NOT ATTEMPTED | Enable EFI in an isolated VM; record serial evidence |
 | Real-hardware boot | NOT ATTEMPTED | Only on a disposable machine; no host disk/EFI changes |
 | 5-level paging | NOT IMPLEMENTED | Kernel requests max 4-level; revisit with 5-level page-table code |
-| APIC/IOAPIC/SMP | PARTIAL | IOAPIC GSI2/GSI4 and LAPIC EOI verified; APIC timer, ACPI MADT/`_PRT`, PCI INTx routing, MSI and SMP not started |
+| APIC/IOAPIC/SMP | PARTIAL | ACPI MADT selects the IOAPIC base and PIT/COM1 routes; LAPIC EOI verified; APIC timer, AML/`_PRT` PCI INTx routing, MSI and SMP not started |
 | KASLR | NOT REQUESTED | Needs relocatable kernel and slide handling |
 | Windows API/driver compatibility | NOT IMPLEMENTED | PE loader, compatibility corpus, object/syscall design |
 | NVIDIA acceleration | RESEARCH ONLY | Scoped port study and one named GPU target |

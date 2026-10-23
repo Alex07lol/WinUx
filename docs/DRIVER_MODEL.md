@@ -1,8 +1,9 @@
 # Driver registration, matching, lifecycle, resource ownership and restart
 
 Status: stages 2-7 implemented and verified (2026-10-22). Stage 8 routes the
-PIT and COM1 through the IOAPIC, but leaves the e1000 on PCI INTx through the
-PIC. Contract for
+PIT and COM1 through the IOAPIC; stage 9 discovers that IOAPIC base and the ISA
+routes from ACPI MADT. The e1000 still uses PCI INTx through the PIC because
+`_PRT`/AML is not implemented. Contract for
 `os_core::driver`, `os_core::queue`, `kernel/src/driver.rs`,
 `kernel/src/net.rs`, `kernel/src/e1000.rs`, `kernel/src/irq.rs`, the shell
 `drivers [stop|start]` command and the QEMU harnesses. Evidence is in section
@@ -26,8 +27,9 @@ the line, clears the queue, disables the device, resets it, returns all ring
 frames, removes network state and releases every claim; start repeats the
 same path. A stop/restart cycle is exercised end to end on QEMU, including
 ICMP and queue delivery after the restart. Stage 8 routes only the PIT and
-COM1 through IOAPIC GSIs 2/4; the driver's IRQ line stays on the 8259 because
-PCI GSI discovery is not implemented.
+COM1 through ACPI-discovered IOAPIC GSIs (2/4 on QEMU and VirtualBox); the
+driver's IRQ line stays on the 8259 because `_PRT`/PCI GSI discovery is not
+implemented.
 
 Not claimed: MMIO unmapping (the HHDM mapping is kernel-lifetime and reused),
 MSI or PCI INTx IOAPIC routing (only PIT/COM1 use the IOAPIC; the e1000 uses
@@ -207,11 +209,11 @@ Stop/restart now exercises the same path in reverse.
 
 ## 8. Evidence
 
-- Host suite 297 tests (292 driver/queue baseline plus 5 IOAPIC encoding
-  tests); `os_core::driver` has 17 tests covering binding, exact page
-  ownership, physical overlap, teardown and restart, and `os_core::queue`
-  has 5 tests including order, overflow, reset and a 20,000-item two-thread
-  SPSC stress run.
+- Host suite 312 tests (292 driver/queue baseline, 5 IOAPIC encoding tests and
+  15 ACPI parser tests); `os_core::driver` has 17 tests covering binding,
+  exact page ownership, physical overlap, teardown and restart, and
+  `os_core::queue` has 5 tests including order, overflow, reset and a
+  20,000-item two-thread SPSC stress run.
 - `scripts/test_driver_model_qemu.sh` PASS on q35 with a pinned e1000: the
   IOAPIC/PIT/COM1 lines plus the six driver boot lines, `,driver`, no panic,
   QEMU exit 33. The same harness types commands, so COM1 RX through IOAPIC
@@ -223,16 +225,20 @@ Stop/restart now exercises the same path in reverse.
   VirtualBox assigns line 9 and boots; its isolated NAT has no gateway reply,
   so no delivery count is claimed there.
 - `scripts/test_all.sh` PASS=30 FAIL=0 SKIP=2 after the stage-8 changes
-  (`boot-qemu-ioapic` and VirtualBox `--require-ioapic` added).
+  (`boot-qemu-ioapic` and VirtualBox `--require-ioapic` added). After stage 9
+  the same tree reports PASS=31 FAIL=0 SKIP=2 with `boot-qemu-acpi` and
+  VirtualBox `--require-acpi`; the driver route evidence is unchanged because
+  the e1000 remains on the 8259.
 - Recorded sessions: `artifacts/qemu-driver-session.log`,
   `artifacts/qemu-driver-restart-session.log`, `artifacts/qemu-net-session.log`,
   `artifacts/vbox-serial.log`.
 
 ## 9. Next stage (not claimed)
 
-PCI INTx IOAPIC routing with ACPI MADT/`_PRT` discovery and MSI/MSI-X, then a
-virtual GPU. Stage 8 deliberately leaves the e1000 on 8259 INTx because q35's
-config line 11 is not its ACPI GSI. The stage-7 handler drains up to
+PCI INTx IOAPIC routing with AML/`_PRT` evaluation and MSI/MSI-X, then a
+virtual GPU. Stages 8-9 deliberately leave the e1000 on 8259 INTx because
+q35's config line 11 is not its ACPI GSI and `_PRT` is an AML method. The
+stage-7 handler drains up to
 one full 32-descriptor ring per interrupt into a 16-frame software queue and
 drops new frames when that queue is full; protocol work still runs on the
 service path, so this is not a background network thread. Queue-overflow and

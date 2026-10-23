@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+mod acpi;
 mod arch;
 mod blk;
 mod config;
@@ -45,6 +46,7 @@ use core::sync::atomic::Ordering;
 use alloc::string::String;
 
 use os_core::fb::{FramebufferGeometry, PixelFormat};
+use os_core::ioapic::{Polarity, TriggerMode};
 use os_core::memmap::{self, MemoryRegion, MemoryType};
 
 use arch::x86_64::{idt, pic, pit};
@@ -190,10 +192,16 @@ fn setup_apic_extint(hhdm_offset: u64) -> Result<*mut u32, &'static str> {
     Ok(lapic)
 }
 
-/// Map the fixed IOAPIC window and install the PIT/COM1 routes.
-fn setup_ioapic(hhdm_offset: u64, lapic: *mut u32) -> Result<irq::IoApicInfo, &'static str> {
-    let base = arch::x86_64::ioapic::map(hhdm_offset)?;
-    irq::init_ioapic(base, lapic)
+/// Map the selected IOAPIC window and install the discovered PIT/COM1 routes.
+fn setup_ioapic(
+    hhdm_offset: u64,
+    lapic: *mut u32,
+    physical_base: u32,
+    timer: irq::LegacyRoute,
+    console: irq::LegacyRoute,
+) -> Result<irq::IoApicInfo, &'static str> {
+    let base = arch::x86_64::ioapic::map(hhdm_offset, physical_base)?;
+    irq::init_ioapic(base, lapic, timer, console)
 }
 
 fn wait_for_ticks(target: u64) -> bool {
@@ -369,6 +377,46 @@ pub extern "C" fn kmain() -> ! {
             region.length / 1024
         );
     }
+    let acpi_info = match acpi::init(hhdm_offset, &regions[..region_count]) {
+        Ok(info) => {
+            kprintln!(
+                "acpi: RSDP revision {}, {} with {} table(s)",
+                info.rsdp_revision,
+                if info.uses_xsdt { "XSDT" } else { "RSDT" },
+                info.table_count
+            );
+            kprintln!(
+                "acpi: MADT revision {}, local APIC {:#x}, {} IOAPIC(s), {} ISA override(s)",
+                info.madt_revision,
+                info.local_apic_address,
+                info.ioapic_count,
+                info.override_count
+            );
+            kprintln!(
+                "acpi: IOAPIC {} at {:#x}, GSI base {}",
+                info.ioapic_id,
+                info.ioapic_address,
+                info.ioapic_gsi_base
+            );
+            kprintln!(
+                "acpi: PIT IRQ0 -> GSI{} ({}, {}); COM1 IRQ4 -> GSI{} ({}, {})",
+                info.timer.gsi,
+                info.timer.trigger_label(),
+                info.timer.polarity_label(),
+                info.console.gsi,
+                info.console.trigger_label(),
+                info.console.polarity_label()
+            );
+            Some(info)
+        }
+        Err(error) => {
+            kprintln!(
+                "acpi: unavailable ({}); using fixed IOAPIC/ISA routes",
+                error.label()
+            );
+            None
+        }
+    };
     let allocator_stats = match memory::init(&regions[..region_count]) {
         Ok(stats) => stats,
         Err(error) => fatal(format_args!("{}", error)),
@@ -443,23 +491,72 @@ pub extern "C" fn kmain() -> ! {
     pit::init();
     console::init();
     let mut ioapic_started = false;
-    match setup_apic_extint(hhdm_offset) {
-        Ok(lapic) => match setup_ioapic(hhdm_offset, lapic) {
-            Ok(info) => {
-                ioapic_started = true;
-                kprintln!(
-                    "ioapic: version {:#04x}, {} pins, id {}; timer GSI2, console GSI4",
-                    info.version,
-                    info.pins,
-                    info.id
-                );
-            }
-            Err(error) => {
-                kprintln!("ioapic: unavailable ({}); using 8259", error);
-                pic::unmask_irq0();
-                pic::unmask_irq(4);
-            }
+    let ioapic_base = acpi_info.map_or(arch::x86_64::ioapic::PHYSICAL_BASE, |info| {
+        info.ioapic_address
+    });
+    let timer_route = acpi_info.map_or(
+        irq::LegacyRoute {
+            gsi: acpi::FALLBACK_TIMER_GSI,
+            trigger: TriggerMode::Edge,
+            polarity: Polarity::ActiveHigh,
         },
+        |info| irq::LegacyRoute {
+            gsi: info.timer.gsi,
+            trigger: info.timer.trigger,
+            polarity: info.timer.polarity,
+        },
+    );
+    let console_route = acpi_info.map_or(
+        irq::LegacyRoute {
+            gsi: acpi::FALLBACK_CONSOLE_GSI,
+            trigger: TriggerMode::Level,
+            polarity: Polarity::ActiveHigh,
+        },
+        |info| irq::LegacyRoute {
+            gsi: info.console.gsi,
+            trigger: info.console.trigger,
+            polarity: info.console.polarity,
+        },
+    );
+    match setup_apic_extint(hhdm_offset) {
+        Ok(lapic) => {
+            match setup_ioapic(hhdm_offset, lapic, ioapic_base, timer_route, console_route) {
+                Ok(info) => {
+                    ioapic_started = true;
+                    kprintln!(
+                        "ioapic: version {:#04x}, {} pins, id {}; timer GSI{}, console GSI{}",
+                        info.version,
+                        info.pins,
+                        info.id,
+                        info.timer_gsi,
+                        info.console_gsi
+                    );
+                    if let Some(discovered) = acpi::info() {
+                        if discovered.timer.gsi != info.timer_gsi
+                            || discovered.console.gsi != info.console_gsi
+                        {
+                            fatal(format_args!(
+                                "acpi selftest failed: discovered GSI{} / GSI{}, programmed GSI{} / GSI{}",
+                                discovered.timer.gsi,
+                                discovered.console.gsi,
+                                info.timer_gsi,
+                                info.console_gsi
+                            ));
+                        }
+                        kprintln!(
+                            "acpi selftest: passed (timer GSI{}, console GSI{})",
+                            info.timer_gsi,
+                            info.console_gsi
+                        );
+                    }
+                }
+                Err(error) => {
+                    kprintln!("ioapic: unavailable ({}); using 8259", error);
+                    pic::unmask_irq0();
+                    pic::unmask_irq(4);
+                }
+            }
+        }
         Err(error) => {
             kprintln!(
                 "apic: ExtINT setup unavailable ({}); using disabled-LAPIC path",
@@ -492,8 +589,15 @@ pub extern "C" fn kmain() -> ! {
         }
     }
     if irq::timer_uses_ioapic() {
-        kprintln!("pit: {} Hz, IOAPIC GSI2", pit::effective_hz());
-        kprintln!("console: COM1 receive interrupt enabled (IOAPIC GSI4)");
+        kprintln!(
+            "pit: {} Hz, IOAPIC GSI{}",
+            pit::effective_hz(),
+            irq::timer_gsi()
+        );
+        kprintln!(
+            "console: COM1 receive interrupt enabled (IOAPIC GSI{})",
+            irq::console_gsi()
+        );
     } else {
         kprintln!("pit: {} Hz, IRQ0 unmasked", pit::effective_hz());
         kprintln!("console: COM1 receive interrupt enabled (IRQ4)");
@@ -644,6 +748,9 @@ pub extern "C" fn kmain() -> ! {
     }
     if net::selftest_passed() {
         checks.push_str(",net");
+    }
+    if ioapic_started && acpi::info().is_some() {
+        checks.push_str(",acpi");
     }
     kprintln!("PROJECT_OS_BOOT_SUCCESS:{} checks={}", BUILD_ID, checks);
 

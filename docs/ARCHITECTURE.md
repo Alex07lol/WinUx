@@ -1,7 +1,7 @@
 # Architecture
 
-Status: **Phase 1 boot milestone plus partial Phase 2/3/9 foundations.** This
-document describes what exists in the repository, not the eventual full OS.
+Status: **Phase 9 stage 9 foundations (partial Phase 2/3/8/9).** This document
+describes what exists in the repository, not the eventual full OS.
 
 ## Boot chain
 
@@ -18,7 +18,7 @@ _start (kernel/src/entry.S)
         v
 kmain (kernel/src/main.rs)
         |  serial -> handoff validation -> framebuffer log console mirror
-        |  memory map -> frame allocator self-test
+        |  memory map -> ACPI MADT -> frame allocator self-test
         |  GDT/TSS/IST -> IDT -> int3 self-test
         |  PIC remap -> APIC/IOAPIC route -> PIT 100 Hz -> 5 ticks
         v
@@ -53,7 +53,7 @@ Verified assumptions at entry:
 
 The kernel requests only the features it uses: bootloader info, firmware type,
 stack size, paging mode, HHDM, command line, executable address, memory map,
-framebuffer and TSC frequency. All request/response structures are transcribed
+framebuffer, TSC frequency and the RSDP. All request/response structures are transcribed
 from the official protocol and live in a writable `.limine_requests` section.
 
 ## Kernel ELF layout
@@ -98,7 +98,8 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/driver.rs` | driver descriptors over the PCI inventory, deterministic binding, e1000 start/stop/restart through `net`, exact MMIO/DMA-page/IRQ ownership ledger and structural self-test | working (Phase 9 stage 7; e1000 Running/Stopped) |
 | `kernel/src/e1000.rs` | Intel 82540EM driver: MMIO, reset, MAC, legacy RX/TX rings, bounded IRQ RX queue (polled fallback), INTx acknowledge, counters, ring teardown | working (QEMU/VirtualBox) |
 | `kernel/src/net.rs` | network binding: ARP cache, IPv4/ICMP/UDP dispatch from the IRQ queue, `ping`, `udpecho`, status counters | working (static config) |
-| `kernel/src/irq.rs` | exclusive IRQ registration; PIC mask/unmask/EOI dispatch; IOAPIC GSI2/GSI4 routing and LAPIC EOI for timer/COM1 | working (Phase 9 stages 6/8) |
+| `kernel/src/acpi.rs` | Limine RSDP discovery, ACPI memory-map validation, MADT IOAPIC and bus-0 ISA route selection, summary and self-test data | working (Phase 9 stage 9) |
+| `kernel/src/irq.rs` | exclusive IRQ registration; PIC mask/unmask/EOI dispatch; dynamic IOAPIC GSI routing from ACPI with LAPIC EOI for timer/COM1, PIC fallback | working (Phase 9 stages 6/8/9) |
 | `kernel/src/shell.rs` | serial shell builtins over kernel services, incl. `config get/set/del/list` | working (serial only) |
 | `kernel/src/arch/x86_64/gdt.rs` | GDT (kernel + user segments), TSS, IST1 double-fault stack | working |
 | `kernel/src/arch/x86_64/idt.rs` | exception gates, PIC IRQ0-15 (IRQ0/IRQ4 dedicated), `int 0x80` gate, frame dispatcher | working |
@@ -107,11 +108,13 @@ writable, which the segment permissions above guarantee.
 | `kernel/src/arch/x86_64/context.rs` | register/RSP-swap context switch | working |
 | `kernel/src/arch/x86_64/paging.rs` | narrow uncached MMIO mapping through the live 4-level tables | working, not a VM manager |
 | `kernel/src/arch/x86_64/apic.rs` | xAPIC mode, LINT0 ExtINT, local-ID read and EOI write for IOAPIC routes | working |
-| `kernel/src/arch/x86_64/ioapic.rs` | fixed `0xfec00000` mapping, ID/version/input probe, redirection-entry mask/program | working (stage 8; no ACPI discovery) |
+| `kernel/src/arch/x86_64/ioapic.rs` | caller-selected IOAPIC base mapping, ID/version/input probe, redirection-entry mask/program | working (stage 9; ACPI base) |
 | `kernel/src/sync.rs` | `SpinLock` and RFLAGS-saving `IrqSpinLock` | working |
 | `kernel/src/panic.rs` | panic report and halt | working |
 | `userland/` | independent no_std cargo workspace: syscall runtime plus the `hello`/`fault` ELF programs | working (ADR-0017) |
 | `userland/pe/` | separate workspace: `pehello` (stage 1), `peconsole` (stage 2), `pebasics` (stage 3), `peinput` (Phase 8 stage 2), `pereg` (Phase 8 stage 3, `advapi32.dll` reads) and `peregw` (Phase 8 stage 4, `advapi32.dll` writes) `raw-dylib` import fixtures plus the negative mutants, linked by rust-lld without an SDK | working (ADR-0019/0020/0021/0023/0024/0025) |
+| `os_core::acpi` | allocation-free RSDP/RSDT/XSDT/MADT parser with checksum, length, entry and capacity validation | host-tested |
+| `os_core::ioapic` | 64-bit redirection-entry encoding, vector reservation, mask and destination fields | host-tested |
 | `os_core::memmap` | classification/accounting/validation | host-tested |
 | `os_core::fb` | geometry, pixel format, bounds, colour packing | host-tested |
 | `os_core::frame` | bitmap frame allocator | host- and in-VM-tested |
@@ -214,9 +217,11 @@ as well (ADR-0014).
 - Single CPU only; no SMP startup, no per-CPU state.
 - Own 4-level VM manager; no 5-level paging, demand paging, copy-on-write or
   huge-page splitting. The bootloader page tables remain allocated and unused.
-- PIT and COM1 use IOAPIC GSI2/GSI4 with local-APIC EOI; the 8259 remains for
-  PCI INTx lines (the e1000 in particular) and as the timer/COM1 fallback.
-  There is no ACPI MADT/`_PRT` discovery, APIC timer, MSI/MSI-X or HPET.
+- PIT and COM1 use an IOAPIC selected by ACPI MADT (GSI2/GSI4 on both
+  supported hypervisors) with local-APIC EOI; the 8259 remains for PCI INTx
+  lines (the e1000 in particular) and as the timer/COM1 fallback. There is no
+  AML/`_PRT` evaluation, PCI INTx IOAPIC routing, APIC timer, MSI/MSI-X or
+  HPET.
 - The kernel heap is a fixed 8 MiB region that does not grow on demand.
 - One user thread at a time (single TSS `rsp0`); program images are our own
   ELF64 `ET_EXEC` modules and PE32+ images loaded from Limine, with no
@@ -238,8 +243,8 @@ as well (ADR-0014).
 - Networking (ADR-0018/0032/0033, `docs/NETWORK.md`): one e1000 with static
   `10.0.2.15/24` on QEMU slirp / VirtualBox NAT; legacy INTx delivery and a
   16-frame IRQ RX queue feed a service-path dispatcher. No background protocol
-  thread, MSI, PCI INTx IOAPIC routing, DHCP, DNS, TCP, sockets or routing beyond the local
-  subnet; one NIC on bus 0; IPv4 only, fragments rejected, no reassembly; the
+  thread, MSI, PCI INTx IOAPIC routing (ACPI `_PRT` is absent), DHCP, DNS, TCP,
+  sockets or routing beyond the local subnet; one NIC on bus 0; IPv4 only, fragments rejected, no reassembly; the
   VirtualBox NAT run detected the NIC but did not answer the gateway ARP
   (non-fatal, reported as observed).
 - No reclaim of bootloader-reclaimable memory.

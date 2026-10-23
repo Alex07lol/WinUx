@@ -1,12 +1,12 @@
 //! Hardware IRQ dispatch, ownership and IOAPIC routing (Phase 9 stages 6-8).
 //!
 //! The timer (IRQ0) and COM1 (IRQ4) keep dedicated IDT paths in `idt.rs`.
-//! Stage 8 routes those two ISA interrupts through IOAPIC GSIs 2 and 4 with
-//! local-APIC end-of-interrupt; `fallback_to_pic` returns both lines to the
-//! 8259 if timer delivery does not start. Every other legacy line still uses
-//! the 8259 until PCI INTx discovery exists. This module also dispatches those
-//! lines to registered handlers, masks/unmasks them, and keeps registration
-//! exclusive. See `docs/DRIVER_MODEL.md`, ADR-0034 and R-027.
+//! Their IOAPIC GSIs, trigger mode and polarity come from ACPI MADT discovery;
+//! the fixed stage-8 destination is GSI2/GSI4. `fallback_to_pic` returns both
+//! lines to the 8259 if timer delivery does not start. Every other legacy line
+//! still uses the 8259 until PCI INTx discovery exists. This module also
+//! dispatches those lines to registered handlers, masks/unmasks them, and keeps
+//! registration exclusive. See `docs/DRIVER_MODEL.md`, ADR-0034 and R-027.
 
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -22,8 +22,6 @@ const TIMER_LINE: u8 = 0;
 const CONSOLE_LINE: u8 = 4;
 const TIMER_VECTOR: u8 = 32;
 const CONSOLE_VECTOR: u8 = 36;
-const TIMER_GSI: u8 = 2;
-const CONSOLE_GSI: u8 = 4;
 /// Route marker meaning "handled by the 8259", not an IOAPIC GSI.
 const PIC_ROUTE: u8 = 0xff;
 
@@ -34,11 +32,21 @@ static ROUTES: [AtomicU8; 16] = [const { AtomicU8::new(PIC_ROUTE) }; 16];
 static IOAPIC_BASE: AtomicUsize = AtomicUsize::new(0);
 static LAPIC_BASE: AtomicUsize = AtomicUsize::new(0);
 
-/// Probed IOAPIC identity, for the one-line boot diagnostic.
+/// Probed IOAPIC identity and the routes programmed into it.
 pub struct IoApicInfo {
     pub version: u8,
     pub pins: u8,
     pub id: u8,
+    pub timer_gsi: u8,
+    pub console_gsi: u8,
+}
+
+/// One ISA route supplied by ACPI discovery or the fixed fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegacyRoute {
+    pub gsi: u8,
+    pub trigger: TriggerMode,
+    pub polarity: Polarity,
 }
 
 /// True when `line` is a legacy interrupt line this module can assign. Timer
@@ -148,35 +156,46 @@ pub fn unmask(line: u8) {
     }
 }
 
-/// Program IOAPIC GSI 2 for the PIT and GSI 4 for COM1.
+/// Program the discovered PIT and COM1 routes into the selected IOAPIC.
 ///
-/// Every entry is masked first, then the two fixed routes are installed. On
-/// failure the table is left fully masked and the caller keeps the 8259 path.
-/// The PIT output is edge-triggered; the UART's interrupt line is level
-/// asserted, so COM1 uses level-high to avoid losing a byte that arrives while
-/// the handler is draining the FIFO.
-pub fn init_ioapic(base: *mut u32, lapic: *mut u32) -> Result<IoApicInfo, &'static str> {
+/// Every entry is masked first, then the two routes are installed. On failure
+/// the table is left fully masked and the caller keeps the 8259 path. The PIT
+/// output is normally edge-triggered; the UART's interrupt line is normally
+/// level asserted, so COM1 uses level-high to avoid losing a byte that arrives
+/// while the handler is draining the FIFO. MADT overrides can change both.
+pub fn init_ioapic(
+    base: *mut u32,
+    lapic: *mut u32,
+    timer_route: LegacyRoute,
+    console_route: LegacyRoute,
+) -> Result<IoApicInfo, &'static str> {
+    if timer_route.gsi == PIC_ROUTE || console_route.gsi == PIC_ROUTE {
+        return Err("ISA route uses the reserved PIC marker");
+    }
+    if timer_route.gsi == console_route.gsi {
+        return Err("timer and console share one GSI");
+    }
     let ioapic = IoApic::new(base)?;
     ioapic.mask_all()?;
     let destination = apic::local_id(lapic);
     let timer = RedirectionEntry::fixed(
         TIMER_VECTOR,
         destination,
-        TriggerMode::Edge,
-        Polarity::ActiveHigh,
+        timer_route.trigger,
+        timer_route.polarity,
         false,
     )
     .ok_or("timer vector is reserved")?;
     let console = RedirectionEntry::fixed(
         CONSOLE_VECTOR,
         destination,
-        TriggerMode::Level,
-        Polarity::ActiveHigh,
+        console_route.trigger,
+        console_route.polarity,
         false,
     )
     .ok_or("console vector is reserved")?;
-    ioapic.write_entry(TIMER_GSI, timer)?;
-    if let Err(error) = ioapic.write_entry(CONSOLE_GSI, console) {
+    ioapic.write_entry(timer_route.gsi, timer)?;
+    if let Err(error) = ioapic.write_entry(console_route.gsi, console) {
         let _ = ioapic.mask_all();
         return Err(error);
     }
@@ -185,11 +204,13 @@ pub fn init_ioapic(base: *mut u32, lapic: *mut u32) -> Result<IoApicInfo, &'stat
         version: ioapic.version(),
         pins: ioapic.pins(),
         id: ioapic.id(),
+        timer_gsi: timer_route.gsi,
+        console_gsi: console_route.gsi,
     };
     IOAPIC_BASE.store(base as usize, Ordering::Release);
     LAPIC_BASE.store(lapic as usize, Ordering::Release);
-    ROUTES[TIMER_LINE as usize].store(TIMER_GSI, Ordering::Release);
-    ROUTES[CONSOLE_LINE as usize].store(CONSOLE_GSI, Ordering::Release);
+    ROUTES[TIMER_LINE as usize].store(timer_route.gsi, Ordering::Release);
+    ROUTES[CONSOLE_LINE as usize].store(console_route.gsi, Ordering::Release);
     Ok(info)
 }
 
@@ -197,8 +218,14 @@ pub fn init_ioapic(base: *mut u32, lapic: *mut u32) -> Result<IoApicInfo, &'stat
 /// timeout. The LAPIC stays enabled for LINT0 ExtINT.
 pub fn fallback_to_pic() {
     if let Some(ioapic) = ioapic() {
-        let _ = ioapic.mask(TIMER_GSI);
-        let _ = ioapic.mask(CONSOLE_GSI);
+        let timer_gsi = route(TIMER_LINE);
+        if timer_gsi != PIC_ROUTE {
+            let _ = ioapic.mask(timer_gsi);
+        }
+        let console_gsi = route(CONSOLE_LINE);
+        if console_gsi != PIC_ROUTE {
+            let _ = ioapic.mask(console_gsi);
+        }
     }
     ROUTES[TIMER_LINE as usize].store(PIC_ROUTE, Ordering::Release);
     ROUTES[CONSOLE_LINE as usize].store(PIC_ROUTE, Ordering::Release);
@@ -211,6 +238,14 @@ pub fn fallback_to_pic() {
 /// Whether the PIT is currently delivered through the IOAPIC.
 pub fn timer_uses_ioapic() -> bool {
     route(TIMER_LINE) != PIC_ROUTE
+}
+
+pub fn timer_gsi() -> u8 {
+    route(TIMER_LINE)
+}
+
+pub fn console_gsi() -> u8 {
+    route(CONSOLE_LINE)
 }
 
 fn route(line: u8) -> u8 {

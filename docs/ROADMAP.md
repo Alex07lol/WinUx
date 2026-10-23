@@ -44,7 +44,7 @@ in `progress.md`. VirtualBox EFI is a secondary follow-up.
 Met: own GDT/TSS/IST, IDT with exception gates, fatal exception reporting,
 breakpoint self-test, PIT periodic interrupt at 100 Hz delivered through IOAPIC GSI2 in QEMU and VirtualBox, APIC MMIO mapping, local-APIC EOI and LINT0 ExtINT for the PIC fallback.
 
-Missing: APIC timer, PCI INTx IOAPIC routing, ACPI MADT/_PRT discovery, MSI, SMP bring-up, recoverable page-fault handling, TSC calibration independent of the bootloader.
+Missing: APIC timer, PCI INTx IOAPIC routing, ACPI `_PRT`/AML discovery, MSI, SMP bring-up, recoverable page-fault handling, TSC calibration independent of the bootloader.
 
 ## Phase 3 acceptance (partial)
 
@@ -507,6 +507,32 @@ with `--require-ioapic` PASS. `scripts/test_all.sh` PASS=30 FAIL=0 SKIP=2.
 Not claimed: ACPI MADT/`_PRT` discovery, PCI INTx IOAPIC routing, MSI/MSI-X,
 APIC timer, SMP, level-triggered PCI lines or physical-hardware testing. See
 ADR-0034, R-027.
+
+## Phase 9 stage 9 (2026-10-23): ACPI MADT discovery
+
+The kernel requests Limine's RSDP, converts the HHDM address to a physical
+address, and validates the RSDP, root table and every consumed table against
+Limine's memory map before dereferencing it. `os_core::acpi` parses revision
+0/1 and 2+ RSDPs, RSDT/XSDT entry lists and MADT IOAPIC/ISA-override records,
+with checksum, length, entry, alignment, duplicate and capacity checks. The
+kernel selects one MADT IOAPIC covering both PIT and COM1, resolves the bus-0
+overrides field by field, and falls back to the fixed stage-8 base/routes if
+discovery fails. Controller mapping failure still uses the 8259 path rather
+than mixing guessed routes. `ioapic::map` now accepts a physical base, rejects
+misaligned bases and windows crossing the 2 MiB mapping, and `irq` programs a
+kernel-side `LegacyRoute`.
+
+QEMU q35 BIOS reports RSDP revision 0 / RSDT / 5 tables, MADT revision 3,
+IOAPIC 0 at `0xfec00000` and 5 overrides; VirtualBox 7.2.20 BIOS reports RSDP
+revision 2 / XSDT / 3 tables, MADT revision 2, IOAPIC ID 1 at `0xfec00000` and
+2 overrides. Both resolve PIT GSI2 edge/active-high and COM1 GSI4
+level/active-high and log `acpi selftest: passed`. Evidence: 312 host tests
+(15 ACPI parser tests); QEMU and VirtualBox serial logs; `test_boot_qemu.sh
+--require-acpi`, `test_virtualbox.sh --require-ioapic --require-acpi` and
+`scripts/test_all.sh` PASS=31 FAIL=0 SKIP=2. Not claimed: AML/`_PRT`
+evaluation, PCI INTx IOAPIC routing, MSI/MSI-X, APIC timer, SMP, ACPI reclaim,
+UEFI boot or physical-hardware validation. The e1000 remains on the 8259.
+See `docs/ACPI.md`, ADR-0035, R-028.
 
 ## Phase 8 acceptance (planned)
 

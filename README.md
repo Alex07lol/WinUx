@@ -3,13 +3,15 @@
 An independent operating system with its **own x86-64 kernel**, heading toward
 native Windows application support without Wine/Proton or CPU translation.
 
-> **Status: Phase 1 boot milestone.** The kernel boots from a BIOS/UEFI hybrid ISO
-> under QEMU (BIOS path verified), validates the Limine handoff, records the
-> firmware memory map, drives a framebuffer dashboard, runs a physical frame
-> allocator self-test, installs GDT/IDT/TSS, handles a deliberate `int3`, and
-> receives 5 PIT timer interrupts before printing a success marker. There is
-> **no user mode, no filesystem, no networking and no Windows application
-> support** yet. A booting kernel does not imply Windows compatibility.
+> **Status: Phase 9 stage 9.** The kernel boots from a BIOS/UEFI hybrid ISO
+> under QEMU (BIOS path verified) and VirtualBox, validates the Limine handoff,
+> records the firmware memory map, drives a framebuffer dashboard, runs
+> allocator/heap/VM/scheduler self-tests, installs GDT/IDT/TSS, discovers the
+> IOAPIC base and PIT/COM1 ISA routes from ACPI MADT, reaches ring 3, and runs
+> the kernel console, VFS, shell, checkpoint persistence, e1000 network path,
+> PCI inventory/driver model and native ELF64/PE32+ fixtures. Windows API
+> coverage remains a narrow first-party fixture surface, not general Windows
+> application or driver compatibility.
 
 ## What this is — and is not
 
@@ -43,7 +45,7 @@ Artifacts:
 Expected serial line:
 
 ```text
-PROJECT_OS_BOOT_SUCCESS:<build-id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator
+PROJECT_OS_BOOT_SUCCESS:<build-id> checks=handoff,memmap,gdt,idt,exceptions,timer,allocator,heap,vm,sched,user,elf,pe,win32,vfs,config,pci,driver,acpi
 ```
 
 `scripts/test_boot_qemu.sh` requires the `isa-debug-exit` device and expects QEMU
@@ -89,13 +91,16 @@ No package installation is performed automatically and no elevation is used.
 ## Layout
 
 ```text
-kernel/            freestanding kernel (entry, Limine ABI, arch, display, memory)
+kernel/            freestanding kernel (entry, Limine ABI, arch, memory, IRQ,
+                   console, VFS, shell, networking, PCI/driver, ACPI)
 os_core/           host-testable, architecture-independent logic
+userland/          no_std ELF runtime and programs
+userland/pe/       native PE32+ fixtures
 tools/membench/    reproducible host frame-allocator benchmark
 boot/              limine.conf and pinned-bootloader metadata
 scripts/           build, ISO, tests, format, lint, benchmark
 docs/              architecture, decisions, research, testing, memory, graphics,
-                   Windows compatibility, roadmap
+                   ACPI, networking, Windows compatibility, roadmap
 artifacts/         generated kernel/ISO/logs (Git-ignored)
 ```
 
@@ -106,22 +111,30 @@ artifacts/         generated kernel/ISO/logs (Git-ignored)
 Captured from QEMU 11.1.0 with the monitor `screendump` command. This is the
 bootloader framebuffer, not a GPU driver or a desktop environment.
 
-## Verification snapshot (2026-10-17)
+## Verification snapshot (2026-10-23)
 
-- Full suite (`scripts/test_all.sh`): **13 PASS, 0 FAIL, 4 SKIP**.
-- Host unit tests: **33 passed** (`cargo test -p os_core`).
-- Kernel build: ELF64, entry `0xffffffff80000000`, `.limine_requests` present.
-- ISO: 6,285,312 bytes, both BIOS and UEFI El Torito entries verified; Limine,
+- Full suite (`scripts/test_all.sh`): **31 PASS, 0 FAIL, 2 SKIP**. The skips are
+  UEFI (no `OVMF_FD`) and the virtual GPU.
+- Host unit tests: **312 passed** (`scripts/test_unit.sh`).
+- Kernel build: ELF64, entry `0xffffffff80000000`, 2,062,984 bytes,
+  `.limine_requests` present.
+- ISO: 8,099,840 bytes, both BIOS and UEFI El Torito entries verified; Limine,
   Rust runtime and project license notices are included under `/licenses`.
 - QEMU BIOS boot: succeeded at 256 MiB, 512 MiB and 1 GiB; each reached the
-  success marker and exited via `isa-debug-exit` with status 33.
-- **VirtualBox 7.2.20 BIOS boot: PASS**; reached the same marker with 5 timer
-  ticks and only the default VM configuration.
-- In-kernel: allocator self-test passed, `int3` handler ran, 5 PIT ticks observed.
-- Negative test: corrupting the ISO made the boot script fail with exit 1.
+  success marker and exited via `isa-debug-exit` with status 33. The ACPI run
+  discovered the RSDT, MADT, IOAPIC 0 at `0xfec00000`, PIT GSI2 and COM1 GSI4,
+  passed the ACPI self-test and observed 7 PIT ticks.
+- **VirtualBox 7.2.20 BIOS boot: PASS**; discovered the XSDT, MADT IOAPIC ID 1,
+  the same PIT/COM1 routes and passed the ACPI self-test with 5 timer ticks and
+  no PIC fallback. The attached NAT NIC was detected but the gateway ARP timed
+  out; that path is non-fatal.
+- In-kernel: allocator/heap/VM/scheduler self-tests, `int3` handler, ring 3,
+  VFS/shell/persistence, ELF64/PE32+ fixtures, PCI/driver model and ACPI MADT
+  discovery passed.
 - UEFI boot: **SKIP** (OVMF not available); ISO entry verified only. This is
-  now the only unverified Phase 1 boot path.
-- Windows/GPU/driver compatibility: **not implemented**.
+  the only unverified Phase 1 boot path.
+- Windows application/driver compatibility and GPU acceleration:
+  **not implemented**.
 
 See [progress.md](progress.md), [docs/TESTING.md](docs/TESTING.md) and
 [docs/RESEARCH.md](docs/RESEARCH.md) for exact commands, results and sources.

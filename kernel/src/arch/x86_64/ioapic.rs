@@ -4,12 +4,12 @@
 //! 32-bit indirect register and `IOWIN` reads or writes it. Entries are
 //! programmed with the host-tested [`os_core::ioapic`] encoding.
 //!
-//! The physical base is fixed at `0xfec00000`, which is the address QEMU and
-//! VirtualBox expose and which Limine does not map through the HHDM. ACPI
-//! MADT discovery is deliberately not implemented yet; the caller falls back
-//! to the 8259 if the fixed window cannot be mapped or probed. Only the boot
-//! CPU programs entries, and interrupt handlers never touch the indirect
-//! registers, so the selector/window pair needs no lock.
+//! The ACPI MADT supplies the controller's physical base. `PHYSICAL_BASE` is
+//! the fixed fallback used when ACPI discovery is unavailable. Limine does not
+//! necessarily map MMIO through the HHDM, so the caller installs a 2 MiB MMIO
+//! window first. Only the boot CPU programs entries, and interrupt handlers
+//! never touch the indirect registers, so the selector/window pair needs no
+//! lock.
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -17,8 +17,8 @@ use os_core::ioapic::{MASK_BIT, RedirectionEntry};
 
 use super::paging::PageTables;
 
-/// Fixed physical address of the first I/O APIC on the supported machines.
-pub const PHYSICAL_BASE: u64 = 0xfec0_0000;
+/// Fixed physical address used when ACPI discovery is unavailable.
+pub const PHYSICAL_BASE: u32 = 0xfec0_0000;
 
 const REG_SELECT: usize = 0x00;
 const REG_WINDOW: usize = 0x10;
@@ -128,15 +128,23 @@ impl IoApic {
     }
 }
 
-/// Map the fixed IOAPIC window through the HHDM and return its virtual base.
-pub fn map(hhdm_offset: u64) -> Result<*mut u32, &'static str> {
-    let aligned = PHYSICAL_BASE & !(TWO_MIB - 1);
+/// Map the selected IOAPIC window through the HHDM and return its virtual base.
+pub fn map(hhdm_offset: u64, physical_base: u32) -> Result<*mut u32, &'static str> {
+    let physical = u64::from(physical_base);
+    if !physical.is_multiple_of(4096) {
+        return Err("IOAPIC base is not page aligned");
+    }
+    let aligned = physical & !(TWO_MIB - 1);
+    let offset = physical - aligned;
+    if offset + 4096 > TWO_MIB {
+        return Err("IOAPIC register window crosses the 2 MiB mapping");
+    }
     let virtual_base = hhdm_offset
         .checked_add(aligned)
         .ok_or("IOAPIC HHDM address overflowed")?;
     PageTables::new(hhdm_offset).map_mmio_2m(aligned, virtual_base)?;
     let address = virtual_base
-        .checked_add(PHYSICAL_BASE - aligned)
+        .checked_add(offset)
         .ok_or("IOAPIC register address overflowed")?;
     Ok(address as *mut u32)
 }

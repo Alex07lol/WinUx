@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+pub mod acpi;
 pub mod config;
 pub mod driver;
 pub mod elf;

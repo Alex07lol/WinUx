@@ -105,6 +105,12 @@ pub struct HhdmResponse {
 }
 
 #[repr(C)]
+pub struct RsdpResponse {
+    pub revision: u64,
+    pub address: *mut u8,
+}
+
+#[repr(C)]
 pub struct CmdlineResponse {
     pub revision: u64,
     pub cmdline: *const u8,
@@ -244,6 +250,7 @@ pub struct Requests {
     pub stack_size: StackSizeRequest,
     pub paging_mode: PagingModeRequest,
     pub hhdm: Request<HhdmResponse>,
+    pub rsdp: Request<RsdpResponse>,
     pub executable_cmdline: Request<CmdlineResponse>,
     pub executable_address: Request<ExecutableAddressResponse>,
     pub memmap: Request<MemmapResponse>,
@@ -289,6 +296,7 @@ impl Requests {
                 min_mode: PAGING_MODE_X86_64_4LVL,
             },
             hhdm: Request::new(0x48dcf1cb8ad2b852, 0x63984e959a98244b),
+            rsdp: Request::new(0xc5e77b6b397e7b43, 0x27637845accdcf3c),
             executable_cmdline: Request::new(0x4b161536e598651e, 0xb390ad4a2f1f303a),
             executable_address: Request::new(0x71ba76863cc55f63, 0xb2644a48c516a487),
             memmap: Request::new(0x67cf3d9d378a806f, 0xe304acdfc50c3c62),
